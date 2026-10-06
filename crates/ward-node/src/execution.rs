@@ -55,7 +55,7 @@ use ward_events::NodeResourceUsage;
 use ward_launch::freeze::{FrozenTree, TreeRoot, freeze_tree, kill_tree, thaw_tree};
 use ward_launch::{ACTION_SOCKET, Launch, PROXY_SOCKET, RunningLaunch};
 use ward_node_protocol::{HostAllowlist, MAX_OUTPUT_STDIO_BYTES, OutputGrant, ResourceGrant};
-use ward_proxy::{GatewayRoute, SystemResolver};
+use ward_proxy::{GatewayRoute, Hold, SystemResolver};
 use ward_snapshot::SnapshotStore;
 
 use crate::actions::ACTION_SOCKET_ENV;
@@ -97,6 +97,7 @@ pub struct LaunchRequest {
     resources: Option<ResourceGrant>,
     action_socket: Option<PathBuf>,
     credential_routes: Vec<GatewayRoute>,
+    hold: Option<Arc<dyn Hold>>,
 }
 
 impl LaunchRequest {
@@ -112,6 +113,7 @@ impl LaunchRequest {
             resources: None,
             action_socket: None,
             credential_routes: Vec::new(),
+            hold: None,
         }
     }
 
@@ -173,6 +175,21 @@ impl LaunchRequest {
     #[must_use]
     pub fn credential_routes(&self) -> &[GatewayRoute] {
         &self.credential_routes
+    }
+
+    /// The same launch with the hold its egress proxy asks about every request it would let
+    /// through: the attempt's action channel holding the manifest's `hold` (#415,
+    /// [`crate::actions::AttemptActions::hold`]).
+    #[must_use]
+    pub fn with_hold(mut self, hold: Arc<dyn Hold>) -> Self {
+        self.hold = Some(hold);
+        self
+    }
+
+    /// The hold the attempt's egress proxy asks; `None` without a manifest `hold`.
+    #[must_use]
+    pub fn hold(&self) -> Option<Arc<dyn Hold>> {
+        self.hold.clone()
     }
 
     /// The output grant the admitted manifest carried; `None` when nothing is returned.
@@ -400,10 +417,11 @@ impl SandboxLauncher {
             .allowlist()
             .map(|allowlist| {
                 let dir = egress_dir_beside(request.workspace()).ok_or(SpawnError::Refused)?;
-                AttemptEgress::start_routed(
+                AttemptEgress::start_held(
                     &dir,
                     allowlist,
                     request.credential_routes().to_vec(),
+                    request.hold(),
                     Arc::new(SystemResolver),
                 )
                 .map(Arc::new)
@@ -577,6 +595,7 @@ impl WorkloadFreezer for SandboxFreezer {
 /// at protocol 1.3, `network.proxy_allowlist` only when built
 /// [`Self::with_network_allowlist`], and `output` only when built
 /// [`Self::with_output_return`].
+#[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,
@@ -588,6 +607,7 @@ pub struct NodeExecution {
     scheduling: Option<SchedulingLimits>,
     resources: Option<ResourceEnforcement>,
     action_channel: bool,
+    approval_hold: bool,
     credentials: Option<Arc<NodeCredentials>>,
 }
 
@@ -603,6 +623,7 @@ impl std::fmt::Debug for NodeExecution {
             .field("scheduling", &self.scheduling)
             .field("resources", &self.resources)
             .field("action_channel", &self.action_channel)
+            .field("approval_hold", &self.approval_hold)
             .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
@@ -628,6 +649,7 @@ impl NodeExecution {
             scheduling: None,
             resources: None,
             action_channel: false,
+            approval_hold: false,
             credentials: None,
         }
     }
@@ -723,6 +745,23 @@ impl NodeExecution {
     #[must_use]
     pub const fn honours_action_channel(&self) -> bool {
         self.action_channel
+    }
+
+    /// Whether this node honours a manifest's `hold` (#415, ADR-0035), on a node that also
+    /// offers the action channel and enforces a network allowlist: the attempt's egress
+    /// proxy refuses each held capability until the control plane approves the request the
+    /// node opens for it. Off, the default, every manifest with `hold` is refused
+    /// `unsupported_grant` at `admit` and the `actions` section carries no `hold`.
+    #[must_use]
+    pub const fn with_approval_hold(mut self, enabled: bool) -> Self {
+        self.approval_hold = enabled;
+        self
+    }
+
+    /// Whether this node honours a manifest's `hold`.
+    #[must_use]
+    pub const fn honours_approval_hold(&self) -> bool {
+        self.approval_hold && self.action_channel && self.network_allowlist
     }
 
     /// Broker the services `credentials` configures to attempts whose manifest grants them

@@ -31,7 +31,9 @@
 //!     [`ward_node_protocol::MAX_ACTION_WAIT_SECS`]), and a `credentials` grant only on a
 //!     node that enforces a network allowlist and whose operator configured every service
 //!     it names, for that service's host and within its ceiling
-//!     ([`NodeAdmission::with_credentials`]); any other grant is refused
+//!     ([`NodeAdmission::with_credentials`]), and a `hold` only on a node that holds
+//!     capabilities until approved ([`NodeAdmission::with_approval_hold`]); any other
+//!     grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
 //!
@@ -120,6 +122,7 @@ impl VerifiedAdmission {
 }
 
 /// The node's admission configuration and durable admission state.
+#[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 pub struct NodeAdmission {
     issuers: TrustedIssuers,
     state: NodeState,
@@ -128,6 +131,7 @@ pub struct NodeAdmission {
     output_return: bool,
     resources: Option<ResourceEnforcement>,
     action_channel: bool,
+    approval_hold: bool,
     credentials: Option<Arc<NodeCredentials>>,
 }
 
@@ -141,6 +145,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("output_return", &self.output_return)
             .field("resources", &self.resources)
             .field("action_channel", &self.action_channel)
+            .field("approval_hold", &self.approval_hold)
             .field("credentials", &self.credentials)
             .finish_non_exhaustive()
     }
@@ -158,6 +163,7 @@ impl NodeAdmission {
             output_return: false,
             resources: None,
             action_channel: false,
+            approval_hold: false,
             credentials: None,
         }
     }
@@ -218,6 +224,21 @@ impl NodeAdmission {
     #[must_use]
     pub const fn honours_action_channel(&self) -> bool {
         self.action_channel
+    }
+
+    /// Whether a manifest's `hold` is honoured (check 10, #415). The task registry sets
+    /// this from its execution, so what `admit` accepts is exactly what the attempt's
+    /// proxy holds.
+    #[must_use]
+    pub const fn with_approval_hold(mut self, enabled: bool) -> Self {
+        self.approval_hold = enabled;
+        self
+    }
+
+    /// Whether a manifest's `hold` is honoured.
+    #[must_use]
+    pub const fn honours_approval_hold(&self) -> bool {
+        self.approval_hold
     }
 
     /// Which `credentials` grants are honoured (check 10): only on a node whose operator
@@ -351,6 +372,9 @@ impl NodeAdmission {
             if !honoured {
                 return Err(Reason::UnsupportedGrant);
             }
+        }
+        if manifest.hold().is_some() && !self.approval_hold {
+            return Err(Reason::UnsupportedGrant);
         }
 
         Ok(VerifiedAdmission {
@@ -768,6 +792,43 @@ mod tests {
         let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
         assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
         assert!(verify_signed(&channel, &offline, &issuer_keypair()).is_ok());
+    }
+
+    #[test]
+    fn a_hold_is_honoured_only_by_a_node_that_holds_approval_gated_capabilities() {
+        let dir = tempfile::tempdir().unwrap();
+        let channel = node_admission(&dir.path().join("channel"), &FixedClock::at(NOW))
+            .with_network_allowlist(true)
+            .with_action_channel(true);
+        let holding = node_admission(&dir.path().join("holding"), &FixedClock::at(NOW))
+            .with_network_allowlist(true)
+            .with_action_channel(true)
+            .with_approval_hold(true);
+        assert!(!channel.honours_approval_hold());
+        assert!(holding.honours_approval_hold());
+        let mut input = envelope_input(lifecycle_binding());
+        crate::test_support::with_manifest(
+            &mut input,
+            crate::test_support::hold_manifest(
+                &["deploy.example.com"],
+                &["deploy.example.com"],
+                30,
+            ),
+        );
+        let held = TaskAdmissionEnvelope::new(input).unwrap();
+        assert_eq!(
+            verify_signed(&channel, &held, &issuer_keypair()).unwrap_err(),
+            Reason::UnsupportedGrant
+        );
+        assert!(verify_signed(&holding, &held, &issuer_keypair()).is_ok());
+        let without_channel = node_admission(&dir.path().join("bare"), &FixedClock::at(NOW))
+            .with_network_allowlist(true)
+            .with_approval_hold(true);
+        assert_eq!(
+            verify_signed(&without_channel, &held, &issuer_keypair()).unwrap_err(),
+            Reason::UnsupportedGrant,
+            "a hold needs the action channel it asks through"
+        );
     }
 
     #[test]

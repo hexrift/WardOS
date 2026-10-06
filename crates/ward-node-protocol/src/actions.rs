@@ -15,15 +15,18 @@
 //!   pending requests and the mutating `answer` ([`TaskActionsRequest`]), answered by a
 //!   [`TaskActionsResponse`].
 //!
-//! The channel grants nothing by itself: an approval is a statement the node records in
-//! the attempt's evidence log and relays to the workload, not a capability the node
-//! enforces. Every bound below is a byte count of the UTF-8 text.
+//! The channel grants nothing by itself: an approval of a workload's request is a statement
+//! the node records in the attempt's evidence log and relays to the workload, not a
+//! capability the node enforces. A request the node opens itself for a capability the
+//! manifest holds ([`crate::hold`]) is listed with that capability, and its approval is
+//! what releases it. Every bound below is a byte count of the UTF-8 text.
 
 use std::fmt::{Display, Formatter};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::hold::{HeldCapability, MAX_HOLDS};
 use crate::{
     OperationId, ProtocolVersion, TaskBinding, TaskLifecycleContext, TaskLifecycleError,
     TaskLifecycleState, supports_task_admission,
@@ -263,6 +266,16 @@ pub struct ActionCapabilities {
     pub max_total: u32,
     /// The highest `wait_secs` the node honours.
     pub max_wait_secs: u32,
+    /// The node honours a manifest's `hold` (#415, ADR-0035): it opens an approval request
+    /// for a held capability on first use and refuses it until approved. Absent means
+    /// `false`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hold: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl ActionCapabilities {
@@ -273,6 +286,7 @@ impl ActionCapabilities {
         max_pending: 0,
         max_total: 0,
         max_wait_secs: 0,
+        hold: false,
     };
 
     /// Every kind, at this revision's ceilings.
@@ -282,6 +296,7 @@ impl ActionCapabilities {
         max_pending: MAX_ACTION_PENDING,
         max_total: MAX_ACTION_TOTAL,
         max_wait_secs: MAX_ACTION_WAIT_SECS,
+        hold: false,
     };
 
     /// Whether any kind is offered.
@@ -317,6 +332,11 @@ impl ActionId {
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// An id the node chose itself, within the grammar by construction.
+    pub(crate) const fn node(id: String) -> Self {
+        Self(id)
     }
 }
 
@@ -532,6 +552,8 @@ pub struct PendingAction {
     summary: String,
     detail: String,
     expires_in_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold: Option<HeldCapability>,
 }
 
 #[derive(Deserialize)]
@@ -543,6 +565,15 @@ struct PendingActionWire {
     summary: String,
     detail: String,
     expires_in_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_present_hold")]
+    hold: Option<HeldCapability>,
+}
+
+fn deserialize_present_hold<'de, D>(deserializer: D) -> Result<Option<HeldCapability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    HeldCapability::deserialize(deserializer).map(Some)
 }
 
 impl PendingAction {
@@ -567,7 +598,22 @@ impl PendingAction {
             summary: request.summary,
             detail: request.detail,
             expires_in_ms,
+            hold: None,
         })
+    }
+
+    /// The same request, opened by the node for the held capability `hold` (#415).
+    #[must_use]
+    pub fn with_hold(mut self, hold: HeldCapability) -> Self {
+        self.hold = Some(hold);
+        self
+    }
+
+    /// The held capability the node opened this request for; `None` for a workload's own
+    /// request.
+    #[must_use]
+    pub const fn hold(&self) -> Option<&HeldCapability> {
+        self.hold.as_ref()
     }
 
     /// The node's request number: what `answer` names.
@@ -615,7 +661,12 @@ impl<'de> Deserialize<'de> for PendingAction {
         let wire = PendingActionWire::deserialize(deserializer)?;
         let request = ActionRequest::new(wire.id, wire.kind, wire.summary, wire.detail)
             .map_err(D::Error::custom)?;
-        Self::new(wire.action, request, wire.expires_in_ms).map_err(D::Error::custom)
+        let pending =
+            Self::new(wire.action, request, wire.expires_in_ms).map_err(D::Error::custom)?;
+        Ok(match wire.hold {
+            Some(hold) => pending.with_hold(hold),
+            None => pending,
+        })
     }
 }
 
@@ -802,10 +853,12 @@ impl Serialize for TaskActionsResponse {
     }
 }
 
-/// Whether `pending` is a listing a node can send: at most [`MAX_ACTION_PENDING`] requests,
-/// each number and id once.
+/// Whether `pending` is a listing a node can send: at most [`MAX_ACTION_PENDING`] requests
+/// of the workload's and [`MAX_HOLDS`] of the node's own, each number and id once.
 fn valid_listing(pending: &[PendingAction]) -> bool {
-    u32::try_from(pending.len()).is_ok_and(|len| len <= MAX_ACTION_PENDING)
+    let held = pending.iter().filter(|entry| entry.hold.is_some()).count();
+    held <= MAX_HOLDS
+        && u32::try_from(pending.len() - held).is_ok_and(|len| len <= MAX_ACTION_PENDING)
         && pending.iter().enumerate().all(|(index, entry)| {
             pending[..index]
                 .iter()
@@ -1611,6 +1664,117 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn a_listing_names_the_held_capability_of_a_node_opened_request() {
+        let held = |action: u32, index: usize, hold: HeldCapability| {
+            PendingAction::new(
+                action,
+                ActionRequest::new(
+                    crate::hold_request_id(index),
+                    ActionKind::Approval,
+                    hold.summary(),
+                    hold.detail(),
+                )
+                .unwrap(),
+                5_000,
+            )
+            .unwrap()
+            .with_hold(hold)
+        };
+        let host = HeldCapability::host("deploy.example.com").unwrap();
+        let entry = held(1, 0, host.clone());
+        assert_eq!(entry.hold(), Some(&host));
+        assert_eq!(PendingAction::new(2, request("w"), 1).unwrap().hold(), None);
+        let listed = one_three()
+            .actions_listed(
+                binding(),
+                TaskLifecycleState::Running,
+                vec![entry, PendingAction::new(2, request("w"), 1).unwrap()],
+            )
+            .unwrap();
+        let json = serde_json::to_string(&listed).unwrap();
+        assert!(
+            json.contains(r#""id":"hold:1","kind":"approval","summary":"network deploy.example.com","detail":"the node refuses requests to deploy.example.com until this is approved","expires_in_ms":5000,"hold":{"host":"deploy.example.com"}}"#),
+            "{json}"
+        );
+        assert_eq!(one_three().decode_actions_response(&json).unwrap(), listed);
+        for bad in [
+            json.replace(r#""hold":{"host":"deploy.example.com"}"#, r#""hold":null"#),
+            json.replace(
+                r#""hold":{"host":"deploy.example.com"}"#,
+                r#""hold":{"host":"Deploy"}"#,
+            ),
+            json.replace(
+                r#""hold":{"host":"deploy.example.com"}"#,
+                r#""hold":{"port":443}"#,
+            ),
+        ] {
+            assert_eq!(
+                one_three().decode_actions_response(&bad),
+                Err(TaskLifecycleError::MalformedMessage),
+                "{bad}"
+            );
+        }
+
+        // Up to the workload's ceiling and every hold at once is a listing a node can send.
+        let workload = (1..=MAX_ACTION_PENDING)
+            .map(|action| PendingAction::new(action, request(&format!("r{action}")), 1).unwrap());
+        let holds = (0..crate::MAX_HOLDS).map(|index| {
+            held(
+                MAX_ACTION_PENDING + 1 + u32::try_from(index).unwrap(),
+                index,
+                HeldCapability::host(format!("h{index}.example.com")).unwrap(),
+            )
+        });
+        let full: Vec<PendingAction> = workload.chain(holds).collect();
+        assert!(
+            one_three()
+                .actions_listed(binding(), TaskLifecycleState::Running, full.clone())
+                .is_ok()
+        );
+        let mut over = full.clone();
+        over.push(held(
+            99,
+            crate::MAX_HOLDS,
+            HeldCapability::service("extra").unwrap(),
+        ));
+        assert_eq!(
+            one_three().actions_listed(binding(), TaskLifecycleState::Running, over),
+            Err(TaskLifecycleError::MalformedMessage)
+        );
+        let mut over = full;
+        over.push(PendingAction::new(100, request("r-extra"), 1).unwrap());
+        assert_eq!(
+            one_three().actions_listed(binding(), TaskLifecycleState::Running, over),
+            Err(TaskLifecycleError::MalformedMessage)
+        );
+    }
+
+    #[test]
+    fn the_hold_flag_is_spelled_only_when_offered_and_absent_reads_false() {
+        let holding = ActionCapabilities {
+            hold: true,
+            ..ActionCapabilities::CEILINGS
+        };
+        let json = serde_json::to_string(&holding).unwrap();
+        assert_eq!(
+            json,
+            r#"{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600,"hold":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<ActionCapabilities>(&json).unwrap(),
+            holding
+        );
+        let earlier = r#"{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}"#;
+        assert_eq!(
+            serde_json::from_str::<ActionCapabilities>(earlier).unwrap(),
+            ActionCapabilities::CEILINGS
+        );
+        for offered in [ActionCapabilities::CEILINGS, ActionCapabilities::NONE] {
+            assert!(!serde_json::to_string(&offered).unwrap().contains("hold"));
+        }
     }
 
     #[test]

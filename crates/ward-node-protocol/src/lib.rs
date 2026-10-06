@@ -18,7 +18,10 @@
 //! And additive within 1.3 ([`credentials`], #267): the manifest's optional `credentials`
 //! grant, naming a service the node's operator configured and the allowlisted host its
 //! proxy injects that service's short-lived credential into; a node offers it through the
-//! capability document's existing `credentials` flags.
+//! capability document's existing `credentials` flags. And additive within 1.3 ([`hold`],
+//! #415): the manifest's optional `hold` of hosts and credentials it grants, held by the
+//! node until the control plane approves the request the node opens for each, the
+//! `actions` section's `hold` flag and the listing's `hold` field.
 //! Issuer verification and execution are the node's (`ward-node`); transport
 //! authentication belongs to #262. A 1.3 capability document may advertise `admit`, and `start` and
 //! `stop` only together. Incompatible peers fail closed rather than falling back to the
@@ -29,6 +32,7 @@
 mod actions;
 mod admission;
 mod credentials;
+mod hold;
 mod output;
 mod receipt;
 mod resources;
@@ -52,6 +56,7 @@ pub use credentials::{
     CredentialError, CredentialGrant, CredentialGrants, MAX_CREDENTIAL_GRANTS,
     MAX_CREDENTIAL_SERVICE_BYTES,
 };
+pub use hold::{HeldCapability, HoldError, HoldGrant, MAX_HOLDS, hold_request_id};
 pub use output::{
     AttemptOutput, MAX_OUTPUT_FILE_BYTES, MAX_OUTPUT_FILES, MAX_OUTPUT_FILES_BYTES,
     MAX_OUTPUT_PATH_BYTES, MAX_OUTPUT_STDIO_BYTES, MAX_RESULT_RESPONSE_BYTES, OutputCapabilities,

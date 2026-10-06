@@ -39,6 +39,7 @@ use crate::actions::{ActionError, ActionGrant, ActionGrantWire};
 use crate::credentials::{
     CredentialError, CredentialGrantWire, CredentialGrants, grants_from_wire,
 };
+use crate::hold::{HoldError, HoldGrant, HoldGrantWire};
 use crate::output::{OutputError, OutputGrant, OutputGrantWire};
 use crate::resources::{ResourceGrant, ResourceGrantWire};
 
@@ -94,6 +95,9 @@ pub enum TaskAdmissionError {
     /// twice, an invalid service or host, a zero TTL, or a host the manifest's
     /// `network.custom` does not cover).
     MalformedCredentialGrant(CredentialError),
+    /// The `hold` is outside its grammar (nothing held, too much, a repeat, a host or
+    /// service the manifest does not grant, or no `actions` grant naming `approval`).
+    MalformedHold(HoldError),
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -131,6 +135,7 @@ impl Display for TaskAdmissionError {
             Self::MalformedResourceGrant => "capability manifest resources grant is invalid",
             Self::MalformedActionGrant(_) => "capability manifest actions grant is invalid",
             Self::MalformedCredentialGrant(_) => "capability manifest credentials grant is invalid",
+            Self::MalformedHold(_) => "capability manifest hold is invalid",
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -271,7 +276,7 @@ impl HostAllowlist {
     }
 }
 
-fn is_host_pattern(pattern: &str) -> bool {
+pub(crate) fn is_host_pattern(pattern: &str) -> bool {
     let name = pattern.strip_prefix("*.").unwrap_or(pattern);
     !name.is_empty()
         && name.len() <= HostAllowlist::MAX_HOST_BYTES
@@ -320,6 +325,8 @@ pub struct CapabilityManifest {
     actions: Option<ActionGrant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credentials: Option<CredentialGrants>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hold: Option<HoldGrant>,
 }
 
 impl CapabilityManifest {
@@ -332,6 +339,7 @@ impl CapabilityManifest {
             resources: None,
             actions: None,
             credentials: None,
+            hold: None,
         }
     }
 
@@ -368,6 +376,23 @@ impl CapabilityManifest {
     ) -> Result<Self, CredentialError> {
         credentials.within(self.allowlist())?;
         self.credentials = Some(credentials);
+        Ok(self)
+    }
+
+    /// The same manifest also holding the capabilities of `hold` until approved.
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`HoldError`] of [`HoldGrant::within`] unless every held host is a
+    /// `network.custom` pattern of this manifest, every held service one of its
+    /// `credentials`, and its `actions` grant names `approval`.
+    pub fn with_hold(mut self, hold: HoldGrant) -> Result<Self, HoldError> {
+        hold.within(
+            self.allowlist(),
+            self.credentials.as_ref(),
+            self.actions.as_ref().map(ActionGrant::kinds),
+        )?;
+        self.hold = Some(hold);
         Ok(self)
     }
 
@@ -415,12 +440,19 @@ impl CapabilityManifest {
             resources,
             actions,
             credentials: None,
+            hold: None,
         };
-        match wire.credentials {
-            None => Ok(manifest),
+        let manifest = match wire.credentials {
+            None => manifest,
             Some(grants) => grants_from_wire(grants)
                 .and_then(|grants| manifest.with_credentials(grants))
-                .map_err(TaskAdmissionError::MalformedCredentialGrant),
+                .map_err(TaskAdmissionError::MalformedCredentialGrant)?,
+        };
+        match wire.hold {
+            None => Ok(manifest),
+            Some(hold) => HoldGrant::try_from(hold)
+                .and_then(|hold| manifest.with_hold(hold))
+                .map_err(TaskAdmissionError::MalformedHold),
         }
     }
 
@@ -453,6 +485,12 @@ impl CapabilityManifest {
     pub const fn credentials(&self) -> Option<&CredentialGrants> {
         self.credentials.as_ref()
     }
+
+    /// The capabilities the manifest asks the node to hold until approved, if any.
+    #[must_use]
+    pub const fn hold(&self) -> Option<&HoldGrant> {
+        self.hold.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -467,6 +505,15 @@ struct CapabilityManifestWire {
     actions: Option<ActionGrantWire>,
     #[serde(default, deserialize_with = "deserialize_present_credentials")]
     credentials: Option<Vec<CredentialGrantWire>>,
+    #[serde(default, deserialize_with = "deserialize_present_hold")]
+    hold: Option<HoldGrantWire>,
+}
+
+fn deserialize_present_hold<'de, D>(deserializer: D) -> Result<Option<HoldGrantWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    HoldGrantWire::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_credentials<'de, D>(

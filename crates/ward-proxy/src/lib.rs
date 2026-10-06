@@ -40,6 +40,7 @@
 //! | [`http`] | Bounded, strict request parsing; origin-form rewrite; body framing |
 //! | [`secret`] | `Secret`: no `Display`, redacted `Debug`, zeroed on drop |
 //! | [`gateway`] | `GatewayRoute`: prefix match, credential scope, rewrite + injection, TLS upstream |
+//! | [`hold`] | `Hold`: a caller's veto on allowed requests until it releases them |
 //! | [`observer`] | `Observer`, `Decision`, `NullObserver` |
 //! | [`proxy`] | `Config`, `Proxy::spawn`, `Handle`, the thread-per-connection relay |
 //!
@@ -58,6 +59,7 @@
 pub mod addr;
 pub mod error;
 pub mod gateway;
+pub mod hold;
 pub mod hosts;
 pub mod http;
 pub mod observer;
@@ -69,6 +71,7 @@ pub mod secret;
 pub use addr::AddrClass;
 pub use error::Error;
 pub use gateway::{GatewayRoute, LeaseDeadline, ScopeDenial};
+pub use hold::{Held, Hold};
 pub use http::{Header, Host, Method, ParseError, Parsed, Request, Target};
 pub use observer::{Decision, NullObserver, Observer};
 pub use policy::{Denial, Pinned, Policy};

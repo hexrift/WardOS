@@ -2,7 +2,7 @@
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
 //! [--task-root <dir>] [--network-allowlist [--credentials <file>]] [--output-return]
-//! [--action-channel] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
+//! [--action-channel [--approval-hold]] [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
 //! [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
@@ -25,7 +25,13 @@
 //! into the sandbox at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, on which
 //! the workload asks and the node records, relays and answers; the control plane reads the
 //! pending requests with `actions` and answers them with `answer`, and the node advertises
-//! `actions`; without it such a manifest is refused `unsupported_grant`. With `--credentials`
+//! `actions`; without it such a manifest is refused `unsupported_grant`. With
+//! `--approval-hold` as well (it needs `--action-channel` and `--network-allowlist`), a
+//! manifest's `hold` is honoured: the first request the attempt's egress proxy sees for a
+//! held host or credential service opens an approval request on the action channel, and
+//! the proxy refuses that capability with a named `403` until the control plane's approval
+//! of that request is recorded; the node advertises `actions.hold`, and without the flag
+//! such a manifest is refused `unsupported_grant`. With `--credentials`
 //! as well (it needs `--network-allowlist`), the operator's credentials file names the
 //! providers and services the node brokers: a manifest's `credentials` grant for a
 //! configured service gets a short-lived lease, bounded by the attempt, that the attempt's
@@ -78,6 +84,7 @@ use ward_node_protocol::{
 
 #[derive(Parser)]
 #[command(name = "ward-node", version, subcommand_negates_reqs = true)]
+#[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -125,6 +132,15 @@ struct Cli {
     /// `unsupported_grant`.
     #[arg(long, requires = "task_root")]
     action_channel: bool,
+    /// Honour a manifest's `hold`: the first request the attempt's egress proxy sees for a
+    /// held host or credential service opens an approval request on the attempt's action
+    /// channel, and the proxy refuses that capability with a named `403` until the control
+    /// plane's approval of that request is recorded; a denial, an expiry or the attempt's
+    /// end keep it refused. Advertise `actions.hold`. Needs `--action-channel` and
+    /// `--network-allowlist`. Without it every manifest with `hold` is refused
+    /// `unsupported_grant`.
+    #[arg(long, requires_all = ["action_channel", "network_allowlist"])]
+    approval_hold: bool,
     /// Broker credentials to admitted workloads: a TOML file of the operator's (the node
     /// user's own, writable by no one else) naming credential providers and the services
     /// they back. A manifest's `credentials` grant for a configured service gets a
@@ -292,6 +308,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                     .with_network_allowlist(cli.network_allowlist)
                     .with_output_return(cli.output_return)
                     .with_action_channel(cli.action_channel)
+                    .with_approval_hold(cli.approval_hold)
                     .with_credentials(credentials)
                     .with_resource_enforcement(enforcement)
                     .with_scheduling(scheduling),
@@ -477,6 +494,38 @@ mod tests {
     }
 
     #[test]
+    fn an_approval_hold_needs_the_action_channel_and_the_allowlist() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+            "--task-root",
+            "t",
+        ];
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--network-allowlist",
+            "--action-channel",
+            "--approval-hold",
+        ]))
+        .expect("serve holding approval-gated capabilities");
+        assert!(cli.approval_hold && cli.action_channel && cli.network_allowlist);
+        for without in [
+            ["--action-channel", "--approval-hold"],
+            ["--network-allowlist", "--approval-hold"],
+        ] {
+            assert!(
+                Cli::try_parse_from(serve.iter().copied().chain(without)).is_err(),
+                "a hold needs the action channel and the allowlist: {without:?}"
+            );
+        }
+    }
+
+    #[test]
     fn task_root_is_optional_and_snapshot_import_needs_a_state_dir() {
         let node = NodeId::from_u128(4).to_string();
         let serve = [
@@ -533,6 +582,7 @@ mod tests {
             Cli::try_parse_from(serve.iter().copied().chain(["--action-channel"])).is_err(),
             "the action channel needs a task root"
         );
+        assert!(!cli.approval_hold);
         let cli = Cli::try_parse_from(serve.iter().copied().chain([
             "--task-root",
             "t",

@@ -36,7 +36,11 @@
 //!   `actions` grant its own channel into the sandbox ([`actions`]), serves the read-only
 //!   `actions` listing of its pending requests and the mutating `answer`, and advertises
 //!   `actions` in 1.3 capability discovery. Any other node refuses the grant
-//!   `unsupported_grant` at `admit` and both requests as unsupported.
+//!   `unsupported_grant` at `admit` and both requests as unsupported. One that also holds
+//!   approval-gated capabilities ([`execution::NodeExecution::with_approval_hold`], #415)
+//!   refuses each capability a manifest's `hold` names in the attempt's egress proxy until
+//!   the control plane approves the request the node opens for it on first use, and
+//!   advertises `actions.hold`.
 //!
 //! * at protocol 1.3, a service whose execution runs attempts in cgroups
 //!   ([`cgroup`], `--cgroup-root`) honours a manifest's `resources` limits, records what
@@ -199,6 +203,7 @@ pub struct NodeService {
     network_allowlist: bool,
     output_return: bool,
     action_channel: bool,
+    approval_hold: bool,
     credentials: bool,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
@@ -221,6 +226,7 @@ impl NodeService {
             network_allowlist: false,
             output_return: false,
             action_channel: false,
+            approval_hold: false,
             credentials: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
@@ -248,6 +254,7 @@ impl NodeService {
             network_allowlist: false,
             output_return: false,
             action_channel: false,
+            approval_hold: false,
             credentials: false,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
@@ -275,6 +282,7 @@ impl NodeService {
         let network_allowlist = execution.honours_network_allowlist();
         let output_return = execution.honours_output_return();
         let action_channel = execution.honours_action_channel();
+        let approval_hold = execution.honours_approval_hold();
         let credentials = execution.honours_credentials();
         Ok(Self {
             capabilities,
@@ -284,6 +292,7 @@ impl NodeService {
             network_allowlist,
             output_return,
             action_channel,
+            approval_hold,
             credentials,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
@@ -399,7 +408,10 @@ impl NodeService {
                 scheduling = tasks.scheduling();
             }
             if self.executes && self.action_channel {
-                actions = ActionCapabilities::CEILINGS;
+                actions = ActionCapabilities {
+                    hold: self.approval_hold,
+                    ..ActionCapabilities::CEILINGS
+                };
             }
             LifecycleCapabilities {
                 admit: self.admits,
@@ -1701,7 +1713,7 @@ mod tests {
         executing_service_configured(
             capabilities(),
             crate::execution::DEFAULT_STOP_TIMEOUT,
-            (network_allowlist, false, false),
+            (network_allowlist, false, false, false),
             Some(Arc::new(
                 crate::credentials::NodeCredentials::parse(crate::test_support::CREDENTIALS)
                     .unwrap(),
@@ -1719,7 +1731,7 @@ mod tests {
         executing_service_configured(
             configured,
             stop_timeout,
-            (network_allowlist, output_return, action_channel),
+            (network_allowlist, output_return, action_channel, false),
             None,
         )
     }
@@ -1727,7 +1739,7 @@ mod tests {
     fn executing_service_configured(
         configured: NodeCapabilities,
         stop_timeout: Duration,
-        (network_allowlist, output_return, action_channel): (bool, bool, bool),
+        (network_allowlist, output_return, action_channel, approval_hold): (bool, bool, bool, bool),
         credentials: Option<Arc<crate::credentials::NodeCredentials>>,
     ) -> Executing {
         let dir = tempfile::tempdir().unwrap();
@@ -1749,6 +1761,7 @@ mod tests {
         .with_network_allowlist(network_allowlist)
         .with_output_return(output_return)
         .with_action_channel(action_channel)
+        .with_approval_hold(approval_hold)
         .with_credentials(credentials);
         let service = NodeService::with_execution(configured, admission, execution).unwrap();
         Executing {
@@ -2552,6 +2565,54 @@ mod tests {
                 "1.{minor}"
             );
         }
+    }
+
+    fn executing_service_holding(network_allowlist: bool, action_channel: bool) -> Executing {
+        executing_service_configured(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            (network_allowlist, false, action_channel, true),
+            None,
+        )
+    }
+
+    #[test]
+    fn the_hold_is_advertised_only_with_the_channel_and_the_allowlist_and_admitted_only_then() {
+        let holding = executing_service_holding(true, true);
+        let (raw, observed) = discovered(&holding.service, 3);
+        assert!(observed.actions().hold);
+        assert!(
+            raw.contains(r#""actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600,"hold":true}"#),
+            "{raw}"
+        );
+        for minor in [1, 2] {
+            assert!(
+                !discovered(&holding.service, minor).0.contains("hold"),
+                "1.{minor}"
+            );
+        }
+        let channel_only = executing_service_holding(false, true);
+        let (raw, observed) = discovered(&channel_only.service, 3);
+        assert!(!observed.actions().hold);
+        assert!(!raw.contains("hold"), "{raw}");
+        let allowlist_only = executing_service_holding(true, false);
+        let (raw, observed) = discovered(&allowlist_only.service, 3);
+        assert_eq!(
+            observed.actions(),
+            ward_node_protocol::ActionCapabilities::NONE
+        );
+        assert!(!raw.contains("hold"), "{raw}");
+        let unflagged = executing_service_built(
+            capabilities(),
+            crate::execution::DEFAULT_STOP_TIMEOUT,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(
+            discovered(&unflagged.service, 3).1.actions(),
+            ward_node_protocol::ActionCapabilities::CEILINGS
+        );
     }
 
     #[test]
