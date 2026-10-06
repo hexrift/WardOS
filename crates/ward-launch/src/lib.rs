@@ -169,8 +169,10 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
 ];
-const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
-const PROC_MASKED_FILES: [&str; 6] = [
+/// The directories of `/proc` every sandbox masks with an empty read-only tmpfs.
+pub const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
+/// The files of `/proc` every sandbox masks with `/dev/null`.
+pub const PROC_MASKED_FILES: [&str; 6] = [
     "kcore",
     "keys",
     "latency_stats",
@@ -1391,6 +1393,12 @@ mod tests {
 
     /// The plan states exactly what `args` hands bubblewrap: every variable it sets, in
     /// order; every bind, writable or not, and every private directory; the command line.
+    fn is_proc_mask(path: &str) -> bool {
+        path.strip_prefix("/proc/").is_some_and(|name| {
+            PROC_MASKED_DIRECTORIES.contains(&name) || PROC_MASKED_FILES.contains(&name)
+        })
+    }
+
     #[test]
     fn a_plan_is_what_bubblewrap_is_given() {
         let launches = [
@@ -1419,15 +1427,23 @@ mod tests {
                 let mut next = || rest.next().unwrap().clone();
                 match arg.as_str() {
                     "--setenv" => env.push((next(), next())),
-                    "--ro-bind" => mounts.push(SandboxMount::ReadOnly {
-                        host: PathBuf::from(next()),
-                        path: next(),
-                    }),
+                    "--ro-bind" => {
+                        let host = PathBuf::from(next());
+                        let path = next();
+                        if !is_proc_mask(&path) {
+                            mounts.push(SandboxMount::ReadOnly { host, path });
+                        }
+                    }
                     "--bind" => mounts.push(SandboxMount::Writable {
                         host: PathBuf::from(next()),
                         path: next(),
                     }),
-                    "--tmpfs" | "--dir" => mounts.push(SandboxMount::Private { path: next() }),
+                    "--tmpfs" | "--dir" => {
+                        let path = next();
+                        if !is_proc_mask(&path) {
+                            mounts.push(SandboxMount::Private { path });
+                        }
+                    }
                     "--hostname" => assert_eq!(next(), plan.hostname),
                     "--chdir" => assert_eq!(next(), plan.cwd),
                     "--proc" | "--dev" => assert!(["/proc", "/dev"].contains(&next().as_str())),

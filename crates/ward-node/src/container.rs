@@ -78,18 +78,16 @@ const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The namespaces of every container: all of bubblewrap's, the cgroup one included.
 const NAMESPACES: [&str; 7] = ["user", "mount", "pid", "ipc", "uts", "network", "cgroup"];
 
-/// Paths of `/proc` the container cannot read.
-const MASKED: [&str; 9] = [
-    "/proc/acpi",
-    "/proc/kcore",
-    "/proc/keys",
-    "/proc/latency_stats",
-    "/proc/timer_list",
-    "/proc/timer_stats",
-    "/proc/sched_debug",
-    "/proc/scsi",
-    "/sys/firmware",
-];
+/// Paths the container cannot read: every `/proc` path a sandbox masks, and the firmware
+/// tables of `/sys`.
+fn masked_paths() -> Vec<String> {
+    ward_launch::PROC_MASKED_DIRECTORIES
+        .iter()
+        .chain(ward_launch::PROC_MASKED_FILES.iter())
+        .map(|name| format!("/proc/{name}"))
+        .chain(std::iter::once("/sys/firmware".to_owned()))
+        .collect()
+}
 
 /// Paths of `/proc` the container can only read.
 const READ_ONLY_PROC: [&str; 5] = [
@@ -452,7 +450,7 @@ fn oci_config(plan: &SandboxPlan, uid: u32, gid: u32) -> Value {
             "namespaces": namespaces,
             "uidMappings": [{"containerID": 0, "hostID": uid, "size": 1}],
             "gidMappings": [{"containerID": 0, "hostID": gid, "size": 1}],
-            "maskedPaths": MASKED,
+            "maskedPaths": masked_paths(),
             "readonlyPaths": READ_ONLY_PROC,
             "seccomp": Profile::baseline(),
         },
@@ -706,6 +704,18 @@ mod tests {
     use ward_launch::Launch;
 
     use super::*;
+
+    #[test]
+    fn the_container_masks_every_proc_path_a_sandbox_masks() {
+        let masked = masked_paths();
+        for name in ward_launch::PROC_MASKED_DIRECTORIES
+            .iter()
+            .chain(ward_launch::PROC_MASKED_FILES.iter())
+        {
+            assert!(masked.contains(&format!("/proc/{name}")), "/proc/{name}");
+        }
+        assert!(masked.contains(&"/sys/firmware".to_owned()));
+    }
 
     fn plan() -> SandboxPlan {
         Launch::new("/tmp", vec!["python3".into(), "probe.py".into()])
