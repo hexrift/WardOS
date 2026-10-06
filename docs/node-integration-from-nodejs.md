@@ -895,12 +895,17 @@ both refuse `sandbox`, an unknown level and anything else outside the grammar be
 anything is signed. `isolationFloorOf(envelope_json)` reads it back from the signed bytes.
 
 **The node's offer** is its capability document's existing `isolation` section:
-`namespaces.sandbox` for `sandbox` and `backends.<level>` for the others (§5). The node
-places an attempt on a backend at exactly its floor, never weaker, and refuses a floor it
-has no backend for `unsupported_grant` at `admit`; at this revision every node offers
-only `sandbox`. `offersIsolation(capabilities, level)` says whether, and
-`requireIsolation(capabilities, floor)` refuses, naming the flag and `unsupported_grant`,
-before a version is allocated or anything is signed.
+`namespaces.sandbox` for `sandbox` and `backends.<level>` for the others (§5). A node
+started with `--container-runtime` offers `container` as well and runs such an attempt in
+an OCI container driven by `runc`. The node places an attempt on a backend at exactly its
+floor, never weaker, and refuses a floor it has no backend for `unsupported_grant` at
+`admit`; a node whose operator started it with `--place-stronger` says
+`isolation.stronger_placement` `true` and runs an attempt on the weakest level it offers
+above its floor instead, so an unmarked manifest runs in a container there.
+`offersIsolation(capabilities, level)` says whether a level is offered,
+`placesStronger(capabilities)` whether the node places stronger, and
+`requireIsolation(capabilities, floor)` refuses a floor the node can place nowhere, naming
+the flag and `unsupported_grant`, before a version is allocated or anything is signed.
 
 **The command line.** `control-plane.mjs run --isolation <level>` puts the floor in the
 manifest, reads the capability document first and exits 2, naming `unsupported_grant`, on
@@ -972,7 +977,7 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 120 cases, no node, no sandbox
+cd examples/node-control-plane && node --test       # 132 cases, no node, no sandbox
 scripts/acceptance/node-js.sh                        # 28 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
@@ -1011,8 +1016,9 @@ accepted, given up once the wait is spent, revoked and sealed when cancelled whi
 never sent again when that revoke is refused),
 and never waited out by `replay`, and isolation floors: the floor's grammar held to
 `ward-node-protocol`'s (`sandbox` and unknown levels refused, the §7.5 example signed byte
-for byte, last), the capability document's `isolation` flag for exactly that level read
-before signing, and `run --isolation` signed, listed, replayed and refused.
+for byte, last), the capability document's `isolation` flag for exactly that level (or
+one above it on a node placing stronger) read before signing, and `run --isolation`
+signed, listed, replayed and refused.
 The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,

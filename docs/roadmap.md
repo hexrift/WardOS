@@ -365,9 +365,11 @@ interactive references in [`design/storyboard/`](design/storyboard/):
   no copy-back. Unifies the existing sandbox/verifier/network mechanisms; KVM/QEMU is the
   microVM/VM foundation. On `ward-node` the backend contract, the ordered isolation levels
   and the manifest's isolation floor are [ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md)
-  (proposed; #263): the bubblewrap launch is its first backend at `sandbox`, and a floor no
-  backend meets is refused, never run weaker. A container backend with cross-backend
-  conformance, then a microVM backend, are next.
+  (proposed; #263): the bubblewrap launch is its first backend at `sandbox`, the operator's
+  `runc` its second at `container` (`--container-runtime`), held to the same authority by a
+  cross-backend conformance suite, and a floor no backend meets is refused, never run
+  weaker; stronger placement is the operator's `--place-stronger`. A microVM backend is
+  next.
 * **Ward Studio + the Ward Agent Runtime** ([ADR-0023](decisions/ADR-0023-ward-studio-and-agent-runtime.md),
   *proposed/roadmap*) — a first-party agentic IDE whose unit of work is *work*, over a
   provider-agnostic agent runtime (Claude/Codex/Gemini/local as replaceable brains). WardOS

@@ -27,6 +27,7 @@ import {
   loadRunRecord,
   manifest,
   offersIsolation,
+  placesStronger,
   requireIsolation,
   rootLease,
   signEnvelope,
@@ -47,14 +48,19 @@ function text(built) {
   return Buffer.from(built.bytes, "hex").toString("utf8");
 }
 
-/** A capability document as a node reports it, offering backends at `levels` beside its sandbox. */
-function document(levels = [], sandbox = true) {
+/**
+ * A capability document as a node reports it, offering backends at `levels` beside its
+ * sandbox, and `stronger_placement` when it places stronger than a floor.
+ */
+function document(levels = [], sandbox = true, stronger = false) {
+  const isolation = {
+    namespaces: { sandbox, user_namespace: sandbox },
+    backends: { container: levels.includes("container"), microvm: levels.includes("microvm"), vm: levels.includes("vm") },
+  };
+  if (stronger) isolation.stronger_placement = true;
   return {
     protocol: { major: 1, minor: 3 },
-    isolation: {
-      namespaces: { sandbox, user_namespace: sandbox },
-      backends: { container: levels.includes("container"), microvm: levels.includes("microvm"), vm: levels.includes("vm") },
-    },
+    isolation,
     lifecycle: { pause: true, stop: true, revoke: true, admit: true, start: true },
   };
 }
@@ -169,6 +175,27 @@ test("requireIsolation refuses, naming the flag and unsupported_grant, or return
   assert.throws(() => requireIsolation(document(), isolationFloor("microvm")), /does not advertise isolation\.backends\.microvm true.*floor of microvm as unsupported_grant/);
   assert.throws(() => requireIsolation(document(["vm"]), { minimum: "container" }), /isolation\.backends\.container.*unsupported_grant/);
   assert.throws(() => requireIsolation(offering, { minimum: "sandbox" }), /leaving isolation out/);
+});
+
+test("a container floor is signed for a node that runs containers (--container-runtime)", () => {
+  const containers = document(["container"]);
+  assert.equal(requireIsolation(containers, isolationFloor("container")), containers);
+  assert.equal(text(manifest({ network: "offline", isolation: isolationFloor("container") })), '{"network":"offline","isolation":{"minimum":"container"}}');
+  assert.throws(() => requireIsolation(document(), isolationFloor("container")), /isolation\.backends\.container true.*unsupported_grant/);
+  assert.throws(() => requireIsolation(containers, isolationFloor("microvm")), /isolation\.backends\.microvm/);
+});
+
+test("a node placing stronger takes a floor it offers a level above, and only then", () => {
+  assert.equal(placesStronger(document(["container"])), false);
+  assert.equal(placesStronger(document(["container"], true, true)), true);
+  assert.equal(placesStronger({ isolation: { stronger_placement: "true" } }), false);
+  assert.equal(placesStronger(null), false);
+  const stronger = document(["vm"], true, true);
+  assert.equal(requireIsolation(stronger, isolationFloor("container")), stronger);
+  assert.equal(requireIsolation(stronger, isolationFloor("microvm")), stronger);
+  assert.equal(requireIsolation(stronger, isolationFloor("vm")), stronger);
+  assert.throws(() => requireIsolation(document(["vm"]), isolationFloor("microvm")), /isolation\.backends\.microvm/, "never stronger without the operator's policy");
+  assert.throws(() => requireIsolation(document(["container"], true, true), isolationFloor("microvm")), /isolation\.backends\.microvm/, "never weaker");
 });
 
 // ---- the command line ------------------------------------------------------------------

@@ -16,6 +16,10 @@
 /// enforce isolation cannot report a successful security verification (#124).
 pub const REQUIRE_ISOLATION_ENV: &str = "WARD_REQUIRE_ISOLATION";
 
+/// Environment variable that turns a missing OCI container runtime from a test skip into
+/// a hard failure (#263). Independent of [`REQUIRE_ISOLATION_ENV`].
+pub const REQUIRE_CONTAINER_ENV: &str = "WARD_REQUIRE_CONTAINER";
+
 /// Whether isolation execution is mandatory on this host, i.e.
 /// [`REQUIRE_ISOLATION_ENV`] is set to a non-empty value.
 #[must_use]
@@ -37,18 +41,45 @@ pub fn isolation_ready(present: bool, prerequisite: &str) -> bool {
     gate(present, isolation_required(), prerequisite)
 }
 
+/// Whether OCI container execution is mandatory on this host, i.e.
+/// [`REQUIRE_CONTAINER_ENV`] is set to a non-empty value.
+#[must_use]
+pub fn container_required() -> bool {
+    std::env::var_os(REQUIRE_CONTAINER_ENV).is_some_and(|v| !v.is_empty())
+}
+
+/// Gate a test body on an OCI container runtime that can run a container here, as
+/// [`isolation_ready`] gates on bubblewrap: `true` when `present`, otherwise a named
+/// skip, or a panic when [`container_required`].
+#[must_use]
+#[track_caller]
+pub fn container_ready(present: bool, prerequisite: &str) -> bool {
+    gate_on(
+        present,
+        container_required(),
+        REQUIRE_CONTAINER_ENV,
+        prerequisite,
+    )
+}
+
 /// The pure decision behind [`isolation_ready`], with `required` passed in so the
 /// negative CI-gate test can exercise the red path without mutating the process
 /// environment (which would race parallel tests).
 #[must_use]
 #[track_caller]
 fn gate(present: bool, required: bool, prerequisite: &str) -> bool {
+    gate_on(present, required, REQUIRE_ISOLATION_ENV, prerequisite)
+}
+
+#[must_use]
+#[track_caller]
+fn gate_on(present: bool, required: bool, switch: &str, prerequisite: &str) -> bool {
     if present {
         return true;
     }
     assert!(
         !required,
-        "{REQUIRE_ISOLATION_ENV} is set but the isolation prerequisite is unavailable: \
+        "{switch} is set but the isolation prerequisite is unavailable: \
          {prerequisite}. CI (issue #124) requires the isolation tests to run for real; a \
          runner that cannot enforce isolation must fail the required job, not skip it."
     );
@@ -77,5 +108,20 @@ mod tests {
     #[should_panic(expected = "WARD_REQUIRE_ISOLATION")]
     fn absent_prerequisite_is_red_when_required() {
         let _ = gate(false, true, "bubblewrap");
+    }
+
+    #[test]
+    fn the_container_gate_skips_on_its_own_switch() {
+        assert!(gate_on(true, true, REQUIRE_CONTAINER_ENV, "runc"));
+        assert!(!gate_on(false, false, REQUIRE_CONTAINER_ENV, "runc"));
+    }
+
+    /// A missing container runtime is red under its own switch, named in the failure.
+    #[test]
+    #[should_panic(
+        expected = "WARD_REQUIRE_CONTAINER is set but the isolation prerequisite is unavailable: runc"
+    )]
+    fn the_container_gate_is_red_when_required() {
+        let _ = gate_on(false, true, REQUIRE_CONTAINER_ENV, "runc");
     }
 }

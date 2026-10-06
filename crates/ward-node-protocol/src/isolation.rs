@@ -340,8 +340,36 @@ mod tests {
                     user_namespace: false,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             }
         );
+        assert_eq!(
+            serde_json::to_string(&none.offering(IsolationLevel::Container)).unwrap(),
+            r#"{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":true,"microvm":false,"vm":false}}"#,
+            "a node placing every attempt at its floor says nothing more"
+        );
+        let stronger = IsolationCapabilities {
+            stronger_placement: true,
+            ..none.offering(IsolationLevel::Container)
+        };
+        let wire = serde_json::to_string(&stronger).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":true,"microvm":false,"vm":false},"stronger_placement":true}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<IsolationCapabilities>(&wire).unwrap(),
+            stronger
+        );
+        for bad in [
+            r#"{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":true,"microvm":false,"vm":false},"stronger_placement":"yes"}"#,
+            r#"{"namespaces":{"sandbox":false,"user_namespace":false},"backends":{"container":true,"microvm":false,"vm":false},"placement":"stronger"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<IsolationCapabilities>(bad).is_err(),
+                "{bad}"
+            );
+        }
         assert_eq!(
             none.offering(IsolationLevel::Microvm).backends,
             ExecutionBackendCapabilities {

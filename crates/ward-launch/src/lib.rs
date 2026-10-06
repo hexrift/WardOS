@@ -169,8 +169,10 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
 ];
-const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
-const PROC_MASKED_FILES: [&str; 6] = [
+/// The directories of `/proc` every sandbox masks with an empty read-only tmpfs.
+pub const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
+/// The files of `/proc` every sandbox masks with `/dev/null`.
+pub const PROC_MASKED_FILES: [&str; 6] = [
     "kcore",
     "keys",
     "latency_stats",
@@ -244,6 +246,54 @@ fn sandbox_path(host: &str) -> String {
         }
     }
     out.join(":")
+}
+
+/// The hostname inside every sandbox.
+pub const SANDBOX_HOSTNAME: &str = "ward-sandbox";
+
+/// One mount of a [`SandboxPlan`], at a sandbox path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SandboxMount {
+    /// A host path bound read-only.
+    ReadOnly {
+        /// The host path.
+        host: PathBuf,
+        /// Where the sandbox sees it.
+        path: String,
+    },
+    /// A host path bound writable: the worktree and the node's sockets.
+    Writable {
+        /// The host path.
+        host: PathBuf,
+        /// Where the sandbox sees it.
+        path: String,
+    },
+    /// An empty directory private to the sandbox, writable, gone with it.
+    Private {
+        /// Where the sandbox sees it.
+        path: String,
+    },
+}
+
+/// Everything a [`Launch`] gives the sandboxed program, as [`Launch::plan`] states it.
+/// Beyond it the sandbox always has its own user, mount, PID, IPC, UTS and network
+/// namespaces (the network one shared with the host only for [`Launch::host_network`]),
+/// a fresh `/proc` and a minimal `/dev`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SandboxPlan {
+    /// The whole environment, in the order it is set: `PWD` last, as bubblewrap sets it
+    /// once it has changed into the working directory.
+    pub env: Vec<(String, String)>,
+    /// The mounts, each after every mount its path lies under.
+    pub mounts: Vec<SandboxMount>,
+    /// The working directory.
+    pub cwd: String,
+    /// The hostname.
+    pub hostname: String,
+    /// Whether the launch keeps the host's network namespace.
+    pub host_network: bool,
+    /// The command line, the shim's included.
+    pub command: Vec<String>,
 }
 
 /// How the command's stdio is handled.
@@ -616,7 +666,7 @@ impl Launch {
                 WORK_ROOT,
             ],
         );
-        push(&mut a, &["--hostname", "ward-sandbox"]);
+        push(&mut a, &["--hostname", SANDBOX_HOSTNAME]);
         // The network namespace is isolated: the only way out is the egress socket,
         // and only when the session provides one (ADR-0014). The one exception is a
         // launch that asked for the host network explicitly (`host_network`, the
@@ -665,24 +715,107 @@ impl Launch {
             push(&mut a, &["--ro-bind", &shim.to_string_lossy(), AGENT_SHIM]);
         }
         push(&mut a, &["--"]);
+        a.extend(self.command());
+        a
+    }
+
+    /// The command line run inside the sandbox: the argv, behind the shim when the launch
+    /// has one.
+    fn command(&self) -> Vec<String> {
+        let mut a: Vec<String> = Vec::new();
         if self.shim.is_some() {
-            push(&mut a, &[AGENT_SHIM]);
+            a.push(AGENT_SHIM.into());
             for dir in SHIM_READ_ONLY {
-                push(&mut a, &["--ro", dir]);
+                a.extend(["--ro".to_owned(), dir.to_owned()]);
             }
             a.extend(self.shim_flags.iter().cloned());
             // The shim only forwards whitelisted env to the agent; name ours explicitly.
             for (k, _) in &self.env {
-                push(&mut a, &["--env", k]);
+                a.extend(["--env".to_owned(), k.clone()]);
             }
             if self.proxy_socket.is_some() {
                 a.push("--relay".into());
                 a.push(format!("{RELAY_ADDR}={PROXY_SOCKET}"));
             }
-            push(&mut a, &["--"]);
+            a.push("--".into());
         }
         a.extend(self.argv.iter().cloned());
         a
+    }
+
+    /// What this launch gives the sandboxed program, independent of the mechanism that
+    /// runs it: the same environment, mounts, working directory, hostname and command line
+    /// [`args`](Self::args) hands bubblewrap, so another runtime can run the same launch
+    /// from it (an OCI runtime over a bundle, `ward-node`'s container backend).
+    pub fn plan(&self, worktree: &Path) -> SandboxPlan {
+        let ro = |host: &str| SandboxMount::ReadOnly {
+            host: PathBuf::from(host),
+            path: host.to_owned(),
+        };
+        let private = |path: &str| SandboxMount::Private {
+            path: path.to_owned(),
+        };
+        let mut mounts: Vec<SandboxMount> = SYSTEM_RO
+            .iter()
+            .filter(|dir| Path::new(dir).exists())
+            .map(|dir| ro(dir))
+            .collect();
+        mounts.extend(["/tmp", "/home", "/run", "/home/agent", "/env"].map(private));
+        mounts.push(SandboxMount::Writable {
+            host: worktree.to_path_buf(),
+            path: WORK_ROOT.to_owned(),
+        });
+        if self.host_network {
+            mounts.extend(
+                ["/etc/resolv.conf", "/etc/hosts"]
+                    .into_iter()
+                    .filter(|file| Path::new(file).exists())
+                    .map(ro),
+            );
+        }
+        for (socket, path) in [
+            (&self.proxy_socket, PROXY_SOCKET),
+            (&self.action_socket, ACTION_SOCKET),
+            (&self.hook_socket, HOOK_SOCKET),
+        ] {
+            if let Some(socket) = socket {
+                mounts.push(SandboxMount::Writable {
+                    host: socket.clone(),
+                    path: path.to_owned(),
+                });
+            }
+        }
+        let bound = |(host, path): &(PathBuf, String)| SandboxMount::ReadOnly {
+            host: host.clone(),
+            path: path.clone(),
+        };
+        mounts.extend(self.seeds.iter().map(bound));
+        mounts.extend(self.tmpfs.iter().map(|path| private(path)));
+        mounts.extend(self.ro_binds.iter().map(bound));
+        if let Some(shim) = &self.shim {
+            mounts.push(SandboxMount::ReadOnly {
+                host: shim.clone(),
+                path: AGENT_SHIM.to_owned(),
+            });
+        }
+        let mut env: Vec<(String, String)> = vec![
+            ("HOME".to_owned(), "/home/agent".to_owned()),
+            ("PATH".to_owned(), sandbox_path(&host_path())),
+            ("TERM".to_owned(), "xterm".to_owned()),
+        ];
+        env.extend(self.env.iter().cloned());
+        if self.hook_socket.is_some() {
+            env.push(("WARD_SOCKET".to_owned(), HOOK_SOCKET.to_owned()));
+        }
+        env.push(("PWD".to_owned(), WORK_ROOT.to_owned()));
+        SandboxPlan {
+            env,
+            mounts,
+            cwd: WORK_ROOT.to_owned(),
+            hostname: SANDBOX_HOSTNAME.to_owned(),
+            host_network: self.host_network,
+            command: self.command(),
+        }
     }
 
     /// Execute the launch.
@@ -777,14 +910,7 @@ impl Launch {
         cmd.args(self.args(&worktree));
         let admitted = admit()?;
         let start = Instant::now();
-        let deadline = self
-            .budget
-            .map(|budget| {
-                start
-                    .checked_add(budget)
-                    .ok_or_else(|| Error::Sandbox("sandbox budget is out of range".into()))
-            })
-            .transpose()?;
+        let deadline = self.deadline(start)?;
         let launch_err = |e: std::io::Error| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Error::Sandbox("bubblewrap (bwrap) is not installed".into())
@@ -810,7 +936,47 @@ impl Launch {
                 None => Ok(child),
             });
         drop(admitted);
-        let mut child = spawned?;
+        Ok(self.own(spawned?, start, deadline))
+    }
+
+    /// Spawn `runtime`, a program that runs this launch's [`plan`](Self::plan) itself in
+    /// place of `bwrap` (an OCI runtime over a bundle built from it), and own it exactly as
+    /// [`spawn`](Self::spawn) owns `bwrap`: started with no environment when the launch
+    /// clears it, its stdio drained within the capture bounds, its budget measured from
+    /// the spawn, killed and reaped when the handle is dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an empty command or a failed spawn.
+    pub fn spawn_runtime(&self, mut runtime: Command) -> Result<RunningLaunch> {
+        if self.argv.is_empty() {
+            return Err(Error::Sandbox("empty command".into()));
+        }
+        if self.clear_env {
+            runtime.env_clear();
+        }
+        if self.stdio == StdioMode::Capture {
+            runtime.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
+        let start = Instant::now();
+        let deadline = self.deadline(start)?;
+        let child = runtime
+            .spawn()
+            .map_err(|e| Error::Sandbox(format!("failed to launch the runtime: {e}")))?;
+        Ok(self.own(child, start, deadline))
+    }
+
+    fn deadline(&self, start: Instant) -> Result<Option<Instant>> {
+        self.budget
+            .map(|budget| {
+                start
+                    .checked_add(budget)
+                    .ok_or_else(|| Error::Sandbox("sandbox budget is out of range".into()))
+            })
+            .transpose()
+    }
+
+    fn own(&self, mut child: Child, start: Instant, deadline: Option<Instant>) -> RunningLaunch {
         let bound = self.capture_bytes;
         let raw_head = self.raw_head_bytes;
         let keep = self.keep_prefix.clone();
@@ -819,14 +985,14 @@ impl Launch {
             .take()
             .map(|r| drain(r, bound, raw_head, keep.clone()));
         let stderr = child.stderr.take().map(|r| drain(r, bound, raw_head, keep));
-        Ok(RunningLaunch {
+        RunningLaunch {
             child,
             stdout,
             stderr,
             start,
             deadline,
             reaped: false,
-        })
+        }
     }
 }
 
@@ -1222,6 +1388,144 @@ mod tests {
         assert!(
             a.contains("--dir /home/agent") && a.contains("--tmpfs /env"),
             "shim rw paths exist"
+        );
+    }
+
+    /// The plan states exactly what `args` hands bubblewrap: every variable it sets, in
+    /// order; every bind, writable or not, and every private directory; the command line.
+    fn is_proc_mask(path: &str) -> bool {
+        path.strip_prefix("/proc/").is_some_and(|name| {
+            PROC_MASKED_DIRECTORIES.contains(&name) || PROC_MASKED_FILES.contains(&name)
+        })
+    }
+
+    #[test]
+    fn a_plan_is_what_bubblewrap_is_given() {
+        let launches = [
+            Launch::new("/tmp", vec!["true".into()]).clear_env(),
+            Launch::new("/tmp", vec!["sh".into(), "-c".into(), "x".into()])
+                .clear_env()
+                .egress("/host/proxy.sock")
+                .actions("/host/actions.sock")
+                .hooks("/host/hooks.sock")
+                .seed("/host/settings.json", "/home/agent/.claude/settings.json")
+                .tmpfs("/run/verifier/cargo")
+                .ro_bind("/host/cargo/bin", "/run/verifier/cargo/bin")
+                .shim("/host/ward-agent")
+                .env("FOO", "bar"),
+            Launch::new("/tmp", vec!["true".into()]).host_network(),
+        ];
+        for launch in launches {
+            let args = launch.args(Path::new("/host/work"));
+            let plan = launch.plan(Path::new("/host/work"));
+            let run = args.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(plan.command, args[run + 1..]);
+            let mut env = Vec::new();
+            let mut mounts = Vec::new();
+            let mut rest = args[..run].iter();
+            while let Some(arg) = rest.next() {
+                let mut next = || rest.next().unwrap().clone();
+                match arg.as_str() {
+                    "--setenv" => env.push((next(), next())),
+                    "--ro-bind" => {
+                        let host = PathBuf::from(next());
+                        let path = next();
+                        if !is_proc_mask(&path) {
+                            mounts.push(SandboxMount::ReadOnly { host, path });
+                        }
+                    }
+                    "--bind" => mounts.push(SandboxMount::Writable {
+                        host: PathBuf::from(next()),
+                        path: next(),
+                    }),
+                    "--tmpfs" | "--dir" => {
+                        let path = next();
+                        if !is_proc_mask(&path) {
+                            mounts.push(SandboxMount::Private { path });
+                        }
+                    }
+                    "--hostname" => assert_eq!(next(), plan.hostname),
+                    "--chdir" => assert_eq!(next(), plan.cwd),
+                    "--proc" | "--dev" => assert!(["/proc", "/dev"].contains(&next().as_str())),
+                    _ => {}
+                }
+            }
+            env.push(("PWD".to_owned(), plan.cwd.clone()));
+            assert_eq!(plan.env, env);
+            let sorted = |mut mounts: Vec<SandboxMount>| {
+                mounts.sort_by_key(|mount| format!("{mount:?}"));
+                mounts
+            };
+            assert_eq!(sorted(plan.mounts.clone()), sorted(mounts));
+            assert_eq!(
+                plan.host_network,
+                !args.contains(&"--unshare-net".to_owned())
+            );
+            let paths: Vec<&str> = plan
+                .mounts
+                .iter()
+                .map(|mount| match mount {
+                    SandboxMount::ReadOnly { path, .. }
+                    | SandboxMount::Writable { path, .. }
+                    | SandboxMount::Private { path } => path.as_str(),
+                })
+                .collect();
+            for (index, path) in paths.iter().enumerate() {
+                assert!(
+                    !paths[index + 1..]
+                        .iter()
+                        .any(|later| Path::new(path).starts_with(later) && later != path),
+                    "{path} is mounted before a mount above it: {paths:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_runtime_is_owned_captured_and_budgeted_as_bubblewrap_is() {
+        let runtime = |script: &str| {
+            let mut command = Command::new("/bin/sh");
+            command.args(["-c", script]);
+            command
+        };
+        let launch = Launch::new("/tmp", vec!["unused".into()])
+            .clear_env()
+            .capture_bytes(1024)
+            .raw_head(3)
+            .budget(Duration::from_secs(10));
+        let out = launch
+            .spawn_runtime(runtime("echo \"out $HOME\"; echo err >&2; exit 3"))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert_eq!(out.code, Some(3));
+        assert_eq!(
+            out.stdout, "out \n",
+            "the runtime starts with no environment"
+        );
+        assert_eq!(out.stdout_raw_head, b"out");
+        assert_eq!(out.stderr_raw_head, b"err");
+        assert_eq!(out.stderr_bytes, 4);
+
+        let started = Instant::now();
+        let slow = Launch::new("/tmp", vec!["unused".into()])
+            .budget(Duration::from_millis(200))
+            .spawn_runtime(runtime("exec sleep 30"))
+            .unwrap()
+            .wait()
+            .unwrap();
+        assert!(slow.timed_out);
+        assert!(started.elapsed() < Duration::from_secs(10));
+
+        assert!(
+            Launch::new("/tmp", Vec::new())
+                .spawn_runtime(runtime("true"))
+                .is_err()
+        );
+        assert!(
+            Launch::new("/tmp", vec!["x".into()])
+                .spawn_runtime(Command::new("/nonexistent/runtime"))
+                .is_err()
         );
     }
 

@@ -36,7 +36,8 @@
 //!     naming an agent adapter only on a node that hosts it and can build its launch from
 //!     the argv ([`NodeAdmission::with_agent_adapters`], ADR-0036), and an `isolation`
 //!     floor only on a node with a Capsule backend its placement allows for it, never a
-//!     weaker one ([`NodeAdmission::with_capsule_placement`], ADR-0039); any other
+//!     weaker one, and `resources` limits only when that backend enforces them
+//!     ([`NodeAdmission::with_capsule_placement`], ADR-0039); any other
 //!     grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
@@ -410,7 +411,11 @@ impl NodeAdmission {
             return Err(Reason::UnsupportedGrant);
         }
         let placed = match &self.capsules {
-            Some(capsules) => capsules.place(manifest.minimum_isolation()).is_some(),
+            Some(capsules) => capsules
+                .place(manifest.minimum_isolation())
+                .is_some_and(|capsule| {
+                    manifest.resources().is_none() || capsule.honours_resources()
+                }),
             None => manifest.isolation().is_none(),
         };
         if !placed {
@@ -832,6 +837,76 @@ mod tests {
         let offline = TaskAdmissionEnvelope::new(envelope_input(lifecycle_binding())).unwrap();
         assert!(verify_signed(&plain, &offline, &issuer_keypair()).is_ok());
         assert!(verify_signed(&channel, &offline, &issuer_keypair()).is_ok());
+    }
+
+    #[test]
+    fn resources_limits_are_never_placed_on_a_backend_that_does_not_enforce_them() {
+        use ward_node_protocol::{
+            CapabilityManifest, CapabilityManifestBytes, IsolationGrant, IsolationLevel,
+            NetworkGrant, NodeCapacity, ResourceCapabilities, ResourceGrant,
+        };
+
+        use crate::capsule::{CapsuleBackendDescriptor, StrongerPlacement};
+        use crate::cgroup::ResourceEnforcement;
+
+        let dir = tempfile::tempdir().unwrap();
+        let enforcement = ResourceEnforcement::new(
+            ResourceCapabilities {
+                cpu: true,
+                memory: true,
+                pids: true,
+            },
+            NodeCapacity::new(4, 8 << 30).unwrap(),
+        );
+        let node = |name: &str, stronger| {
+            node_admission(&dir.path().join(name), &FixedClock::at(NOW))
+                .with_resource_enforcement(Some(enforcement))
+                .with_capsule_placement(Some(CapsulePlacement::new(
+                    vec![
+                        CapsuleBackendDescriptor::BUBBLEWRAP,
+                        CapsuleBackendDescriptor::RUNC,
+                    ],
+                    stronger,
+                )))
+        };
+        let with = |floor: Option<IsolationLevel>, limited: bool| {
+            let manifest = CapabilityManifest::new(NetworkGrant::Offline);
+            let manifest = match floor {
+                Some(level) => manifest.with_isolation(IsolationGrant::new(level).unwrap()),
+                None => manifest,
+            };
+            let manifest = if limited {
+                manifest.with_resources(ResourceGrant::new(None, None, Some(64)).unwrap())
+            } else {
+                manifest
+            };
+            let mut input = envelope_input(lifecycle_binding());
+            crate::test_support::with_manifest(
+                &mut input,
+                CapabilityManifestBytes::encode(&manifest).unwrap(),
+            );
+            TaskAdmissionEnvelope::new(input).unwrap()
+        };
+        let exact = node("exact", StrongerPlacement::Refused);
+        let stronger = node("stronger", StrongerPlacement::Allowed);
+        let container = Some(IsolationLevel::Container);
+        for (admission, floor, limited, admitted) in [
+            (&exact, None, true, true),
+            (&exact, container, false, true),
+            (&exact, container, true, false),
+            (&stronger, None, false, true),
+            (&stronger, None, true, false),
+        ] {
+            assert_eq!(
+                verify_signed(admission, &with(floor, limited), &issuer_keypair()).map(|_| ()),
+                if admitted {
+                    Ok(())
+                } else {
+                    Err(Reason::UnsupportedGrant)
+                },
+                "{floor:?} limited {limited}"
+            );
+        }
     }
 
     #[test]

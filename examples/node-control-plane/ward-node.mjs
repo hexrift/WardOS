@@ -667,13 +667,25 @@ export function offersIsolation(capabilities, level) {
 }
 
 /**
- * The capability document, refused unless it offers a backend at exactly the floor's
- * level: a node with none places the attempt nowhere and refuses the manifest
- * `unsupported_grant` at `admit` (ADR-0039 §5), so the client refuses it before signing.
+ * Whether the node's operator lets it run an attempt on a backend stronger than its floor
+ * (`isolation.stronger_placement`, §5, ADR-0039 §5): it then runs the attempt on the weakest
+ * level it offers above the floor, if any, and at the floor otherwise.
+ */
+export function placesStronger(capabilities) {
+  return capabilities?.isolation?.stronger_placement === true;
+}
+
+/**
+ * The capability document, refused unless the node can place the floor: it offers a backend
+ * at exactly the floor's level or, when it places stronger, at a level above it. Any other
+ * node places the attempt nowhere and refuses the manifest `unsupported_grant` at `admit`
+ * (ADR-0039 §5), so the client refuses it before signing.
  */
 export function requireIsolation(capabilities, floor) {
   const { minimum } = checkIsolation(floor);
-  if (!offersIsolation(capabilities, minimum)) {
+  const above = ISOLATION_LEVELS.slice(ISOLATION_LEVELS.indexOf(minimum) + 1);
+  const stronger = placesStronger(capabilities) && above.some((level) => offersIsolation(capabilities, level));
+  if (!offersIsolation(capabilities, minimum) && !stronger) {
     const flag = minimum === "sandbox" ? "isolation.namespaces.sandbox" : `isolation.backends.${minimum}`;
     refuse(`the node does not advertise ${flag} true and refuses an isolation floor of ${minimum} as unsupported_grant`);
   }

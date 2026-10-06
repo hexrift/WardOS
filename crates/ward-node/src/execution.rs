@@ -70,7 +70,7 @@ use ward_snapshot::SnapshotStore;
 use crate::actions::ACTION_SOCKET_ENV;
 use crate::adapters::AttemptAdapter;
 use crate::capsule::{
-    CapsuleBackend, CapsuleBackendDescriptor, CapsulePlacement, StrongerPlacement,
+    CapsuleBackend, CapsuleBackendDescriptor, CapsulePlacement, CapsuleRecord, StrongerPlacement,
 };
 use crate::cgroup::ResourceEnforcement;
 use crate::credentials::NodeCredentials;
@@ -412,6 +412,10 @@ pub trait TaskLauncher: Send + Sync {
     /// restarted, and wait a bounded time for it to die. A process that no longer has
     /// exactly that identity is never signalled.
     fn end_survivor(&self, process: &WorkloadProcess);
+
+    /// Remove what the launcher itself kept beside `workspace` for a workload a node that
+    /// has since restarted may have spawned there. Nothing, by default.
+    fn end_survivor_beside(&self, _workspace: &Path) {}
 }
 
 /// A freeze or thaw of a workload's process tree that could not be confirmed. A failed
@@ -487,21 +491,7 @@ impl SandboxLauncher {
         request: &LaunchRequest,
         cgroup: Option<&Path>,
     ) -> Result<Box<dyn RunningWorkload>, SpawnError> {
-        let egress = request
-            .allowlist()
-            .map(|allowlist| {
-                let dir = egress_dir_beside(request.workspace()).ok_or(SpawnError::Refused)?;
-                AttemptEgress::start_held(
-                    &dir,
-                    allowlist,
-                    request.credential_routes().to_vec(),
-                    request.hold(),
-                    Arc::new(SystemResolver),
-                )
-                .map(Arc::new)
-                .map_err(|_| SpawnError::Refused)
-            })
-            .transpose()?;
+        let egress = start_egress(request)?;
         let launch = sandbox_launch(request, egress.as_deref().map(AttemptEgress::socket));
         let launch = match cgroup {
             Some(dir) => launch.cgroup(dir),
@@ -524,25 +514,74 @@ impl TaskLauncher for SandboxLauncher {
     }
 
     fn end_survivor(&self, process: &WorkloadProcess) {
-        if current_boot().as_deref() == Some(process.boot()) {
-            let _ = kill_tree(
-                TreeRoot::recorded(process.pid(), process.start_time()),
-                DEFAULT_SURVIVOR_SETTLE,
-            );
-        }
+        end_survivor_tree(process);
     }
 }
 
-fn current_boot() -> Option<String> {
+/// Kill, with `SIGKILL`, the tree still rooted at a process with exactly the identity of
+/// `process`, from this boot, and wait a bounded time for it to die.
+pub(crate) fn end_survivor_tree(process: &WorkloadProcess) {
+    if current_boot().as_deref() == Some(process.boot()) {
+        let _ = kill_tree(
+            TreeRoot::recorded(process.pid(), process.start_time()),
+            DEFAULT_SURVIVOR_SETTLE,
+        );
+    }
+}
+
+pub(crate) fn current_boot() -> Option<String> {
     std::fs::read_to_string(BOOT_ID)
         .ok()
         .map(|boot| boot.trim().to_owned())
         .filter(|boot| !boot.is_empty())
 }
 
+/// The attempt's own egress proxy, started beside its workspace with exactly its
+/// allowlist, credential routes and hold; `None` for an offline launch.
+pub(crate) fn start_egress(
+    request: &LaunchRequest,
+) -> Result<Option<Arc<AttemptEgress>>, SpawnError> {
+    request
+        .allowlist()
+        .map(|allowlist| {
+            let dir = egress_dir_beside(request.workspace()).ok_or(SpawnError::Refused)?;
+            AttemptEgress::start_held(
+                &dir,
+                allowlist,
+                request.credential_routes().to_vec(),
+                request.hold(),
+                Arc::new(SystemResolver),
+            )
+            .map(Arc::new)
+            .map_err(|_| SpawnError::Refused)
+        })
+        .transpose()
+}
+
+/// The stdio a launch kept, as the reaper returns it.
+pub(crate) fn captured(outcome: &ward_launch::Outcome) -> CapturedStdio {
+    CapturedStdio {
+        stdout: CapturedStream {
+            head: outcome.stdout_raw_head.clone(),
+            total: outcome.stdout_bytes,
+        },
+        stderr: CapturedStream {
+            head: outcome.stderr_raw_head.clone(),
+            total: outcome.stderr_bytes,
+        },
+    }
+}
+
 fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launch {
+    capsule_launch(request, proxy_socket).budget(request.budget())
+}
+
+/// What any backend runs for `request` behind the egress socket `proxy_socket`: the
+/// workspace, the argv, a cleared environment and exactly the bindings the request
+/// carries, with the output capture its grant asks for. The budget is the backend's to
+/// enforce.
+pub(crate) fn capsule_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launch {
     let launch = Launch::new(request.workspace(), request.argv().to_vec())
-        .budget(request.budget())
         .capture_bytes(OUTPUT_CAPTURE_BYTES)
         .clear_env();
     let launch = match request.output() {
@@ -645,16 +684,7 @@ impl RunningWorkload for SandboxWorkload {
         };
         WorkloadEnd {
             exit,
-            stdio: CapturedStdio {
-                stdout: CapturedStream {
-                    head: outcome.stdout_raw_head,
-                    total: outcome.stdout_bytes,
-                },
-                stderr: CapturedStream {
-                    head: outcome.stderr_raw_head,
-                    total: outcome.stderr_bytes,
-                },
-            },
+            stdio: captured(&outcome),
             usage: None,
         }
     }
@@ -706,8 +736,9 @@ impl WorkloadFreezer for SandboxFreezer {
     }
 }
 
-/// What a node needs to execute admitted tasks: its task root, its snapshot store and the
-/// Capsule backend it runs attempts on ([`crate::capsule`]). A node built with it
+/// What a node needs to execute admitted tasks: its task root, its snapshot store, the
+/// Capsule backends it runs attempts on and how it places them ([`crate::capsule`]). A
+/// node built with it
 /// advertises `start`, `stop`, `pause` and `revoke` together at protocol 1.3,
 /// `network.proxy_allowlist` only when built
 /// [`Self::with_network_allowlist`], and `output` only when built
@@ -716,7 +747,8 @@ impl WorkloadFreezer for SandboxFreezer {
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,
-    backend: Arc<dyn CapsuleBackend>,
+    backends: Vec<Arc<dyn CapsuleBackend>>,
+    stronger: StrongerPlacement,
     stop_timeout: Duration,
     spawn_timeout: Duration,
     network_allowlist: bool,
@@ -735,6 +767,7 @@ impl std::fmt::Debug for NodeExecution {
         formatter
             .debug_struct("NodeExecution")
             .field("task_root", &self.task_root)
+            .field("placement", &self.placement())
             .field("stop_timeout", &self.stop_timeout)
             .field("spawn_timeout", &self.spawn_timeout)
             .field("network_allowlist", &self.network_allowlist)
@@ -752,7 +785,7 @@ impl std::fmt::Debug for NodeExecution {
 
 impl NodeExecution {
     /// Execute under `task_root`, materialising from `snapshots`, running every attempt on
-    /// `backend`.
+    /// `backend` until [`Self::with_backend`] adds another.
     #[must_use]
     pub fn new(
         task_root: TaskRoot,
@@ -762,7 +795,8 @@ impl NodeExecution {
         Self {
             task_root,
             snapshots,
-            backend,
+            backends: vec![backend],
+            stronger: StrongerPlacement::Refused,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
             network_allowlist: false,
@@ -775,6 +809,27 @@ impl NodeExecution {
             agent_adapters: None,
             agent_shim: None,
         }
+    }
+
+    /// Also run attempts on `backend` (`--container-runtime`, [`crate::container`]):
+    /// those whose manifest's floor it is at, and, under [`Self::with_stronger_placement`],
+    /// those it is the weakest backend above. The first backend stays the one survivors
+    /// of a record naming no backend are ended through.
+    #[must_use]
+    pub fn with_backend(mut self, backend: Arc<dyn CapsuleBackend>) -> Self {
+        self.backends.push(backend);
+        self
+    }
+
+    /// Whether the operator lets the node place an attempt on a stronger backend than its
+    /// floor (`--place-stronger`, ADR-0039 §5): [`StrongerPlacement::Allowed`] runs it on
+    /// the weakest backend above its floor when the node has one, and the capability
+    /// document says so (`isolation.stronger_placement`). [`StrongerPlacement::Refused`],
+    /// the default, runs every attempt at exactly its floor.
+    #[must_use]
+    pub const fn with_stronger_placement(mut self, stronger: StrongerPlacement) -> Self {
+        self.stronger = stronger;
+        self
     }
 
     /// Host the agent adapters `adapters` names on admitted workloads that name one
@@ -955,17 +1010,51 @@ impl NodeExecution {
         &self.snapshots
     }
 
-    /// The launcher workloads are spawned through: the backend's.
+    /// The launcher of the node's first backend.
     #[must_use]
     pub fn launcher(&self) -> Arc<dyn TaskLauncher> {
-        Arc::clone(&self.backend) as Arc<dyn TaskLauncher>
+        Arc::clone(&self.backends[0]) as Arc<dyn TaskLauncher>
     }
 
-    /// Where attempts run: the node's one backend, at exactly the level an attempt's
-    /// manifest requires (ADR-0039 §5).
+    /// The launcher of the backend `descriptor` describes, if the node has it.
+    #[must_use]
+    pub fn launcher_for(
+        &self,
+        descriptor: CapsuleBackendDescriptor,
+    ) -> Option<Arc<dyn TaskLauncher>> {
+        self.backends
+            .iter()
+            .find(|backend| backend.descriptor() == descriptor)
+            .map(|backend| Arc::clone(backend) as Arc<dyn TaskLauncher>)
+    }
+
+    /// The launcher that ends a survivor of an attempt whose record names `capsule`: that
+    /// backend's, or the first backend's for a record naming none or a backend the node
+    /// no longer has.
+    #[must_use]
+    pub fn survivors(&self, capsule: Option<&CapsuleRecord>) -> Arc<dyn TaskLauncher> {
+        let named = capsule.and_then(|capsule| {
+            self.backends
+                .iter()
+                .find(|backend| backend.descriptor().backend() == capsule.backend())
+        });
+        match named {
+            Some(backend) => Arc::clone(backend) as Arc<dyn TaskLauncher>,
+            None => self.launcher(),
+        }
+    }
+
+    /// Where attempts run: the node's backends, at exactly the level an attempt's
+    /// manifest requires, or above it only as the operator's policy allows (ADR-0039 §5).
     #[must_use]
     pub fn placement(&self) -> CapsulePlacement {
-        CapsulePlacement::new(vec![self.backend.descriptor()], StrongerPlacement::Refused)
+        CapsulePlacement::new(
+            self.backends
+                .iter()
+                .map(|backend| backend.descriptor())
+                .collect(),
+            self.stronger,
+        )
     }
 
     /// How long `stop` waits for the reaper to confirm the kill and reap.

@@ -407,6 +407,16 @@ pub struct IsolationCapabilities {
     pub namespaces: NamespaceCapabilities,
     /// Supported execution isolation backends.
     pub backends: ExecutionBackendCapabilities,
+    /// The node's operator lets it run an attempt on a backend stronger than its
+    /// manifest's floor (#263, ADR-0039 §5): on the weakest offered level above the floor
+    /// when there is one. Absent means `false`: every attempt runs at exactly its floor.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stronger_placement: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Network enforcement mechanisms a node can enforce locally.
@@ -2400,6 +2410,7 @@ mod tests {
                     microvm: false,
                     vm: false,
                 },
+                stronger_placement: false,
             },
             NetworkCapabilities {
                 offline: false,
@@ -2441,6 +2452,7 @@ mod tests {
                     microvm: true,
                     vm: true,
                 },
+                stronger_placement: false,
             },
             NetworkCapabilities {
                 offline: true,

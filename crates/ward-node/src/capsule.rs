@@ -17,15 +17,19 @@
 //! * `inspect` is the running workload's pid and host process;
 //! * `exec` and `snapshot` are declared and no verb asks for them yet.
 //!
-//! [`CapsuleBackendDescriptor::serves`] says which of them a backend serves. The first
-//! backend is the bubblewrap launch, [`CapsuleBackendDescriptor::BUBBLEWRAP`] at `sandbox`,
-//! with or without a cgroup per attempt.
+//! [`CapsuleBackendDescriptor::serves`] says which of them a backend serves. The backends
+//! are the bubblewrap launch, [`CapsuleBackendDescriptor::BUBBLEWRAP`] at `sandbox`, with
+//! or without a cgroup per attempt, and the operator's `runc` ([`crate::container`]),
+//! [`CapsuleBackendDescriptor::RUNC`] at `container`, or
+//! [`CapsuleBackendDescriptor::RUNC_ROOTLESS`] without `pause` and `resume` when the node
+//! does not run as root.
 //!
 //! [`CapsulePlacement`] decides which backend runs an attempt whose manifest names a
-//! minimum level: one at exactly that level, a stronger one only when the operator's
-//! policy allows it ([`StrongerPlacement`]), never a weaker one. No backend means
-//! `unsupported_grant` at `admit`. The backend that ran an attempt is recorded in its task
-//! record as a [`CapsuleRecord`].
+//! minimum level: one at exactly that level or, when the operator's policy allows it
+//! ([`StrongerPlacement`]), the weakest one above it; never a weaker one. No backend means
+//! `unsupported_grant` at `admit`, as does a manifest with `resources` limits placed on a
+//! backend that does not enforce them. The backend that ran an attempt is recorded in its
+//! task record as a [`CapsuleRecord`].
 
 use serde::{Deserialize, Serialize};
 use ward_node_protocol::{IsolationCapabilities, IsolationLevel};
@@ -76,6 +80,7 @@ pub struct CapsuleBackendDescriptor {
     backend: &'static str,
     level: IsolationLevel,
     serves: &'static [CapsuleOperation],
+    resources: bool,
 }
 
 impl CapsuleBackendDescriptor {
@@ -93,6 +98,39 @@ impl CapsuleBackendDescriptor {
             CapsuleOperation::Destroy,
             CapsuleOperation::Inspect,
         ],
+        resources: true,
+    };
+
+    /// The operator's `runc` run as root: an OCI container per attempt in cgroups of its
+    /// own, paused with the cgroup freezer, serving everything but `exec` and `snapshot`.
+    pub const RUNC: Self = Self {
+        backend: "runc",
+        level: IsolationLevel::Container,
+        serves: &[
+            CapsuleOperation::Prepare,
+            CapsuleOperation::Start,
+            CapsuleOperation::Pause,
+            CapsuleOperation::Resume,
+            CapsuleOperation::Stop,
+            CapsuleOperation::Destroy,
+            CapsuleOperation::Inspect,
+        ],
+        resources: false,
+    };
+
+    /// The operator's `runc` run without root: the same container with no cgroup, so with
+    /// no freezer; it serves neither `pause` nor `resume`.
+    pub const RUNC_ROOTLESS: Self = Self {
+        backend: "runc",
+        level: IsolationLevel::Container,
+        serves: &[
+            CapsuleOperation::Prepare,
+            CapsuleOperation::Start,
+            CapsuleOperation::Stop,
+            CapsuleOperation::Destroy,
+            CapsuleOperation::Inspect,
+        ],
+        resources: false,
     };
 
     /// The backend's id, as its task records name it.
@@ -113,6 +151,14 @@ impl CapsuleBackendDescriptor {
     pub fn serves(self, operation: CapsuleOperation) -> bool {
         self.serves.contains(&operation)
     }
+
+    /// Whether a manifest's `resources` limits are enforced on this backend on a node that
+    /// runs attempts in cgroups; a manifest with limits is never placed on one that does
+    /// not.
+    #[must_use]
+    pub const fn honours_resources(self) -> bool {
+        self.resources
+    }
 }
 
 /// A mechanism a node runs attempts in, at one isolation level.
@@ -126,7 +172,8 @@ pub trait CapsuleBackend: TaskLauncher {
 pub enum StrongerPlacement {
     /// Only a backend at exactly the minimum runs it.
     Refused,
-    /// The weakest backend at or above the minimum runs it.
+    /// The weakest backend above the minimum runs it, or one at exactly the minimum when
+    /// the node has none above.
     Allowed,
 }
 
@@ -145,28 +192,41 @@ impl CapsulePlacement {
     }
 
     /// The backend an attempt whose manifest names `minimum` runs on: one at exactly
-    /// `minimum`, otherwise, only when stronger placement is allowed, the weakest above it;
-    /// never a weaker one. `None` when no backend qualifies.
+    /// `minimum`; when stronger placement is allowed, the weakest above it, if any, and
+    /// one at exactly `minimum` otherwise; never a weaker one. `None` when no backend
+    /// qualifies.
     #[must_use]
     pub fn place(&self, minimum: IsolationLevel) -> Option<CapsuleBackendDescriptor> {
-        let candidates = self
-            .backends
-            .iter()
-            .copied()
-            .filter(|backend| match self.stronger {
-                StrongerPlacement::Refused => backend.level() == minimum,
-                StrongerPlacement::Allowed => backend.level() >= minimum,
-            });
-        candidates.min_by_key(|backend| backend.level())
+        let at = |level: IsolationLevel| {
+            self.backends
+                .iter()
+                .copied()
+                .find(|backend| backend.level() == level)
+        };
+        let above = || {
+            self.backends
+                .iter()
+                .copied()
+                .filter(|backend| backend.level() > minimum)
+                .min_by_key(|backend| backend.level())
+        };
+        match self.stronger {
+            StrongerPlacement::Refused => at(minimum),
+            StrongerPlacement::Allowed => above().or_else(|| at(minimum)),
+        }
     }
 
     /// The levels the node offers, as the capability document's `isolation` flags say
-    /// them.
+    /// them, and whether it places stronger than a floor.
     #[must_use]
     pub fn isolation(&self, base: IsolationCapabilities) -> IsolationCapabilities {
-        self.backends.iter().fold(base, |isolation, backend| {
+        let offered = self.backends.iter().fold(base, |isolation, backend| {
             isolation.offering(backend.level())
-        })
+        });
+        IsolationCapabilities {
+            stronger_placement: self.stronger == StrongerPlacement::Allowed,
+            ..offered
+        }
     }
 }
 
@@ -228,6 +288,7 @@ mod tests {
             backend: "test",
             level,
             serves: &[],
+            resources: false,
         }
     }
 
@@ -246,6 +307,28 @@ mod tests {
                 ),
                 "{operation:?}"
             );
+        }
+        assert!(bubblewrap.honours_resources());
+    }
+
+    #[test]
+    fn the_runc_backend_is_a_container_pausing_only_with_the_cgroups_root_gives_it() {
+        for (runc, pauses) in [
+            (CapsuleBackendDescriptor::RUNC, true),
+            (CapsuleBackendDescriptor::RUNC_ROOTLESS, false),
+        ] {
+            assert_eq!(runc.backend(), "runc");
+            assert_eq!(runc.level(), IsolationLevel::Container);
+            assert!(!runc.honours_resources());
+            for operation in CapsuleOperation::ALL {
+                let served = match operation {
+                    CapsuleOperation::Exec | CapsuleOperation::Snapshot => false,
+                    CapsuleOperation::Pause | CapsuleOperation::Resume => pauses,
+                    _ => true,
+                };
+                assert_eq!(runc.serves(operation), served, "{operation:?}");
+            }
+            assert!(CapsuleRecord::from(runc).is_well_formed());
         }
     }
 
@@ -297,9 +380,23 @@ mod tests {
         );
         let upgrading = CapsulePlacement::new(vec![microvm, container], StrongerPlacement::Allowed);
         assert_eq!(upgrading.place(IsolationLevel::Sandbox), Some(container));
-        assert_eq!(upgrading.place(IsolationLevel::Container), Some(container));
+        assert_eq!(upgrading.place(IsolationLevel::Container), Some(microvm));
         assert_eq!(upgrading.place(IsolationLevel::Microvm), Some(microvm));
         assert_eq!(upgrading.place(IsolationLevel::Vm), None);
+
+        let runc = CapsuleBackendDescriptor::RUNC_ROOTLESS;
+        let both = vec![CapsuleBackendDescriptor::BUBBLEWRAP, runc];
+        let exact = CapsulePlacement::new(both.clone(), StrongerPlacement::Refused);
+        assert_eq!(
+            exact.place(IsolationLevel::Sandbox),
+            Some(CapsuleBackendDescriptor::BUBBLEWRAP),
+            "an unmarked manifest stays on bubblewrap unless the operator says otherwise"
+        );
+        assert_eq!(exact.place(IsolationLevel::Container), Some(runc));
+        let stronger = CapsulePlacement::new(both, StrongerPlacement::Allowed);
+        assert_eq!(stronger.place(IsolationLevel::Sandbox), Some(runc));
+        assert_eq!(stronger.place(IsolationLevel::Container), Some(runc));
+        assert_eq!(stronger.place(IsolationLevel::Microvm), None);
     }
 
     #[test]
@@ -310,6 +407,7 @@ mod tests {
                 user_namespace: true,
             },
             backends: ExecutionBackendCapabilities::default(),
+            stronger_placement: false,
         };
         let sandbox_only = CapsulePlacement::new(
             vec![CapsuleBackendDescriptor::BUBBLEWRAP],
@@ -323,8 +421,19 @@ mod tests {
                     user_namespace: true,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             }
         );
+        let stronger = CapsulePlacement::new(
+            vec![
+                CapsuleBackendDescriptor::BUBBLEWRAP,
+                CapsuleBackendDescriptor::RUNC,
+            ],
+            StrongerPlacement::Allowed,
+        )
+        .isolation(base);
+        assert!(stronger.stronger_placement);
+        assert!(stronger.offers(IsolationLevel::Container));
         let both = CapsulePlacement::new(
             vec![
                 CapsuleBackendDescriptor::BUBBLEWRAP,

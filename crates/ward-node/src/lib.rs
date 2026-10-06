@@ -24,7 +24,10 @@
 //!   namespace sandbox and its user namespace, the offline network and the
 //!   content-addressed snapshot store — and `network.proxy_allowlist` only when its
 //!   execution honours a `network.custom` manifest through a per-attempt egress proxy
-//!   ([`egress`]), which is what makes `admit` accept one.
+//!   ([`egress`]), which is what makes `admit` accept one. Its `isolation` flags offer
+//!   the levels of its Capsule backends ([`capsule`]): `sandbox`, and `container` with the
+//!   operator's `runc` ([`container`]); `isolation.stronger_placement` says the operator
+//!   lets it place an attempt above its floor.
 //! * at protocol 1.3, a service whose execution returns output
 //!   ([`execution::NodeExecution::with_output_return`]) also serves the read-only `result`
 //!   request for an ended attempt admitted with an `output` grant: its bounded stdout,
@@ -104,6 +107,7 @@ pub mod admit;
 pub mod audit;
 pub mod capsule;
 pub mod cgroup;
+pub mod container;
 pub mod credentials;
 pub mod egress;
 pub mod evidence;
@@ -838,6 +842,7 @@ mod tests {
                     user_namespace: true,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             },
             NetworkCapabilities {
                 offline: true,
@@ -2127,6 +2132,7 @@ mod tests {
                     user_namespace: true,
                 },
                 backends: ExecutionBackendCapabilities::default(),
+                stronger_placement: false,
             }
         );
         assert_eq!(

@@ -397,6 +397,57 @@ kept out, and a rotated node key and client CA, each by `SIGHUP` without a resta
 the client refuses the revoked key, pinned or not, through the library and the adapter, and
 reaches the node again once it is rotated to a fresh key and reloaded.
 
+### 3.2 Running attempts in OCI containers: runc
+
+A node runs every attempt in a bubblewrap sandbox. To also run attempts at isolation level
+`container` ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md)),
+give it the host's `runc` and add the flag to the unit:
+
+```bash
+apt-get install -y runc            # /usr/bin/runc; /usr/bin/setpriv comes with util-linux
+```
+
+```ini
+ExecStart=/usr/local/bin/ward-node \
+  --socket /run/ward-node/node.sock \
+  --state-dir /var/lib/ward-node/state \
+  --node-id node_01M3KY5QG0000028T5CY4TQKFF \
+  --trusted-issuers /etc/ward-node/trusted-issuers \
+  --task-root /var/lib/ward-node/tasks \
+  --container-runtime /usr/bin/runc
+```
+
+At start the node verifies the file (absolute, a regular file owned by root or its own
+user, writable by no one else, `--version` naming runc) and runs one container from it over
+a scratch directory of the task root; any refusal stops the node and names the reason, for
+example `container runtime /usr/bin/runc: cannot run a container on this host`. A node
+running as `ward-node` runs `runc` rootless: the host must allow that user unprivileged
+user namespaces, as bubblewrap already needs, and where AppArmor restricts them (Ubuntu
+24.04's `kernel.apparmor_restrict_unprivileged_userns`) `runc` needs a profile that allows
+them as `bwrap` has one. Rootless containers get no cgroup, so the node refuses `pause`
+for their attempts `unsupported_operation`; a node run as root gives each container cgroups
+of its own, outside the unit's, and pauses it with their freezer. Either way a container
+dies with the node (`setpriv --pdeathsig`), and a restarted node deletes what its
+predecessor left; `KillMode=control-group` does not reach a root container's cgroups.
+
+The capability document then offers `container`:
+
+```text
+$ echo '{"cmd":"capabilities"}' | ward-node-adapter --socket /run/ward-node/node.sock
+{…,"isolation":{"namespaces":{"sandbox":true,"user_namespace":true},"backends":{"container":true,"microvm":false,"vm":false}},…}
+```
+
+A manifest with `"isolation":{"minimum":"container"}` runs in a container and its task
+record names `"capsule":{"backend":"runc","isolation":"container"}`; a manifest without a
+floor still runs in bubblewrap. To run every attempt in a container instead, add
+`--place-stronger`: the node then places an attempt on the weakest backend above its
+floor and says so in its document (`"stronger_placement":true` in `isolation`), so start
+it only once every control plane reading the document is at this revision. A manifest
+with `resources` limits is never placed in a container: keep such work on a node without
+`--place-stronger`. `crates/ward-node/tests/node_capsule_conformance_cli.rs` runs one
+signed manifest on both backends and holds them to the same writable paths, environment,
+refusals, brokered credential, output and evidence.
+
 ## 4. Operator: import a snapshot
 
 A workload runs over a project snapshot the node already holds. Import it as the node's
