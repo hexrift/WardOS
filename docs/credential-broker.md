@@ -5,7 +5,7 @@ Implemented: the model-API gateways (Anthropic, OpenAI; see
 [agent-integration.md](agent-integration.md) §3), the GitHub adapter in gateway
 mode (§4), the credential-provider interface with a Vault/OpenBao backend for
 short-lived, proxy-injected leases (§5, #267), and the same providers brokering leases to
-`ward-node` workloads (§8). Registry and SSH adapters, cloud STS backends, minted tokens
+`ward-node` workloads (§8), a Git capability for a plain node workload among them (§8.1). Registry and SSH adapters, cloud STS backends, minted tokens
 and the encrypted vault are ahead. Decision records:
 [ADR-0008](decisions/ADR-0008-credential-broker.md),
 [ADR-0032](decisions/ADR-0032-credential-provider-interface.md),
@@ -246,3 +246,78 @@ providers to admitted attempts
   `CredentialRevoked`, all origin `node`, none carrying a secret or a handle.
 * **Provider calls** are bounded at 5 seconds on a node, so revoking fits within the bound
   `stop` and `revoke` wait for.
+* **Reaching the route.** Through the attempt's proxy socket, `WARD_PROXY_SOCKET`, and, on
+  a node started with `--agent-shim`, through the shim's loopback relay as
+  `http://127.0.0.1:3128/<service>/…`, with `HTTP_PROXY` and `NO_PROXY` set so stock
+  clients find it ([ADR-0037](decisions/ADR-0037-node-agent-shim-and-relay.md) §7).
+
+### 8.1 Recipe: a Git capability for a node workload
+
+The node's operator configures the repository as a service, the control plane grants it to
+one attempt, and the workload's stock `git` clones the gateway URL; the token never enters
+the sandbox and is revoked at the provider when the attempt ends.
+
+**The node.** `ward-node … --task-root <dir> --network-allowlist --credentials <file>
+--agent-shim /usr/local/bin/ward-agent` (node-integration.md §2.1). Without
+`--agent-shim` the route is reachable only on the proxy socket, which `git` cannot dial.
+
+**The service**, in the node's credentials file beside its `[provider.<name>]` table:
+
+```toml
+[service.git]
+provider = "bao"
+engine = "token"                          # a token role the Git server accepts tokens of
+role = "ward-git-widgets"
+permissions = ["widgets-push", "write"]   # the lease's policies; drop "write" for clone-only
+max_ttl_secs = 900
+renew = false
+upstream = "git.example.com:443"          # the only place the token goes, over TLS
+header = "authorization"
+value_prefix = "Bearer "
+paths = ["/acme/widgets.git"]             # the repository, after `/git` is stripped
+```
+
+**The grant**, in the signed capability manifest:
+
+```json
+{"network":{"custom":["git.example.com"]},
+ "credentials":[{"service":"git","host":"git.example.com","ttl_secs":600}]}
+```
+
+**The workload** uses the gateway URL, never the upstream's:
+
+```text
+git clone http://127.0.0.1:3128/git/acme/widgets.git
+git -C widgets push origin HEAD:main
+```
+
+`NO_PROXY` sends it straight to the relay; the route strips `/git` and forwards
+`/acme/widgets.git/info/refs`, `…/git-upload-pack` and `…/git-receive-pack` to
+`git.example.com` with `Authorization: Bearer <lease>`. Without `write` the route passes a
+clone or fetch (`GET`, `POST …/git-upload-pack`) and refuses a push `403 request outside
+credential scope` before the upstream is contacted; a path outside `paths` is refused the
+same way. A tool that insists on the upstream's own HTTPS URL can be pointed at the gateway
+in the workspace, holding no secret:
+`git config --global url."http://127.0.0.1:3128/git/".insteadOf https://git.example.com/`.
+A clone of `https://git.example.com/…` without it is a `CONNECT` tunnel, which the proxy
+never injects into: the server sees an anonymous request.
+
+**What the upstream must accept.** The route sends the leased value behind the value
+prefix and nothing else; it computes no encoding. A token-engine lease is the provider's
+token, so it fits a Git server that verifies the provider's tokens as bearer credentials,
+and it is revoked at the source when the attempt ends. A forge that accepts only its own
+tokens, or only HTTP Basic (`x-access-token:<token>` in base64), needs the value in that
+form from the provider: a KV secret (`engine = "kv"`, with `value_prefix = "Basic "` for a
+pre-encoded pair) is static and not revocable at the source, so the route ends with the
+attempt but the secret does not. A provider engine that mints a forge's own short-lived
+tokens is not implemented (§4).
+
+**What fails, and how.** A provider that cannot serve issues nothing: every request on the
+route is `403 credential lease expired`, which `git` reports as `The requested URL returned
+error: 403`, and the attempt's log has `CredentialDenied` with
+`credential-provider:<provider>:<state>`. When the attempt ends the route answers the same
+`403` and the lease is revoked at the provider; a later attempt of the task gets a fresh
+lease only if its manifest grants it again and the provider issues one, and nothing the
+earlier attempt could keep (its workspace, its `.git/config`, its environment) holds a
+token. A host the manifest does not list is refused `403` through the relay. Proven by
+`ward-node`'s `tests/node_git_capability_cli.rs`.
