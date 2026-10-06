@@ -2,7 +2,9 @@
 //!
 //! Sandboxes, proxies and hook listeners run in this process (ADR-0013); the
 //! session log is written by the per-session `wardd` that `ward up` starts
-//! (ADR-0015), or by this process when none is serving.
+//! (ADR-0015), or by this process when none is serving. `ward node migrate`
+//! moves an installation into local node mode, where `ward run --via-node` runs
+//! on the local `ward-node` instead and nothing runs in-process (ADR-0040).
 
 #![allow(
     clippy::missing_errors_doc,
@@ -22,6 +24,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod answers;
 mod init;
+mod node_mode;
 mod replay;
 mod replay_stats;
 mod tui;
@@ -115,11 +118,25 @@ enum Command {
         dir: Option<PathBuf>,
     },
     /// Run a command in the current session's sandbox (starting a throwaway session
-    /// if none is active), and show the observer view.
+    /// if none is active), and show the observer view. With `--via-node`, run it instead
+    /// as one attempt on this installation's local node (`ward node migrate`), under the
+    /// project's policy compiled into a signed envelope; never in-process.
     Run {
         /// Project directory (default: current).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Run as one attempt on the local node over a snapshot of the project; the
+        /// worktree is not written, and a policy the node cannot enforce exactly is
+        /// refused by name.
+        #[arg(long)]
+        via_node: bool,
+        /// With `--via-node`: run over this snapshot (64 hex digits) from the node's
+        /// store instead of a fresh capture of the project.
+        #[arg(long, requires = "via_node")]
+        snapshot: Option<String>,
+        /// With `--via-node`: the attempt's wall-clock budget in seconds.
+        #[arg(long, requires = "via_node", default_value_t = 600)]
+        budget: u64,
         /// Command and arguments to run.
         #[arg(trailing_var_arg = true, required = true)]
         argv: Vec<String>,
@@ -355,6 +372,10 @@ enum Command {
     /// `ward theme set ward-dark` is `wardos-theme set ward-dark`, `ward setup wifi` is
     /// `wardos-setup wifi`, and `ward` is the single command you type in the terminal —
     /// the secure session core here, the desktop verbs in the `wardos-*` family.
+    /// The local `ward-node` this installation moves into (ADR-0040): migrate to it
+    /// and back, check what was carried, and serve it.
+    #[command(subcommand)]
+    Node(NodeCmd),
     #[command(external_subcommand)]
     Desktop(Vec<String>),
 }
@@ -378,6 +399,39 @@ impl WatchMode {
             Self::Plain
         }
     }
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Move this installation into local node mode as one transaction: a local issuer
+    /// key (mode 0600) and the trust store naming it, every retained snapshot imported
+    /// into the node's store and verified by digest, every sealed session log left in
+    /// place and recorded by BLAKE3, every policy file referenced and never rewritten.
+    /// A failure leaves the installation as it was.
+    Migrate {
+        /// Print what would be carried and write nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Return to per-session mode: the node home is removed, or moved aside when
+        /// attempts ran under it, so their evidence is kept.
+        #[arg(long, conflicts_with_all = ["dry_run", "node_id"])]
+        rollback: bool,
+        /// The local node's identity (`node_…`); default: a new one.
+        #[arg(long)]
+        node_id: Option<ward_events::NodeId>,
+    },
+    /// Print the installation's mode and re-check what the migration carried: each
+    /// evidence log unchanged and verifying, each snapshot whole in the node's store.
+    Status,
+    /// Run the local node in the foreground on the node home's paths (`ward-node
+    /// --socket … --state-dir … --task-root … --trusted-issuers …`); any further flags
+    /// after `--` are passed to `ward-node`, so remote features are enabled on the same
+    /// node without migrating again.
+    Serve {
+        /// Further `ward-node` flags, e.g. `-- --listen-tls 0.0.0.0:7443 …`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<std::ffi::OsString>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -718,7 +772,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
         Command::Vault(cmd) => cmd_vault(cmd),
         Command::Up { dir } => cmd_up(&dir.unwrap_or_else(cwd)),
         Command::Status { dir } => cmd_status(&dir.unwrap_or_else(cwd)),
-        Command::Run { dir, argv } => cmd_run(&dir.unwrap_or_else(cwd), &argv),
+        run @ Command::Run { .. } => cmd_run_either(run),
         Command::Claude {
             dir,
             pass_env,
@@ -804,6 +858,7 @@ fn run(cli: Cli) -> ward_daemon::Result<ExitCode> {
             samples,
             warm_up,
         } => cmd_benchmark(fixtures.as_deref(), json.as_deref(), samples, warm_up),
+        Command::Node(cmd) => cmd_node(cmd),
         Command::Desktop(argv) => cmd_desktop(&argv),
     }
 }
@@ -880,7 +935,8 @@ fn cmd_session(cmd: SessionCmd) -> ward_daemon::Result<ExitCode> {
 /// readiness checks decide the exit code; the hardware panel is a report, so a degraded
 /// row (software rendering, no Wi-Fi) never fails the command.
 fn cmd_doctor() -> ExitCode {
-    let checks = ward_daemon::doctor::run();
+    let mut checks = ward_daemon::doctor::run();
+    checks.push(node_mode::doctor_check(&ward_daemon::session::state_root()));
     print!("{}", render::doctor_panel(&checks));
     print!(
         "{}",
@@ -891,6 +947,112 @@ fn cmd_doctor() -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// `ward node …`: the local node this installation moves into (ADR-0040).
+fn cmd_node(cmd: NodeCmd) -> ward_daemon::Result<ExitCode> {
+    use node_mode::migrate;
+    let state = ward_daemon::session::state_root();
+    let failed = |e: migrate::MigrationError| ward_daemon::Error::Project(e.to_string());
+    match cmd {
+        NodeCmd::Migrate { rollback: true, .. } => {
+            match migrate::rollback(&state).map_err(failed)? {
+                migrate::RolledBack::Removed => {
+                    println!("per-session mode restored; the node home is removed");
+                }
+                migrate::RolledBack::Kept(aside) => println!(
+                    "per-session mode restored; the node home, with its attempts' evidence, \
+                     is kept at {}",
+                    aside.display()
+                ),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        NodeCmd::Migrate {
+            dry_run, node_id, ..
+        } => {
+            let plan = migrate::plan(&state).map_err(failed)?;
+            if dry_run {
+                print!("{}", migrate::describe(&plan));
+                return Ok(ExitCode::SUCCESS);
+            }
+            let node = match node_id {
+                Some(node) => node,
+                None => ward_events::NodeId::from_u128(ward_daemon::ids::new_ulid()?),
+            };
+            let record = migrate::migrate(&plan, node, &mut |_| Ok(())).map_err(failed)?;
+            println!(
+                "local node mode: node {} · {} snapshots imported · {} evidence logs and {} \
+                 policy files carried in place\n  `ward node serve` runs the node; \
+                 `ward run --via-node -- <command>` runs on it",
+                record.node,
+                record.snapshots.len(),
+                record.evidence.len(),
+                record.policy.len()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        NodeCmd::Status => cmd_node_status(&state),
+        NodeCmd::Serve { args } => node_mode::run::serve(&state, &args),
+    }
+}
+
+/// `ward run`: in the current session's sandbox, or with `--via-node` as one attempt on
+/// the local node.
+fn cmd_run_either(command: Command) -> ward_daemon::Result<ExitCode> {
+    let Command::Run {
+        dir,
+        via_node,
+        snapshot,
+        budget,
+        argv,
+    } = command
+    else {
+        return Ok(ExitCode::FAILURE);
+    };
+    let dir = dir.unwrap_or_else(cwd);
+    if !via_node {
+        return cmd_run(&dir, &argv);
+    }
+    node_mode::run::run_via_node(
+        &ward_daemon::session::state_root(),
+        &node_mode::run::NodeRun {
+            dir,
+            argv,
+            snapshot,
+            budget: Duration::from_secs(budget),
+        },
+    )
+}
+
+fn cmd_node_status(state: &Path) -> ward_daemon::Result<ExitCode> {
+    let node_mode::Mode::LocalNode(record) = node_mode::mode(state)? else {
+        println!("mode      per-session");
+        return Ok(ExitCode::SUCCESS);
+    };
+    let home = node_mode::NodeHome::under(state);
+    let serving = std::os::unix::net::UnixStream::connect(home.socket()).is_ok();
+    println!("mode      local-node");
+    println!("node      {} · {}", record.node, home.dir().display());
+    println!("issuer    {} · key {}", record.issuer, record.issuer_key_id);
+    println!(
+        "socket    {} · {}",
+        home.socket().display(),
+        if serving { "serving" } else { "not serving" }
+    );
+    let findings = node_mode::migrate::check(state, &record);
+    for finding in &findings {
+        println!(
+            "  {}  {}",
+            if finding.ok { "ok  " } else { "FAIL" },
+            finding.line
+        );
+    }
+    Ok(if findings.iter().all(|finding| finding.ok) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    })
 }
 
 /// `ward ready`: project-readiness checks (#147), plus the one row that needs to know
@@ -2692,11 +2854,11 @@ fn cwd() -> PathBuf {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::{
-        Cli, Command, SessionCmd, SnapshotCmd, WatchMode, adapters_text, approvals_all_line,
-        desktop_command, observer_degraded_warning, on_path_in, pause_status, pause_status_json,
-        pause_uncertainty_lines, pending_all_line, pending_text, resolved_session_line,
-        resolved_session_line_for, resume_note, stop_in, stopped_line, unreachable_line,
-        verb_program,
+        Cli, Command, NodeCmd, SessionCmd, SnapshotCmd, WatchMode, adapters_text,
+        approvals_all_line, desktop_command, observer_degraded_warning, on_path_in, pause_status,
+        pause_status_json, pause_uncertainty_lines, pending_all_line, pending_text,
+        resolved_session_line, resolved_session_line_for, resume_note, stop_in, stopped_line,
+        unreachable_line, verb_program,
     };
     use clap::Parser as _;
     use std::time::Duration;
@@ -3816,5 +3978,62 @@ mod tests {
         assert!(json["lifecycle"]["op"].is_string());
         let cli = Cli::try_parse_from(["ward", "status"]).unwrap();
         assert!(matches!(cli.command, Command::Status { dir: None }));
+    }
+
+    #[test]
+    fn run_via_node_parses_and_its_options_need_it() {
+        let cli = Cli::try_parse_from(["ward", "run", "--via-node", "--", "make", "-j2"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run { via_node: true, budget: 600, snapshot: None, ref argv, .. }
+                if argv == &["make", "-j2"]
+        ));
+        let cli = Cli::try_parse_from(["ward", "run", "--", "make"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Run {
+                via_node: false,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from(["ward", "run", "--snapshot", "ab", "--", "make"]).is_err());
+        assert!(Cli::try_parse_from(["ward", "run", "--budget", "5", "--", "make"]).is_err());
+    }
+
+    #[test]
+    fn node_subcommands_parse_and_rollback_takes_nothing_else() {
+        let cli = Cli::try_parse_from(["ward", "node", "migrate", "--dry-run"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Node(NodeCmd::Migrate {
+                dry_run: true,
+                rollback: false,
+                node_id: None
+            })
+        ));
+        let cli = Cli::try_parse_from(["ward", "node", "migrate", "--rollback"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Node(NodeCmd::Migrate { rollback: true, .. })
+        ));
+        assert!(
+            Cli::try_parse_from(["ward", "node", "migrate", "--rollback", "--dry-run"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["ward", "node", "migrate", "--node-id", "nope"]).is_err());
+        let cli = Cli::try_parse_from(["ward", "node", "status"]).unwrap();
+        assert!(matches!(cli.command, Command::Node(NodeCmd::Status)));
+        let cli = Cli::try_parse_from([
+            "ward",
+            "node",
+            "serve",
+            "--",
+            "--listen-tls",
+            "127.0.0.1:7443",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Node(NodeCmd::Serve { ref args }) if args == &["--listen-tls", "127.0.0.1:7443"]
+        ));
     }
 }

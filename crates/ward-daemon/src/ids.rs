@@ -39,6 +39,12 @@ pub fn new_session_id() -> Result<SessionId, Error> {
         .map_err(|e| Error::Events(e.to_string()))
 }
 
+/// A fresh ULID as its 128 bits: the construction of [`new_session_id`], for an id
+/// of any other kind.
+pub fn new_ulid() -> Result<u128, Error> {
+    ulid_u128().map_err(|e| Error::Events(e.to_string()))
+}
+
 /// A fresh, time-ordered id for one lifecycle operation (a pause or a stop):
 /// the same ULID construction as [`new_session_id`], rendered as 32 hex digits.
 pub fn new_operation_id() -> Result<String, Error> {
@@ -134,6 +140,14 @@ mod tests {
             (b >> 80) >= (a >> 80),
             "the ms timestamp prefix must not go backwards"
         );
+    }
+
+    #[test]
+    fn a_fresh_ulid_is_never_zero_and_never_repeats() {
+        let a = super::new_ulid().unwrap();
+        let b = super::new_ulid().unwrap();
+        assert_ne!(a, 0);
+        assert_ne!(a, b);
     }
 
     #[test]

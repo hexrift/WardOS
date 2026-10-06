@@ -364,6 +364,19 @@ separate processes in Phase 1 (see ADR-0009 for the process-split decision).
 Thin, fast Rust client for the `wardd` control socket. Target: `ward status` renders in
 < 10 ms warm. All security decisions live in `wardd`; the CLI only formats and forwards.
 
+In local node mode the CLI is also a client of the installation's own `ward-node`
+([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md)). `ward node migrate` carries
+the installation into a node home under the state root (`<state>/node/`) as one
+transaction: a local issuer key (mode 0600) and the trust-store line naming it, every
+retained snapshot imported into the node's store and verified by digest, and a record of
+every sealed session log and policy file by BLAKE3, all built in a staging directory and
+committed by one rename; the session tree is never written, and `--rollback` undoes the
+rename. `ward node serve` runs `ward-node` on that home; `ward run --via-node` compiles the
+project's effective policy into an envelope's manifest (exactly, or refused by name),
+signs it as the local issuer and drives one attempt from `create` to `seal` through
+`ward-node-client`. The node decides admission as for any issuer, and nothing on that path
+runs in-process.
+
 ### 3.3 `ward-agent` — the in-sandbox shim
 
 PID 1 inside the agent sandbox. Responsibilities:
@@ -720,7 +733,9 @@ gap by gap, is [node-security-limitations.md](node-security-limitations.md); the
 from an empty host to a verified attempt is
 [node-integration-guide.md](node-integration-guide.md). How this node mode relates to
 the per-session `wardd` of §3.1, what the two share on one host and the staged path from
-one to the other is [migration-to-node.md](migration-to-node.md).
+one to the other is [migration-to-node.md](migration-to-node.md); the migration of one
+installation into a node of its own, and the CLI's first path through it, is ADR-0040
+(§3.2).
 
 ---
 

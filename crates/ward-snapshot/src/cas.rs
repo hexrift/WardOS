@@ -70,6 +70,25 @@ impl Cas {
         Ok(Self { root })
     }
 
+    /// Open the CAS already at `root` for reading, creating nothing: a root that does
+    /// not exist is [`SnapshotError::NotFound`], and a category directory it lacks reads
+    /// as empty.
+    pub fn open_existing(root: &Path) -> Result<Self> {
+        match fs::metadata(root) {
+            Ok(metadata) if metadata.is_dir() => Ok(Self {
+                root: root.to_path_buf(),
+            }),
+            Ok(_) => Err(SnapshotError::NotFound(format!(
+                "store {} is not a directory",
+                root.display()
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(SnapshotError::NotFound(format!("store {}", root.display())))
+            }
+            Err(e) => Err(SnapshotError::io(root, e)),
+        }
+    }
+
     /// The CAS root directory — needed by [`crate::gc`] to address the
     /// `leases/` and `kept/` directories, which sit alongside `blobs/`,
     /// `manifests/` and `meta/` but are never created by [`Self::open`]

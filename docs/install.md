@@ -165,6 +165,26 @@ ward stop                  # end the sandboxed processes, then seal the log
 `examples/ward-demo` is a project with a protected test and a tempting shortcut, for
 seeing `ward verify` refuse one.
 
+### 4.1 Optional: local node mode
+
+With the node tarball installed as well (`ward-node` beside `ward` or on `PATH`;
+node-integration-guide.md §1), an installation can move into a `ward-node` of its own
+([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md),
+[migration-to-node.md](migration-to-node.md) §3.5):
+
+```bash
+ward node migrate --dry-run    # what would be carried; writes nothing
+ward node migrate              # one transaction; stop every session first
+ward node serve                # the local node, in the foreground (or as a user service)
+ward run --via-node -- cargo test   # one attempt on the node, sealed by it
+ward node status               # mode, and every carried log and snapshot re-checked
+ward node migrate --rollback   # back to per-session mode (stop the node first)
+```
+
+`ward run --via-node` runs only a policy the node enforces as a session would: a project
+whose policy asks for a credential, step-through observation or `localhost_only` egress is
+refused by name. `ward up`, `ward claude` and the other session commands stay per-session.
+
 ## 5. Where things live
 
 | Path | Contents |
@@ -174,6 +194,7 @@ seeing `ward verify` refuse one.
 | `~/.local/state/ward/vault/<NAME>` | one key per file, 0600 in a 0700 directory (`ward vault`) |
 | `<project>/.ward/policy.yaml`, `.tamperward/config.yml`, `.tamperward.yml` | the project's policy, verifier config and TamperWard policy (`ward init`) |
 | `/tmp/ward-<id tail>/` | per-launch sockets, gone when the command exits |
+| `~/.local/state/ward/node/` | only after `ward node migrate`: the local node's home (mode 0700) with its issuer key, trust store, state, task root and `migration.json`; `ward node migrate --rollback` removes it ([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md)) |
 
 Keep `WARD_STATE_DIR` short: the control socket path must fit in 107 bytes; `ward
 doctor` checks this.
