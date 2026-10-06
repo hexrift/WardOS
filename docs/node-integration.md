@@ -101,9 +101,10 @@ admission example is a working test vector (§7.4).
   bridged onto the action channel (the hold is the approval, §6.10), an event stream
   (`stream`), a workspace export as a snapshot (`snapshots.read` and
   `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and
-  enrolment, attestation, certificate revocation or a durable record of TLS handshakes
-  (the transport is a local Unix socket and, on a node started with `--listen-tls`, TCP
-  with mutual TLS whose certificates the operator provisions, §3; the rest is #262). The full list, with what each gap means for a control plane, is
+  enrolment, attestation, certificate revocation lists or a durable record of TLS
+  handshakes (the transport is a local Unix socket and, on a node started with
+  `--listen-tls`, TCP with mutual TLS whose certificates the operator provisions and
+  whose client keys it can revoke without a restart, §2.1, §3; the rest is #262). The full list, with what each gap means for a control plane, is
   [node-security-limitations.md](node-security-limitations.md) §3.
 - The per-session runtime (`ward up`, one `wardd` per session) is a separate mode on the
   same host, with its own state, sockets and uid; how the two compare, coexist and
@@ -119,7 +120,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--output-return] [--action-channel [--approval-hold]] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
   [--agent-adapter <id>… [--agent-shim <file>]] [--client-uid <uid>]… [--client-group <group>] \
-  [--listen-tls <ip:port> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]…]
+  [--listen-tls <ip:port> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]
 ```
 
 | Flag | Required | Meaning |
@@ -141,17 +142,27 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--agent-shim` | no | The operator's `ward-agent` shim (the node tarball's, the runtime tarball's or the image's `ward-agent`: `/usr/local/bin/ward-agent` as node-integration-guide.md §1 installs it, `/usr/bin/ward-agent` on the image), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, that names `--relay` in its `--help` and once runs `/bin/true` hardened over the task root (so a kernel without Landlock stops the node). Every attempt of a hosted adapter then runs under it, bound read-only at `/run/ward/ward-agent`: Landlock, seccomp and no capabilities inside the sandbox, the adapter's command hooks reaching its hook socket, and, behind an egress proxy, the shim's relay on `127.0.0.1:3128` forwarding to the attempt's proxy with `HTTP_PROXY`/`HTTPS_PROXY` naming it and the adapter's provider base URL on it for a provider the manifest grants a credential for (§6.10). Nothing in the capability document changes. Needs `--agent-adapter`. Without it no shim is bound and no relay runs. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
-| `--listen-tls` | no | Also serve the protocol on this TCP address (`<ip>:<port>`; port `0` picks a free one) over TLS 1.3 with a mandatory client certificate ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), §3). At start the node writes `ward-node: serving the node protocol over mutual TLS on <ip>:<port>` to stderr. The socket is served as before. A certificate the node accepts takes the place of `--client-uid` for this listener, never of an issuer signature. Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`; an address already in use stops the node. |
+| `--listen-tls` | no | Also serve the protocol on this TCP address (`<ip>:<port>`; port `0` picks a free one) over TLS 1.3 with a mandatory client certificate ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), §3). At start the node writes `ward-node: serving the node protocol over mutual TLS on <ip>:<port>` to stderr. The socket is served as before. A certificate the node accepts takes the place of `--client-uid` for this listener, never of an issuer signature. With it, `SIGHUP` reloads the TLS files without a restart (below). Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`; an address already in use stops the node. |
 | `--tls-cert` | with `--listen-tls` | The node's certificate chain in PEM, leaf first, as the operator's PKI issued it for the names its clients expect (`subjectAltName`); the node user's own regular file, not a symlink, writable by no one else, at most 64 KiB. |
 | `--tls-key` | with `--listen-tls` | The private key of `--tls-cert`'s leaf, PEM (PKCS#8, SEC1 or PKCS#1); the node user's own regular file, not a symlink, with no group or other permission bits (0600 or 0400), at most 64 KiB. A key that is not the certificate's stops the node. |
 | `--tls-client-ca` | with `--listen-tls` | The CA certificates, PEM, a client's certificate must chain to, for client authentication; the node user's own regular file, not a symlink, writable by no one else, at most 64 KiB, with at least one usable certificate. |
 | `--tls-client-pin` | no | Serve only these client keys: `sha256:` and the 64 lowercase hex digits of the SHA-256 of the client certificate's DER `SubjectPublicKeyInfo` (`openssl x509 -in client.pem -pubkey -noout \| openssl pkey -pubin -outform der \| sha256sum`); repeatable, a malformed or repeated pin stops the node. A pin outlives the renewal of a certificate for the same key. Without it every key the client CA certified is served. Needs `--listen-tls`. |
+| `--tls-client-revoked` | no | A revocation list: client keys refused even when their certificate chains to `--tls-client-ca` and is pinned, one per line in `--tls-client-pin`'s spelling, with blank lines and `#` comments (to the end of the line) allowed and a key listed twice revoked once. The node user's own regular file, not a symlink, writable by no one else, at most 64 KiB, UTF-8; a line that is anything else stops the node, naming the line. Re-read on every `SIGHUP`, so start with an empty list to revoke without a restart later. Needs `--listen-tls`. |
 
 The node refuses to start on any unsafe or malformed input: a trust store, state file or
 task record it cannot parse, wrong permissions, a pinned id mismatch, a TLS file that is
-unsafe, empty or inconsistent. It serves until killed. Every file, the TLS files included,
-is read once at start: changing one, rotating a certificate or a client CA included, is a
-restart (§6.4).
+unsafe, empty or inconsistent. It serves until killed. Every file is read once at start,
+and changing one is a restart (§6.4), except the TLS files of a node started with
+`--listen-tls`: on `SIGHUP` it reads `--tls-cert`, `--tls-key`, `--tls-client-ca` and
+`--tls-client-revoked` again under the same checks and, only when all of them are usable,
+uses them for every handshake from then on, writing `ward-node: reloaded the TLS
+configuration: server key sha256:<pin> (changed|unchanged), client CA certificates <n>
+(changed|unchanged), pinned client keys <n>, revoked client keys <n> (+<added>,
+-<removed>)` to stderr; otherwise it keeps the previous configuration whole and writes
+`ward-node: reloading the TLS configuration failed; still serving the previous one:
+<reason>`. The process, its tasks and the socket are untouched either way. The pins
+(flags) and the trust store are not reloaded. Without `--listen-tls`, `SIGHUP` keeps its
+default effect and ends the node.
 
 The same binary has three operator subcommands over local files; none speaks to the
 socket, and each runs as the node's uid:
@@ -362,13 +373,14 @@ and hashes are lowercase hex. The exit status is the text form's.
   `--listen-tls` address the node speaks TLS 1.3 only (no 1.2, no early data, no session
   resumption) and requires the application protocol `ward-node` (ALPN) and a client
   certificate that chains to `--tls-client-ca` for client authentication, is within its
-  validity window give or take 60 seconds of clock skew and, with `--tls-client-pin`,
-  carries a pinned key. The client checks the node's certificate against the server CA
+  validity window give or take 60 seconds of clock skew, carries a key not on the
+  `--tls-client-revoked` list and, with `--tls-client-pin`, carries a pinned key. The
+  client checks the node's certificate against the server CA
   it was given, for the name it expects (and, if it pins one, the node's key), with the
   same skew. One connection still carries one request; the handshake must complete within
   10 seconds of accept and then the request deadline applies. A refused handshake (no
-  certificate, another CA, expired or not yet valid, not pinned, no `ward-node` ALPN, TLS
-  1.2, a plaintext client, too slow) ends with a TLS alert or a close and no protocol byte,
+  certificate, another CA, expired or not yet valid, revoked, not pinned, no `ward-node`
+  ALPN, TLS 1.2, a plaintext client, too slow) ends with a TLS alert or a close and no protocol byte,
   and the node reports it on stderr with the peer's address and the reason, at most once
   per address per 10 seconds with the count it did not report; a served session is
   reported as `served a TLS client sha256:<pin> from <address>`, at most once per client
@@ -376,7 +388,11 @@ and hashes are lowercase hex. The exit status is the text form's.
   once (one more is closed at accept), and only an authenticated session waits for the
   one-at-a-time lock the socket's connections share, so a TCP peer that never completes a
   handshake delays nobody. After the answer, or after a fail-closed close, the node ends
-  the session with `close_notify`; a client reads that as EOF exactly as on the socket.
+  the session with `close_notify`; a client reads that as EOF exactly as on the socket. A
+  reload on `SIGHUP` (§2.1) applies from the next handshake and does not interrupt a
+  session in progress, except that a session whose key a reload revoked while it waited
+  for the lock is closed unserved and reported; its client sees EOF without an answer, as
+  for any fail-closed close (§10).
 - **Fail closed:** anything malformed (invalid JSON, an unknown or missing field, an
   unknown verb, a request whose `protocol` differs from the negotiated version, a value
   out of bounds) gets no response line: the node closes the connection. Only well-formed

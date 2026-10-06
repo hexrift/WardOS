@@ -1098,9 +1098,11 @@ plane deciding what to put through the node today:
   (#279, #424).
 - **Enrolment and revocation of transport identities.** A node started with
   `--listen-tls` is reached from anywhere over mutual TLS (§6 above), but its certificate,
-  its client CA and any pins are files its operator provisions and rotates by restarting
-  the node; there is no enrolment, attestation or certificate revocation, and the node
-  reports handshakes on stderr, not in a durable record (#262, ADR-0038).
+  its client CA and any pins are files its operator provisions; the certificate, the
+  client CA and a list of revoked client keys are reloaded on `SIGHUP` without a restart,
+  the pins only by restarting the node. There is no enrolment, attestation or certificate
+  revocation list, and the node reports handshakes on stderr, not in a durable record
+  (#262, ADR-0038).
 - **A queue on the node.** A node at its bound on what runs at once refuses a `start`
   `capacity_exhausted` and keeps nothing queued (§7.6 above): the client waits for a
   bounded time with the same start, and the control plane's own queue holds the rest.
