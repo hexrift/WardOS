@@ -5,16 +5,18 @@
 //! the node's server identity (`--tls-cert`, `--tls-key`) and the CA its clients'
 //! certificates must chain to (`--tls-client-ca`), optionally narrowed to pinned client
 //! keys (`--tls-client-pin sha256:<hex>`, the SHA-256 of the certificate's DER
-//! `SubjectPublicKeyInfo`). Every file is read once at start, owned by the node's user,
-//! never a symlink, the key readable by no one else and the rest writable by no one else;
-//! any unsafe, unreadable or inconsistent input stops the node.
+//! `SubjectPublicKeyInfo`), and with `--tls-client-revoked <file>` refuses the client keys
+//! that file lists, one pin per line. Every file is read at start, owned by the node's
+//! user, never a symlink, the key readable by no one else and the rest writable by no one
+//! else; any unsafe, unreadable or inconsistent input stops the node.
 //!
 //! A client is served only when its certificate chains to the client CA for client
 //! authentication, is within its validity window give or take [`CLOCK_SKEW`], carries a
-//! pinned key when pins are configured, and the session negotiated [`ALPN`]. There is no
-//! session resumption, so every connection verifies its certificate afresh. That identity
-//! replaces the peer-credential gate of the socket ([`crate::peer`]) and nothing else:
-//! `admit` still needs a trusted issuer signature (ADR-0030 §2).
+//! key that is not revoked and is pinned when pins are configured, and the session
+//! negotiated [`ALPN`]. There is no session resumption, so every connection verifies its
+//! certificate afresh. That identity replaces the peer-credential gate of the socket
+//! ([`crate::peer`]) and nothing else: `admit` still needs a trusted issuer signature
+//! (ADR-0030 §2).
 //!
 //! Each accepted TCP connection gets a thread of its own for the handshake, at most
 //! [`MAX_TLS_CONNECTIONS`] at once, bounded by [`HANDSHAKE_TIMEOUT`]; the request is then
@@ -100,6 +102,18 @@ pub enum TlsConfigError {
     /// The same pin was listed twice.
     #[error("client pin {0} is listed twice")]
     DuplicatePin(SpkiPin),
+    /// A line of the revocation list is neither a pin, blank nor a comment.
+    #[error(
+        "{path}, line {line}: malformed revoked key {value:?} (expected sha256: followed by 64 lowercase hex digits)"
+    )]
+    Revocation {
+        /// The revocation list.
+        path: PathBuf,
+        /// The line, counted from 1.
+        line: usize,
+        /// What the line holds, comment and surrounding blanks removed.
+        value: String,
+    },
     /// rustls refused the assembled configuration.
     #[error("TLS configuration: {0}")]
     Tls(String),
@@ -195,15 +209,83 @@ impl ClientPins {
     }
 }
 
-/// The operator's TLS files.
-#[derive(Debug, Clone, Copy)]
-pub struct TlsFiles<'a> {
+/// The client keys a node refuses on its TLS listener even when their certificate chains
+/// to the client CA and is pinned (`--tls-client-revoked`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevokedKeys(BTreeSet<SpkiPin>);
+
+impl RevokedKeys {
+    /// Parse a revocation list: one pin per line, as `--tls-client-pin` spells it, with
+    /// blank lines and everything from a `#` to the end of its line ignored. A key listed
+    /// twice is revoked once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsConfigError::Revocation`], naming `path` and the line, for anything
+    /// else on a line.
+    pub fn parse(path: &Path, text: &str) -> Result<Self, TlsConfigError> {
+        let mut revoked = BTreeSet::new();
+        for (index, line) in text.lines().enumerate() {
+            let value = line.split_once('#').map_or(line, |(value, _)| value).trim();
+            if value.is_empty() {
+                continue;
+            }
+            let pin = SpkiPin::parse(value).map_err(|_| TlsConfigError::Revocation {
+                path: path.to_owned(),
+                line: index + 1,
+                value: value.to_owned(),
+            })?;
+            revoked.insert(pin);
+        }
+        Ok(Self(revoked))
+    }
+
+    /// Read and parse the revocation list at `path`, under the rule of the certificates:
+    /// the node user's own regular file, not a symlink, writable by no one else, at most
+    /// [`MAX_TLS_FILE_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsConfigError`] for an unsafe, unreadable or malformed list.
+    pub fn load(path: &Path) -> Result<Self, TlsConfigError> {
+        let bytes = read(path, 0o022)?;
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| TlsConfigError::File(format!("{}: not UTF-8 text", path.display())))?;
+        Self::parse(path, text)
+    }
+
+    /// Whether `pin` is revoked.
+    #[must_use]
+    pub fn revokes(&self, pin: SpkiPin) -> bool {
+        self.0.contains(&pin)
+    }
+
+    /// How many keys are revoked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no key is revoked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Where the node's TLS configuration comes from.
+#[derive(Debug, Clone)]
+pub struct TlsSources {
     /// The node's certificate chain, leaf first (`--tls-cert`).
-    pub cert: &'a Path,
+    pub cert: PathBuf,
     /// The node's private key, PKCS#8, SEC1 or PKCS#1 PEM (`--tls-key`).
-    pub key: &'a Path,
+    pub key: PathBuf,
     /// The CA certificates a client's certificate must chain to (`--tls-client-ca`).
-    pub client_ca: &'a Path,
+    pub client_ca: PathBuf,
+    /// The client keys served (`--tls-client-pin`).
+    pub client_pins: ClientPins,
+    /// The revocation list of client keys (`--tls-client-revoked`), if any.
+    pub client_revoked: Option<PathBuf>,
 }
 
 /// A loaded, consistent server configuration, ready to bind.
@@ -219,37 +301,48 @@ impl NodeTls {
     ///
     /// Returns [`TlsConfigError`] for an unsafe, unreadable, empty or malformed file, a
     /// key that does not match the certificate, or a configuration rustls refuses.
-    pub fn load(files: TlsFiles<'_>, pins: ClientPins) -> Result<Self, TlsConfigError> {
+    pub fn load(sources: &TlsSources) -> Result<Self, TlsConfigError> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let chain = certificates(files.cert, 0o022)?;
-        let key_bytes = read(files.key, 0o077)?;
+        let chain = certificates(&sources.cert, 0o022)?;
+        let key_bytes = read(&sources.key, 0o077)?;
         let key =
             PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|error| TlsConfigError::Pem {
-                path: files.key.to_owned(),
+                path: sources.key.clone(),
                 reason: format!("holds no usable PEM private key ({error})"),
             })?;
         let signing = provider
             .key_provider
             .load_private_key(key.clone_key())
             .map_err(|error| TlsConfigError::Pem {
-                path: files.key.to_owned(),
+                path: sources.key.clone(),
                 reason: format!("the key cannot sign ({error})"),
             })?;
         CertifiedKey::new(chain.clone(), signing)
             .keys_match()
             .map_err(|_| TlsConfigError::KeyMismatch {
-                cert: files.cert.to_owned(),
-                key: files.key.to_owned(),
+                cert: sources.cert.clone(),
+                key: sources.key.clone(),
             })?;
 
         let mut roots = RootCertStore::empty();
-        for ca in certificates(files.client_ca, 0o022)? {
+        for ca in certificates(&sources.client_ca, 0o022)? {
             roots.add(ca).map_err(|error| TlsConfigError::Pem {
-                path: files.client_ca.to_owned(),
+                path: sources.client_ca.clone(),
                 reason: format!("holds a certificate that is not a usable CA ({error})"),
             })?;
         }
-        let verifier = ClientVerifier::new(roots, pins, Arc::clone(&provider))?;
+        let revoked = sources
+            .client_revoked
+            .as_deref()
+            .map(RevokedKeys::load)
+            .transpose()?
+            .unwrap_or_default();
+        let verifier = ClientVerifier::new(
+            roots,
+            sources.client_pins.clone(),
+            Arc::new(revoked),
+            Arc::clone(&provider),
+        )?;
 
         let mut config = ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])
@@ -312,24 +405,31 @@ fn certificates(
 }
 
 /// The client-certificate check: the client CA's chain for client authentication, with
-/// [`CLOCK_SKEW`] on either side of the validity window, then the pins.
+/// [`CLOCK_SKEW`] on either side of the validity window, then the revocation list, then
+/// the pins.
 #[derive(Debug)]
 struct ClientVerifier {
     inner: Arc<dyn ClientCertVerifier>,
     pins: ClientPins,
+    revoked: Arc<RevokedKeys>,
 }
 
 impl ClientVerifier {
     fn new(
         roots: RootCertStore,
         pins: ClientPins,
+        revoked: Arc<RevokedKeys>,
         provider: Arc<CryptoProvider>,
     ) -> Result<Self, TlsConfigError> {
         let inner = WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
             .clear_root_hint_subjects()
             .build()
             .map_err(|error| TlsConfigError::Tls(error.to_string()))?;
-        Ok(Self { inner, pins })
+        Ok(Self {
+            inner,
+            pins,
+            revoked,
+        })
     }
 }
 
@@ -346,6 +446,14 @@ fn shifted(now: UnixTime, skew: Duration, later: bool) -> UnixTime {
 #[derive(Debug, Error)]
 #[error("the client key {0} is not pinned with --tls-client-pin")]
 struct NotPinned(SpkiPin);
+
+#[derive(Debug, Error)]
+#[error("the client key {0} is revoked by --tls-client-revoked")]
+struct Revoked(SpkiPin);
+
+fn refused_key(error: impl std::error::Error + Send + Sync + 'static) -> rustls::Error {
+    rustls::Error::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(error))))
+}
 
 impl ClientCertVerifier for ClientVerifier {
     fn offer_client_auth(&self) -> bool {
@@ -388,10 +496,11 @@ impl ClientCertVerifier for ClientVerifier {
         }?;
         let pin = SpkiPin::of_certificate(end_entity)
             .map_err(|_| rustls::Error::InvalidCertificate(CertificateError::BadEncoding))?;
+        if self.revoked.revokes(pin) {
+            return Err(refused_key(Revoked(pin)));
+        }
         if !self.pins.serves(pin) {
-            return Err(rustls::Error::InvalidCertificate(CertificateError::Other(
-                OtherError(Arc::new(NotPinned(pin))),
-            )));
+            return Err(refused_key(NotPinned(pin)));
         }
         Ok(verified)
     }
@@ -736,6 +845,53 @@ mod tests {
         assert!(pins.serves(SpkiPin::parse(&one).unwrap()));
         assert!(!pins.serves(SpkiPin::parse(&two).unwrap()));
         assert!(ClientPins::default().serves(SpkiPin::parse(&two).unwrap()));
+    }
+
+    #[test]
+    fn a_revocation_list_is_one_pin_per_line_with_blank_lines_and_comments() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let two = format!("sha256:{}", "2".repeat(64));
+        let three = format!("sha256:{}", "3".repeat(64));
+        let path = Path::new("revoked.list");
+        let revoked = RevokedKeys::parse(
+            path,
+            &format!("# lost keys\r\n\n  {one}  # laptop\n\t{two}\n{one}\n"),
+        )
+        .unwrap();
+        assert_eq!(revoked.len(), 2, "a key listed twice is revoked once");
+        assert!(revoked.revokes(SpkiPin::parse(&one).unwrap()));
+        assert!(revoked.revokes(SpkiPin::parse(&two).unwrap()));
+        assert!(!revoked.revokes(SpkiPin::parse(&three).unwrap()));
+        assert!(RevokedKeys::parse(path, "").unwrap().is_empty());
+        assert!(RevokedKeys::parse(path, "#\n \n").unwrap().is_empty());
+        assert!(RevokedKeys::default().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_revocation_line_is_named_by_its_number() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let path = Path::new("revoked.list");
+        for (text, at, holds) in [
+            (format!("{one}\nsha256:00\n"), 2, "sha256:00".to_owned()),
+            (format!("# a\n\n{one} {one}"), 3, format!("{one} {one}")),
+            (one.to_uppercase(), 1, one.to_uppercase()),
+            ("md5:00 # old".to_owned(), 1, "md5:00".to_owned()),
+        ] {
+            let error = RevokedKeys::parse(path, &text).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    TlsConfigError::Revocation { path: p, line, value }
+                        if p == path && *line == at && *value == holds
+                ),
+                "{text:?}: {error:?}"
+            );
+            let message = error.to_string();
+            assert!(
+                message.starts_with(&format!("revoked.list, line {at}: malformed")),
+                "{message}"
+            );
+        }
     }
 
     #[test]
