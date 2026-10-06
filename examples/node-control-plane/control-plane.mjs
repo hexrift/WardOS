@@ -43,6 +43,9 @@ import {
   requireAgentAdapter,
   requireApprovalHold,
   requireCredentialBroker,
+  requireResourceEnforcement,
+  resourcesGrant,
+  resourcesGrantOf,
   rootLease,
   saveRunRecord,
   signEnvelope,
@@ -69,6 +72,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--actions-wait-secs <n>] [--approve-all | --deny-all | --ask] [--note <text>]
                [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
                [--hold host=<pattern> | --hold service=<name>]... [--agent-adapter <id>]
+               [--cpu-millis <n>] [--memory-bytes <n>] [--pids <n>]
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
@@ -114,12 +118,21 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                does not list it in adapters.hosted is refused here before anything is
                signed. The outcome names it in agent_adapter. (--adapter is the
                ward-node-adapter binary, not an agent adapter.)
+               --cpu-millis (CPU time per second, in thousandths of a CPU), --memory-bytes
+               (memory, tmpfs included, no swap) and --pids (processes and threads at once)
+               put a resources grant in the manifest: the node, started with --cgroup-root,
+               enforces each limit on the attempt's whole process tree through its cgroup
+               and records what the attempt used in the evidence log. Each is an integer
+               >= 1; give any of them. The node's capability document is read first: a node
+               that does not report resources with each named limit true, or whose capacity
+               is below a limit, is refused here (unsupported_grant) before anything is
+               signed. The outcome lists the grant in resources.
   replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
                A policy answers its action channel as run's does, replaying recorded answers;
-               a recorded credentials grant, hold and agent adapter are listed in the outcome
-               as run's are.
+               a recorded credentials grant, hold, resources grant and agent adapter are
+               listed in the outcome as run's are.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
   result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
                Read an ended attempt's stored result again (its run must have carried the grant).
@@ -180,6 +193,9 @@ const OPTIONS = {
   credential: { type: "string", multiple: true },
   hold: { type: "string", multiple: true },
   "agent-adapter": { type: "string" },
+  "cpu-millis": { type: "string" },
+  "memory-bytes": { type: "string" },
+  pids: { type: "string" },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -276,7 +292,8 @@ function credentialsOf(values, budgetMs) {
 
 /**
  * The manifest the flags ask for: offline, with an output grant when any output flag is
- * given and an actions grant when --actions is; with --credential, the credentials grant
+ * given, a resources grant when any of --cpu-millis, --memory-bytes and --pids is, and an
+ * actions grant when --actions is; with --credential, the credentials grant
  * and a network.custom of exactly its hosts; with --hold, the hold, which needs --actions
  * naming approval and may name only those hosts and services.
  */
@@ -290,6 +307,12 @@ function manifestOf(values, budgetMs) {
       files: (values.files ?? []).flatMap((entry) => entry.split(",")),
       filesBytes: integer(values, "files-bytes", 0),
     });
+  }
+  const limits = { cpuMillis: "cpu-millis", memoryBytes: "memory-bytes", pids: "pids" };
+  if (Object.values(limits).some((name) => values[name] !== undefined)) {
+    object.resources = resourcesGrant(
+      Object.fromEntries(Object.entries(limits).map(([field, name]) => [field, values[name] === undefined ? undefined : integer(values, name)])),
+    );
   }
   const tuning = ["actions-max-pending", "actions-max-total", "actions-wait-secs"].some((name) => values[name] !== undefined);
   if (values.actions === undefined) {
@@ -538,17 +561,20 @@ function deriveCommand(positionals) {
 
 /**
  * Refuse a credentials grant unless the node's capability document offers the broker, a
- * hold unless it offers approval holds, and an agent adapter unless it hosts it; the
- * document is read once, and only when needed.
+ * hold unless it offers approval holds, a resources grant unless it enforces every limit
+ * within its capacity, and an agent adapter unless it hosts it; the document is read once,
+ * and only when needed.
  */
 async function requireOffers(values, workloadManifest, agentAdapter) {
   const brokered = workloadManifest?.credentials !== undefined;
   const held = workloadManifest?.hold !== undefined;
-  if (!brokered && !held && agentAdapter === null) return;
+  const limited = workloadManifest?.resources !== undefined;
+  if (!brokered && !held && !limited && agentAdapter === null) return;
   const adapter = adapterOf(values);
   try {
     const capabilities = await adapter.capabilities();
     if (brokered) requireCredentialBroker(capabilities);
+    if (limited) requireResourceEnforcement(capabilities, workloadManifest.resources);
     if (held) requireApprovalHold(capabilities);
     if (agentAdapter !== null) requireAgentAdapter(capabilities, agentAdapter);
   } finally {
@@ -634,6 +660,7 @@ async function run(values, argv) {
   );
   const outcome = { ...outcomeOf(report, { grant: outputGrantOf(signed.envelope_json) }), version, operations: report.operations };
   if (workloadManifest?.actions !== undefined) outcome.actions = answers;
+  if (workloadManifest?.resources !== undefined) outcome.resources = workloadManifest.resources;
   if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
   if (workloadManifest?.hold !== undefined) outcome.hold = workloadManifest.hold;
   if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
@@ -660,6 +687,8 @@ async function replay(values) {
     replayed: true,
   };
   if (granted) outcome.actions = answers;
+  const resources = resourcesGrantOf(record.envelope_json);
+  if (resources !== null) outcome.resources = resources;
   const credentials = credentialsGrantOf(record.envelope_json);
   if (credentials !== null) outcome.credentials = credentials;
   const hold = holdGrantOf(record.envelope_json);

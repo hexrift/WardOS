@@ -17,6 +17,14 @@ export const ID_PREFIXES: ReadonlyArray<IdPrefix>;
  */
 export const OUTPUT_CEILINGS: Readonly<{ stdioBytes: 1048576; filesBytes: 8388608; files: 64; pathBytes: 255 }>;
 
+/**
+ * What a node started with `--cgroup-root` honours of a `resources` grant (§7.5): at most
+ * 65 536 `pids` on every node (refused before signing above it), and at most
+ * `cpuMillisPerCpu` `cpu_millis` per logical CPU and the host's memory, both as the
+ * capability document's `capacity` reports them.
+ */
+export const RESOURCE_CEILINGS: Readonly<{ pids: 65536; cpuMillisPerCpu: 1000 }>;
+
 /** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
 export const ACTION_KINDS: ReadonlyArray<ActionKind>;
 
@@ -125,6 +133,22 @@ export interface OutputGrant {
 }
 
 /**
+ * The `resources` grant of §7.5 in wire spelling: the limits the node enforces on the
+ * attempt's whole process tree through its cgroup (§9). Each optional, at least one
+ * present, each an integer ≥ 1: `cpu_millis` is CPU time per second of wall clock in
+ * thousandths of one CPU (`cpu.max`), `memory_bytes` the memory the tree may use, tmpfs
+ * included, with no swap (`memory.max`), `pids` the processes and threads that may exist in
+ * it at once (`pids.max`, at most 65 536). Honoured only by a node started with
+ * `--cgroup-root` that reports each named limit `true` in `resources` and within its
+ * `capacity`; refused `unsupported_grant` otherwise.
+ */
+export interface ResourcesGrant {
+  cpu_millis?: number;
+  memory_bytes?: number;
+  pids?: number;
+}
+
+/**
  * The `actions` grant of §7.5 in wire spelling (ADR-0031 §2): the `kinds` the workload may
  * send (1–2, no repeats), at most `max_pending` waiting at once and `max_total` in the
  * attempt's lifetime (`max_pending` ≤ `max_total`), each answered `expired` after
@@ -176,6 +200,7 @@ export type HeldCapability = { host: string } | { service: string };
  */
 export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & {
   output?: OutputGrant;
+  resources?: ResourcesGrant;
   actions?: ActionsGrant;
   credentials?: CredentialGrant[];
   hold?: HoldGrant;
@@ -270,6 +295,25 @@ export function manifest(object?: Manifest): ManifestBytes;
 export function outputGrantOf(envelopeJson: string): OutputGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside the grammar or above the ceilings. */
 export function outputGrant(input: { stdioBytes: number; files: string[]; filesBytes: number }): OutputGrant;
+/** The `resources` grant of a signed envelope's manifest, or `null` without one. */
+export function resourcesGrantOf(envelopeJson: string): ResourcesGrant | null;
+/**
+ * The §7.5 `resources` grant from the control plane's words; an omitted limit is absent.
+ * Refused outside the grammar (no limit, a limit < 1 or not a safe integer) or above the
+ * pid ceiling.
+ */
+export function resourcesGrant(input?: { cpuMillis?: number; memoryBytes?: number; pids?: number }): ResourcesGrant;
+/**
+ * Whether the node's capability document (§5) enforces `grant`: its `resources` section has
+ * every named limit `true`, and the grant is within its `capacity` (1000 `cpu_millis` per
+ * logical CPU, at most its `memory_bytes`).
+ */
+export function enforcesResources(capabilities: unknown, grant: ResourcesGrant): boolean;
+/**
+ * The capability document, refused (naming why and `unsupported_grant`) unless it enforces
+ * `grant`: any other node refuses the manifest at `admit`, so it is refused before signing.
+ */
+export function requireResourceEnforcement<C>(capabilities: C, grant: ResourcesGrant): C;
 /** The `actions` grant a signed envelope's manifest carries, read from its exact bytes, or `null`. */
 export function actionsGrantOf(envelopeJson: string): ActionsGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside ADR-0031's grammar or above the ceilings. */
