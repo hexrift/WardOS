@@ -15,7 +15,7 @@ use crate::error::{Error, Result};
 use crate::sandbox::RELAY_ADDR;
 
 /// Placeholder the agent presents; the proxy strips it before injection.
-pub const PLACEHOLDER: &str = "ward-gateway";
+pub const PLACEHOLDER: &str = ward_agent_adapter::catalogue::PLACEHOLDER_KEY;
 
 /// The lease a host-vault key is issued under: the validity a gateway grant
 /// is recorded with (`session::GATEWAY_TTL`); the route ends with the launch.
