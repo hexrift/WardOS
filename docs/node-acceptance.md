@@ -54,8 +54,9 @@ the acceptance of the Node.js reference control plane
 real node started with `--output-return` and `--action-channel` (and a third without
 either, a fourth with `--network-allowlist` and `--credentials`, a fifth with
 `--network-allowlist` alone, a sixth with `--network-allowlist`, `--credentials`,
-`--action-channel` and `--approval-hold`, and a seventh with all of those but
-`--approval-hold`), under the same isolation requirement; its twenty-two verdicts
+`--action-channel` and `--approval-hold`, a seventh with all of those but
+`--approval-hold`, and an eighth with `--agent-adapter claude-code` and
+`--agent-adapter codex`), under the same isolation requirement; its twenty-five verdicts
 (five of the attempt's lifecycle; three of result return: declared content with digests the host
 agrees with, truncation past the budgets, and the refusal of a grant by a node without
 the flag; six of the action channel, with a workload in the sandbox that proceeds only on
@@ -73,8 +74,14 @@ workload that retries a held credential route: `--approve-all` approves the requ
 node opened and the next request reaches the upstream with the lease injected, `--deny-all`
 and an unanswered request keep the route refused by name with nothing sent upstream, and a
 node without `--approval-hold` and the client before it refuse the hold, each checked
-against the sealed log's action and network records) follow the table and a failure of
-either fails the run. The credentials and hold nodes are `ward-node` built with its
+against the sealed log's action and network records; three of hosted agent adapters
+(ADR-0036), with a Claude Code fake that writes its hook lines and a Codex fake that checks
+its home, on the shipped build whose environment holds model keys: both run under
+byte-identical signed manifests with none of the node's keys in either sandbox and one
+`agent_adapter` binding in each sealed log, Claude Code's hook lines are answered `allow`
+and recorded as claims while Codex has no hook socket, and an adapter the node does not
+host is refused by the client and by a node without `--agent-adapter`) follow the table
+and a failure of either fails the run. The credentials and hold nodes are `ward-node` built with its
 `test-loopback` feature (the
 shipped build never connects to a loopback upstream or speaks plain HTTP to one), which
 `node-js.sh` builds into a target directory of its own or takes from
@@ -343,6 +350,12 @@ minute on a developer machine; each case prints its own time.
   answers) and by the four hold cases of `node-js.sh`, against the same fakes; a held host
   is proven released only on a credential route to it, since the shipped proxy never
   connects to a loopback upstream.
+- **Hosted agent adapters outside this suite.** A workload naming an agent adapter
+  (node-integration.md §6.10, ADR-0036) is proven by `ward-node`'s own
+  `tests/node_adapter_conformance.rs` (the same signed manifest through Claude Code, Codex
+  and the generic adapter, with identical refusals and enforcement records) and by the
+  three agent-adapter cases of `node-js.sh`, with fake runtimes; never with a real runtime
+  against a real model.
 - **No workspace export, no streamed output.** The result return cases prove the bounded
   result of §2.3 (declared files, stream heads); what a workload wrote beyond the files it
   declared is still read on the host as the node's uid, which a remote control plane

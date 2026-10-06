@@ -9,7 +9,9 @@
 // FAKE_ADAPTER_CREDENTIALS=1 advertises the allowlist and the credential broker (§5), as a
 // node started with --network-allowlist and --credentials does; FAKE_ADAPTER_APPROVAL_HOLD=1
 // advertises the action channel with `hold` (§5, §6.9), as one started with
-// --action-channel and --approval-hold as well does.
+// --action-channel and --approval-hold as well does. FAKE_ADAPTER_AGENT_ADAPTERS=<id>,…
+// advertises those agent adapters in `adapters` (§5), as a node started with
+// --agent-adapter for each does.
 //
 // FAKE_ADAPTER_ACTIONS names a JSON file that scripts the attempt's action channel (§6.7)
 // and holds the node's side of it, so that several adapter processes in turn (a run and an
@@ -44,6 +46,7 @@ const resultReject = process.env.FAKE_ADAPTER_RESULT_REJECT;
 const channelFile = process.env.FAKE_ADAPTER_ACTIONS;
 const brokering = process.env.FAKE_ADAPTER_CREDENTIALS === "1";
 const holding = process.env.FAKE_ADAPTER_APPROVAL_HOLD === "1";
+const agentAdapters = (process.env.FAKE_ADAPTER_AGENT_ADAPTERS ?? "").split(",").filter(Boolean);
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -62,6 +65,7 @@ const CAPABILITIES = {
   verifier: { isolated: false },
   lifecycle: { pause: true, stop: true, revoke: true, admit: true, start: true },
   ...(holding ? { actions: { approval: true, decision: true, max_pending: 8, max_total: 64, max_wait_secs: 3600, hold: true } } : {}),
+  ...(agentAdapters.length > 0 ? { adapters: { contract: "1.0", hosted: agentAdapters } } : {}),
 };
 
 let failed = false;

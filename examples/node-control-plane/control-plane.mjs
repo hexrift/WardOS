@@ -21,6 +21,7 @@ import {
   VersionStore,
   actionsGrant,
   actionsGrantOf,
+  agentAdapterOf,
   answerOperationId,
   buildEnvelope,
   credentialsGrant,
@@ -39,11 +40,13 @@ import {
   outputGrant,
   outputGrantOf,
   recordAnswer,
+  requireAgentAdapter,
   requireApprovalHold,
   requireCredentialBroker,
   rootLease,
   saveRunRecord,
   signEnvelope,
+  workloadAdapter,
   writeReturnedFiles,
 } from "./ward-node.mjs";
 
@@ -65,7 +68,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--actions <kind>[,<kind>]] [--actions-max-pending <n>] [--actions-max-total <n>]
                [--actions-wait-secs <n>] [--approve-all | --deny-all | --ask] [--note <text>]
                [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
-               [--hold host=<pattern> | --hold service=<name>]...
+               [--hold host=<pattern> | --hold service=<name>]... [--agent-adapter <id>]
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
@@ -103,11 +106,20 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                policy answers those requests like any other. A node not started with
                --approval-hold is refused here before anything is signed. The outcome lists
                the hold in hold.
+               --agent-adapter runs the argv as that agent adapter (claude-code, codex or
+               process; argv[0] is the program it launches, a name on the sandbox PATH or an
+               absolute path): the node adds the adapter's environment and settings files
+               and, for one with hooks, records its hook lines as agent-origin claims, under
+               exactly the authority the manifest grants. A node whose capability document
+               does not list it in adapters.hosted is refused here before anything is
+               signed. The outcome names it in agent_adapter. (--adapter is the
+               ward-node-adapter binary, not an agent adapter.)
   replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
                A policy answers its action channel as run's does, replaying recorded answers;
-               a recorded credentials grant and hold are listed in the outcome as run's are.
+               a recorded credentials grant, hold and agent adapter are listed in the outcome
+               as run's are.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
   result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
                Read an ended attempt's stored result again (its run must have carried the grant).
@@ -157,6 +169,7 @@ const OPTIONS = {
   "actions-poll-ms": { type: "string" },
   credential: { type: "string", multiple: true },
   hold: { type: "string", multiple: true },
+  "agent-adapter": { type: "string" },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -497,18 +510,20 @@ function deriveCommand(positionals) {
 }
 
 /**
- * Refuse a credentials grant unless the node's capability document offers the broker, and
- * a hold unless it offers approval holds; the document is read once, and only when needed.
+ * Refuse a credentials grant unless the node's capability document offers the broker, a
+ * hold unless it offers approval holds, and an agent adapter unless it hosts it; the
+ * document is read once, and only when needed.
  */
-async function requireOffers(values, workloadManifest) {
+async function requireOffers(values, workloadManifest, agentAdapter) {
   const brokered = workloadManifest?.credentials !== undefined;
   const held = workloadManifest?.hold !== undefined;
-  if (!brokered && !held) return;
+  if (!brokered && !held && agentAdapter === null) return;
   const adapter = adapterOf(values);
   try {
     const capabilities = await adapter.capabilities();
     if (brokered) requireCredentialBroker(capabilities);
     if (held) requireApprovalHold(capabilities);
+    if (agentAdapter !== null) requireAgentAdapter(capabilities, agentAdapter);
   } finally {
     await adapter.close();
   }
@@ -543,8 +558,9 @@ async function run(values, argv) {
   // The grants, the policy and the node's offer of a credential broker and of approval
   // holds are checked before a version is allocated or anything is signed.
   const workloadManifest = manifestOf(values, budgetMs);
+  const agentAdapter = values["agent-adapter"] === undefined ? null : workloadAdapter(values["agent-adapter"], argv).id;
   const answering = policyOf(values, workloadManifest?.actions !== undefined);
-  await requireOffers(values, workloadManifest);
+  await requireOffers(values, workloadManifest, agentAdapter);
   const now = Date.now();
   const binding = { task, attempt, lease };
   const versions = new VersionStore(join(stateDir, "admission-versions.json"));
@@ -564,7 +580,7 @@ async function run(values, argv) {
       issuedAtUnixMs: now - 60_000,
       expiresAtUnixMs: now + validForMs + budgetMs,
     }),
-    workload: { argv, manifest: workloadManifest, snapshot: need(values, "snapshot"), wallClockBudgetMs: budgetMs },
+    workload: { argv, manifest: workloadManifest, snapshot: need(values, "snapshot"), wallClockBudgetMs: budgetMs, adapter: agentAdapter },
     issuedAtUnixMs: now - 60_000,
     expiresAtUnixMs: now + validForMs,
     version,
@@ -593,6 +609,7 @@ async function run(values, argv) {
   if (workloadManifest?.actions !== undefined) outcome.actions = answers;
   if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
   if (workloadManifest?.hold !== undefined) outcome.hold = workloadManifest.hold;
+  if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
@@ -620,6 +637,8 @@ async function replay(values) {
   if (credentials !== null) outcome.credentials = credentials;
   const hold = holdGrantOf(record.envelope_json);
   if (hold !== null) outcome.hold = hold;
+  const agentAdapter = agentAdapterOf(record.envelope_json);
+  if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }

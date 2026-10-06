@@ -19,7 +19,11 @@
 # refused 403 by name until the request the node opened for it is approved (and then
 # reaches the fake upstream with the lease injected), stays refused when it is denied or
 # expires, and read the log's request, answer and refusal back; a sixth node without
-# --approval-hold proves the refusal. A fake upstream on loopback over plain HTTP is
+# --approval-hold proves the refusal. The agent-adapter cases (node-integration.md §7.3,
+# ADR-0036) start a seventh node with --agent-adapter claude-code and --agent-adapter codex
+# and prove that both run under one signed manifest with the same authority, Claude Code's
+# hook lines recorded as claims, and an adapter the node does not host refused by the
+# client and by the plain node. A fake upstream on loopback over plain HTTP is
 # something the shipped ward-node refuses by design (its proxy never connects to loopback
 # and speaks only TLS upstream), so the credentials and hold nodes alone are ward-node
 # built with the `test-loopback` feature, exactly as ward-node's own
@@ -1378,6 +1382,138 @@ if [[ -z "$problems" ]]; then
   pass hold_is_refused_without_the_flag_or_outside_its_manifest "a node started with --action-channel, --network-allowlist and --credentials but without --approval-hold advertises actions without hold; run --hold reads that and refuses before anything is signed or recorded, the node itself refuses the signed hold unsupported_grant at admit, and a hold on a service or host the manifest does not grant is refused by the client before signing"
 else
   fail hold_is_refused_without_the_flag_or_outside_its_manifest "$problems"
+fi
+
+# ---- the agent-adapter node (node-integration.md §7.3, ADR-0036) ---------------------------
+
+# A node hosting Claude Code and Codex (the shipped build, offline), whose own environment
+# holds model keys. The fakes speak what each adapter wires: Claude Code reads the settings
+# the node seeds and writes its hook lines to $WARD_SOCKET (no ward-agent shim is bound in a
+# node sandbox), Codex checks the home its adapter sets and that it has no hook socket.
+# Each reports its environment's names and exits 0 only when every check held.
+agent_key="anthropic-canary-node-js-$$"
+agents_pid="$(ANTHROPIC_API_KEY="$agent_key" OPENAI_API_KEY="$agent_key" \
+  start_node "$work/agents.sock" "$work/agents-state" "$work/agents-tasks" \
+  --agent-adapter claude-code --agent-adapter codex)"
+background+=("$agents_pid")
+agents_common=(--socket "$work/agents.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
+mkdir -p "$work/agents-project"
+cat >"$work/agents-project/claude.py" <<'CLAUDE'
+import json
+import os
+import socket
+import sys
+
+settings = json.load(open(os.path.join(os.environ["CLAUDE_CONFIG_DIR"], "settings.json")))
+wired = settings["hooks"]
+answers = []
+for hook, tool in [("SessionStart", None), ("PreToolUse", "Bash"), ("PostToolUse", "Bash"), ("Stop", None)]:
+    if hook not in wired:
+        sys.exit(9)
+    line = {"hook": hook}
+    if tool:
+        line.update(tool=tool, summary="make test")
+    peer = socket.socket(socket.AF_UNIX)
+    peer.connect(os.environ["WARD_SOCKET"])
+    peer.sendall((json.dumps(line) + "\n").encode())
+    answers.append(json.loads(peer.makefile().readline())["decision"])
+    peer.close()
+with open("report.json", "w") as out:
+    json.dump({"answers": answers, "env": sorted(os.environ)}, out)
+sys.exit(0 if answers == ["allow"] * 4 and "ANTHROPIC_API_KEY" not in os.environ else 3)
+CLAUDE
+cat >"$work/agents-project/codex.py" <<'CODEX'
+import json
+import os
+import sys
+
+ok = os.environ.get("CODEX_HOME") == "/home/agent/.codex" and "WARD_SOCKET" not in os.environ
+ok = ok and not os.path.exists("/run/ward/hooks.sock") and "OPENAI_API_KEY" not in os.environ
+with open("report.json", "w") as out:
+    json.dump({"env": sorted(os.environ)}, out)
+sys.exit(0 if ok else 3)
+CODEX
+agents_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/agents-state" "$work/agents-project")"
+agents_run=("${agents_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
+  --state-dir "$work/cp" --snapshot "$agents_snapshot" --task-root "$work/agents-tasks" --timeout-ms 90000 --budget-ms 60000)
+
+# claims_in <log> <text>: how many times the evidence log's bytes hold the text.
+claims_in() {
+  node -e 'const b = require("fs").readFileSync(process.argv[1]); const t = Buffer.from(process.argv[2]); let n = 0; for (let i = b.indexOf(t); i >= 0; i = b.indexOf(t, i + 1)) n++; process.stdout.write(String(n));' "$1" "$2"
+}
+
+# ---- case 23: Claude Code and Codex run under one manifest and the same authority ---------
+
+problems=""
+node "$client" capabilities "${agents_common[@]}" >"$work/agents-capabilities.json"
+check 23 "$work/agents-capabilities.json" 'o.adapters' '{"contract":"1.0","hosted":["claude-code","codex"]}' "the hosted adapters"
+for agent in claude codex; do
+  id=claude-code
+  [[ "$agent" == codex ]] && id=codex
+  status=0
+  node "$client" run "${agents_run[@]}" --task "acc-task-23-$agent" --attempt "acc-attempt-23-$agent" \
+    --agent-adapter "$id" -- python3 "$agent.py" >"$work/run23-$agent.json" 2>>"$work/client.log" || status=$?
+  [[ "$status" == "0" ]] || problems+="$agent: exit status $status; "
+  check 23 "$work/run23-$agent.json" 'o.outcome' '"completed"' "$agent outcome"
+  check 23 "$work/run23-$agent.json" 'o.agent_adapter' "\"$id\"" "$agent named in the outcome"
+  check 23 "$work/run23-$agent.json" 'o.finalState' '"sealed"' "$agent final state"
+  task="$(field "$work/run23-$agent.json" 'o.binding.task' | tr -d '"')"
+  attempt="$(field "$work/run23-$agent.json" 'o.binding.attempt' | tr -d '"')"
+  log="$(field "$work/run23-$agent.json" 'o.evidenceLog' | tr -d '"')"
+  verify_log_at "$work/agents-state" "$work/agents-tasks" "$task" "$log" || problems+="$agent: the evidence log does not verify; "
+  [[ "$(claims_in "$log" "{\"agent_adapter\":{\"contract\":\"1.0\",\"adapter\":\"$id\"")" == "1" ]] || problems+="$agent: not one binding in the log; "
+  [[ "$(claims_in "$log" "$agent_key")" == "0" ]] || problems+="$agent: the node's key is in the log; "
+  grep -q "$agent_key" "$work/agents-tasks/$task/$attempt/report.json" 2>/dev/null && problems+="$agent: the node's key reached the sandbox; "
+  node -e 'const r = require(process.argv[1]); process.exit(r.envelope_json ? 0 : 1)' "$work/cp/runs/$attempt.json" \
+    || problems+="$agent: no run record; "
+  node -e 'const e = JSON.parse(require(process.argv[1]).envelope_json); process.stdout.write(e.workload.capability_manifest.hash)' \
+    "$work/cp/runs/$attempt.json" >"$work/manifest23-$agent.txt"
+done
+[[ "$(cat "$work/manifest23-claude.txt")" == "$(cat "$work/manifest23-codex.txt")" ]] || problems+="the two runs signed different manifests; "
+if [[ -z "$problems" ]]; then
+  pass agent_adapters_run_one_manifest "a node started with --agent-adapter claude-code and --agent-adapter codex advertises both in adapters; run --agent-adapter signs each beside the argv under byte-identical manifests, both complete in the same sandbox with each adapter's own configuration and none of the node's keys, and each sealed log holds one agent_adapter binding and verifies"
+else
+  fail agent_adapters_run_one_manifest "$problems"
+fi
+
+# ---- case 24: Claude Code's hook lines are claims; Codex has no hook socket -----------------
+
+problems=""
+claude_task="$(field "$work/run23-claude.json" 'o.binding.task' | tr -d '"')"
+claude_attempt="$(field "$work/run23-claude.json" 'o.binding.attempt' | tr -d '"')"
+claude_log="$(field "$work/run23-claude.json" 'o.evidenceLog' | tr -d '"')"
+codex_log="$(field "$work/run23-codex.json" 'o.evidenceLog' | tr -d '"')"
+[[ "$(field "$work/agents-tasks/$claude_task/$claude_attempt/report.json" 'o.answers')" == '["allow","allow","allow","allow"]' ]] \
+  || problems+="the hook socket did not answer every line allow; "
+[[ "$(claims_in "$claude_log" "PreToolUse Bash make test")" == "1" ]] || problems+="the PreToolUse claim is not in the log; "
+[[ "$(claims_in "$claude_log" "PostToolUse Bash make test")" == "1" ]] || problems+="the PostToolUse claim is not in the log; "
+[[ "$(claims_in "$codex_log" "ToolUse")" == "0" ]] || problems+="a hookless adapter's log holds a tool claim; "
+[[ ! -e "$work/agents-tasks/$claude_task/$claude_attempt.adapter" ]] || problems+="the adapter directory outlived the attempt; "
+if [[ -z "$problems" ]]; then
+  pass claude_code_hooks_are_claims "Claude Code's seeded settings wire its hooks to the attempt's hook socket, each line is answered allow and recorded in the sealed log as an agent-origin claim; Codex's attempt has no hook socket and its log no claim; the adapter's directory is gone with the attempt"
+else
+  fail claude_code_hooks_are_claims "$problems"
+fi
+
+# ---- case 25: an adapter the node does not host is refused, by the client and by the node ---
+
+problems=""
+status=0
+node "$client" run "${agents_run[@]}" --task acc-task-25 --attempt acc-attempt-25a \
+  --agent-adapter process -- python3 codex.py >"$work/run25a.json" 2>"$work/run25a.err" || status=$?
+[[ "$status" == "2" ]] || problems+="client refusal exit status $status, expected 2; "
+grep -q 'process in adapters.hosted.*unsupported_grant' "$work/run25a.err" || problems+="the client's refusal does not name it: $(cat "$work/run25a.err"); "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-25a).json" ]] || problems+="the refused run was recorded; "
+# The node refuses it too: case 23's signed Codex run, replayed to a node hosting no adapter.
+status=0
+node "$client" replay --socket "$work/plain.sock" --adapter "$WARD_NODE_ADAPTER_BIN" --state-dir "$work/cp" \
+  --attempt "$(node "$client" derive-id exec acc-attempt-23-codex)" >"$work/run25b.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="node refusal exit status $status, expected 1; "
+check 25 "$work/run25b.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "the node hosting no adapter refuses it"
+if [[ -z "$problems" ]]; then
+  pass agent_adapter_refused_where_not_hosted "run --agent-adapter process on a node that hosts only claude-code and codex is refused by the client before anything is signed or recorded, and the node started without --agent-adapter refuses the signed Codex run unsupported_grant at admit"
+else
+  fail agent_adapter_refused_where_not_hosted "$problems"
 fi
 
 echo
