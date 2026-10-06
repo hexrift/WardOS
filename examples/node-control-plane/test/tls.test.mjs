@@ -1,7 +1,8 @@
 // The adapter's flags for a node reached over mutual TLS (node-integration.md §3, §11.4,
 // ADR-0038): `--connect-tls` with this client's certificate and key, the server CA, the
-// expected name and an optional pinned key in place of `--socket`, never both, every
-// setting checked before the adapter is spawned, and the CLI's flags mapped onto them.
+// expected name, an optional pinned key and an optional list of revoked node keys in
+// place of `--socket`, never both, every setting checked before the adapter is spawned,
+// and the CLI's flags mapped onto them.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -11,6 +12,7 @@ import { Adapter, adapterNodeArgs } from "../ward-node.mjs";
 
 const CLI = fileURLToPath(new URL("../control-plane.mjs", import.meta.url));
 const PIN = `sha256:${"ab".repeat(32)}`;
+const REVOKED = "/etc/ward-control-plane/revoked-nodes";
 const TLS = {
   address: "node-4.ward.test:7443",
   cert: "/etc/ward-control-plane/client.pem",
@@ -67,4 +69,34 @@ test("the CLI maps its TLS flags onto the adapter and refuses a mixture", () => 
   const partial = run("--connect-tls", TLS.address, "--tls-cert", TLS.cert);
   assert.equal(partial.status, 2, partial.stderr);
   assert.match(partial.stderr, /--tls-key is required/);
+});
+
+test("a list of revoked node keys is --tls-server-revoked, after the pin", () => {
+  assert.deepEqual(adapterNodeArgs({ tls: { ...TLS, serverRevoked: REVOKED } }).slice(-2), ["--tls-server-revoked", REVOKED]);
+  assert.deepEqual(adapterNodeArgs({ tls: { ...TLS, serverPin: PIN, serverRevoked: REVOKED } }).slice(-4), [
+    "--tls-server-pin", PIN,
+    "--tls-server-revoked", REVOKED,
+  ]);
+  assert.ok(!adapterNodeArgs({ tls: TLS }).includes("--tls-server-revoked"));
+  for (const revoked of ["", 7, null, ["/a"]]) {
+    assert.throws(() => adapterNodeArgs({ tls: { ...TLS, serverRevoked: revoked } }), /serverRevoked/);
+  }
+});
+
+test("the adapter process and the CLI pass the revoked node keys on", async () => {
+  const adapter = new Adapter({ command: ECHO, tls: { ...TLS, serverRevoked: REVOKED } });
+  const event = await adapter.next();
+  assert.deepEqual(event.argv.slice(-2), ["--tls-server-revoked", REVOKED]);
+
+  const run = (...args) => spawnSync(process.execPath, [CLI, "capabilities", "--adapter", ECHO[0], ...args], { encoding: "utf8" });
+  const stray = run("--socket", "/s", "--tls-server-revoked", REVOKED);
+  assert.equal(stray.status, 2, stray.stderr);
+  assert.match(stray.stderr, /--tls-server-revoked needs --connect-tls/);
+  const flags = [
+    "--connect-tls", TLS.address, "--tls-cert", TLS.cert, "--tls-key", TLS.key,
+    "--tls-server-ca", TLS.serverCa, "--tls-server-name", TLS.serverName,
+  ];
+  const empty = run(...flags, "--tls-server-revoked", "");
+  assert.equal(empty.status, 2, empty.stderr);
+  assert.match(empty.stderr, /serverRevoked/);
 });

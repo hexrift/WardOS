@@ -311,12 +311,14 @@ Rules of the conversation:
 **A node on another host.** A node started with `--listen-tls` (node-integration.md §2.1,
 §3, ADR-0038) is reached over mutual TLS by the same adapter: `--connect-tls <host:port>`
 with this client's certificate and key, the CA of the node's certificate, the name it must
-carry and, optionally, the node's pinned key, in place of `--socket`. The conversation is
-unchanged. The reference client takes them as `new Adapter({ tls: { address, cert, key,
-serverCa, serverName, serverPin } })` (exclusive with `socket`, every setting checked
+carry, optionally the node's pinned key and optionally a list of revoked node keys
+(`--tls-server-revoked`: one `sha256:<hex>` per line, `#` comments, as the node's
+`--tls-client-revoked`), in place of `--socket`. The conversation is unchanged. The
+reference client takes them as `new Adapter({ tls: { address, cert, key, serverCa,
+serverName, serverPin, serverRevoked } })` (exclusive with `socket`, every setting checked
 before the adapter is spawned) and on its command line as `--connect-tls <host:port>
 --tls-cert <pem> --tls-key <pem> --tls-server-ca <pem> --tls-server-name <name>
-[--tls-server-pin sha256:<hex>]`:
+[--tls-server-pin sha256:<hex>] [--tls-server-revoked <file>]`:
 
 ```js
 const adapter = new Adapter({
@@ -326,14 +328,17 @@ const adapter = new Adapter({
     key: "/etc/institution/ward/client-key.pem",      // mode 0600 or 0400
     serverCa: "/etc/institution/ward/node-ca.pem",
     serverName: "node-7.exec.internal",
+    serverRevoked: "/etc/institution/ward/revoked-nodes", // node keys refused even when pinned
   },
 });
 ```
 
 The client's certificate says who may speak; the issuer signature (§5) still decides what
 is admitted, so the issuer key stays on the control plane as before. A refused handshake (a
-node certified by another CA or for another name, a node that refuses this client) is the
-adapter's `error` event, with the TLS reason, before anything is sent; a session that
+node certified by another CA or for another name, a node whose key the list revokes, a
+node that refuses this client) is the adapter's `error` event, with the TLS reason, before
+anything is sent; a list that cannot be read or has a malformed line is an `error` event
+naming the line before any command; a session that
 fails later in a `run` ends it `unknown` with the reason in `transport_error`, like any lost
 answer (§9). A remote client cannot read the
 evidence log; pass `task_root` only to have the report name the path the operator verifies.
@@ -935,7 +940,7 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 118 cases, no node, no sandbox
+cd examples/node-control-plane && node --test       # 120 cases, no node, no sandbox
 scripts/acceptance/node-js.sh                        # 28 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
@@ -1101,7 +1106,9 @@ plane deciding what to put through the node today:
   `--listen-tls` is reached from anywhere over mutual TLS (§6 above), but its certificate,
   its client CA and any pins are files its operator provisions; the certificate, the
   client CA and a list of revoked client keys are reloaded on `SIGHUP` without a restart,
-  the pins only by restarting the node. There is no enrolment, attestation or certificate
+  the pins only by restarting the node. A node key that leaked is refused only by the
+  clients whose `serverRevoked` list names it: the list is a file on each client host,
+  propagated by the operator. There is no enrolment, attestation or certificate
   revocation list, and the node reports handshakes on stderr, not in a durable record
   (#262, ADR-0038).
 - **A queue on the node.** A node at its bound on what runs at once refuses a `start`
@@ -1144,9 +1151,12 @@ Operator side:
       name the institution dials, `--tls-client-ca` naming the CA of the institution's
       client certificates and, where that CA certifies more than the institution,
       `--tls-client-pin` for the institution's keys (node-integration.md §2.1, ADR-0038);
-      the port reachable only from the control plane's network; a restart planned for every
-      certificate or CA rotation; the node's stderr (refused and served handshakes) kept in
-      the journal.
+      the port reachable only from the control plane's network; `--tls-client-revoked`
+      with an empty list and `ExecReload=` sending `SIGHUP`, so a revocation or rotation
+      needs no restart; the node's stderr (refused and served handshakes, reloads) kept in
+      the journal; the procedure for a compromised node key (node-integration-guide.md
+      §3.1: revoke on every client host, rotate the node to a fresh key, reload) written
+      down.
 - [ ] Where workloads need limits: the node started with `--cgroup-root <dir>`, a cgroup
       v2 directory delegated to the node user (for systemd, `Delegate=yes`); `resources`
       reads `true` for each limit the institution grants from the client's user. Where the
@@ -1174,8 +1184,11 @@ behind an adapter:
       (§7); `unknown` mapped to failure.
 - [ ] For a node on another host: the adapter given `tls` settings in place of `socket`
       (§6), the client key in a 0600 file of the worker's user, the expected server name
-      from configuration, never derived from what the node says; a TLS refusal treated as
-      an unreachable node, never retried with weaker settings.
+      from configuration, never derived from what the node says; a `serverRevoked` list
+      on every worker host, from the institution's configuration, that the operator's
+      procedure for a compromised node key updates; a TLS refusal (a revoked node key
+      included) treated as an unreachable node, never retried with weaker settings or
+      without the list.
 - [ ] Nodes started with `--output-return`, and each action's verdict file and stream
       budget declared in its manifest's `output` grant within the ceilings (§7.1 above); every
       returned file's digest verified before use; a granted output that is missing treated
