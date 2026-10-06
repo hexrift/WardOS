@@ -9,7 +9,8 @@ keep where, how to derive the ids and the version, how to build and sign the env
 outcome, how to ask for and read back a bounded result, how to grant the action channel
 and answer the workload's requests while it runs, how to grant a workload a credential the
 node brokers without the secret ever reaching it, how to run the workload as an agent
-adapter the node hosts, how to cancel and how to recover after a restart on either side. Every rule
+adapter the node hosts, how to bound what it may use and wait out a node at capacity, how
+to cancel and how to recover after a restart on either side. Every rule
 here is the contract's, [node-integration.md](node-integration.md), cited by section;
 nothing here adds to it. The reference implementation of everything below is
 [`examples/node-control-plane`](../examples/node-control-plane/README.md): a
@@ -31,7 +32,11 @@ must not reach a host or use a credential before a human says yes, the control p
 that capability in the manifest and the node refuses it until the control plane approves
 the request the node opens for it (§7.4 below). Where the action is an agent runtime —
 Claude Code, Codex or any program — the workload names its adapter and the node launches
-it through the adapter contract under the same manifest (§7.5 below). What the node
+it through the adapter contract under the same manifest (§7.5 below). Where an action must
+stay within a CPU, memory or process budget, the manifest names the limits and the node
+enforces them in a cgroup of the attempt's own; a node at its bound on what runs at once
+refuses a start as backpressure, and the client waits it out with the same start (§7.6
+below). What the node
 cannot do yet for such a control plane is §11 below; read it before deciding which actions
 go through the node.
 
@@ -782,6 +787,90 @@ $ node control-plane.mjs run … --agent-adapter codex -- codex exec "fix the bu
 
 `replay` names the recorded adapter the same way.
 
+### 7.6 Resource limits and capacity
+
+A node started with `--cgroup-root <dir>`, a cgroup v2 directory its operator delegated to
+it, runs every attempt in a cgroup of its own, enforces the manifest's `resources` limits
+on the attempt's whole process tree there, and records what the attempt used
+(node-integration.md §2.1, §7.5, §9). A node started with `--max-running <n>` runs at most
+`n` attempts at once and refuses a `start` past that bound, or below a memory or disk
+headroom floor, `capacity_exhausted` (§8.2). The two are independent: either can be on
+without the other.
+
+**The grant** is part of the signed manifest, after `network` and `output` and before
+`actions`, its limits in this order:
+
+```json
+{"network":"offline","resources":{"cpu_millis":500,"memory_bytes":268435456,"pids":64}}
+```
+
+Each limit is optional and at least one is present (no limits is no `resources` field):
+`cpu_millis`, CPU time per second of wall clock in thousandths of one CPU (`1000` is one
+full CPU); `memory_bytes`, the memory the tree may use, tmpfs writes included, with no
+swap; `pids`, the processes and threads that may exist in it at once, at most 65 536
+(`RESOURCE_CEILINGS`). Each is an integer of at least 1. `resourcesGrant({cpuMillis,
+memoryBytes, pids})` builds it, leaving out a limit not given, and `workload.manifest` takes
+it; both refuse anything outside that grammar, or a `pids` above the ceiling, before
+anything is signed. `resourcesGrantOf(envelope_json)` reads it back from the signed bytes.
+
+**The node's offer.** The capability document carries `resources` (`{"cpu":…,"memory":…,
+"pids":…}`) exactly on a node started with `--cgroup-root`, each flag `true` when the node
+enabled that controller (§5); it honours at most 1 000 `cpu_millis` per logical CPU and at
+most the `memory_bytes` it reports in `capacity`. Any other node, or a grant above those,
+is refused `unsupported_grant` at `admit`, so the client reads the document first:
+`enforcesResources(capabilities, grant)` says whether, and
+`requireResourceEnforcement(capabilities, grant)` refuses, naming why and
+`unsupported_grant`, before a version is allocated or anything is signed.
+
+**What the evidence log says.** On a node with `--cgroup-root`, `NodeAttemptResourceUsage`
+before `NodeAttemptEnded`: the limits enforced and what the tree used (CPU time, peak
+memory, peak pids), with `memory_oom_kills` and `pids_max_events` saying whether a limit
+was hit; a tree past its memory limit is killed whole (§6.5, §9). Read them, not the exit
+status alone, to tell a limit from the workload's own failure.
+
+**Capacity.** A `start` refused `capacity_exhausted` is backpressure, not a failure: the
+task is still `ready` and its admission valid, nothing ran and nothing was recorded, and the
+same `start` (the same operation id) may be sent again once an attempt has ended (§8.2,
+§11.2). `Adapter.run(signed, {capacityWaitMs})` does that: it sends the same `run` command
+again, the same signed bytes, proof and operation ids, so create and admit replay and the
+same `start` is sent, after 250 ms, each wait twice the last up to 5 s (`CAPACITY_WAIT`,
+or `capacityDelayMs` and `capacityMaxDelayMs`), until the node starts it or
+`capacityWaitMs` is spent. Nothing is re-signed and no version is allocated. Before each
+wait it reads the capability document's live `scheduling` (`max_running`, `running` and the
+floors with what is available), and lists each wait, `{retry, operation_id, delay_ms,
+scheduling}`, in `capacityWaits` and to `onCapacityWait`. Once the wait is spent the result
+is the refusal (`capacityExhausted(report)`): `refused`, certain, the attempt still
+`ready`. Keep it in the control plane's own queue and replay the recorded run later; a
+start sent after the envelope expired is `lease_expired`, and the attempt then needs a new
+admission. `capacityWaitMs` defaults to 0, so a library caller decides. A `cancel()` while
+waiting does not signal the idle adapter (which would exit): the attempt is revoked under
+the scheme's `revoke` id, so nothing starts it later, and the same run, sent once more,
+finds it revoked and seals it; a revoke the node refuses is reported in `operations` and
+the run is not sent again, since it could start the attempt.
+
+**The command line.** `control-plane.mjs run --cpu-millis <n> --memory-bytes <n> --pids <n>`
+(any of them) puts the grant in the manifest, reads the node's capability document first
+and exits 2, naming `unsupported_grant`, on a node that does not enforce every named limit
+within its capacity; the outcome lists the grant in `resources`, and `replay` lists the
+recorded one. `--capacity-wait-secs <n>` (default 30, 0 disables, never past
+`--valid-for-ms`) bounds the wait; each wait is printed on stderr with the node's
+scheduling and listed in the outcome's `capacity_waits`:
+
+```text
+$ node control-plane.mjs run … --memory-bytes 268435456 --pids 64 --capacity-wait-secs 60 -- make test
+control-plane: start (operation 3) refused capacity_exhausted: the node runs 4 of 4 attempts; sending the same start again in 250 ms (retry 1)
+{"outcome":"completed",…,"resources":{"memory_bytes":268435456,"pids":64},"capacity_waits":[{"retry":1,"operation_id":3,"delay_ms":250,"scheduling":{"max_running":4,"running":4,…}}]}
+```
+
+When the wait is spent `run` exits 1 with the refusal and says on stderr that the attempt
+is admitted and ready and that `replay --attempt <exec_…>` sends the same start again.
+`replay` sends the recorded run once and never waits: at capacity its outcome is the
+refusal again. The acceptance proves both against a real node started with
+`--max-running 1` and without `--cgroup-root`: a run that gives up, one that waits until the
+attempt holding the slot ends and completes under operation ids 1, 2, 3 and 6 and version
+1, the replay of the first that is then started, and the refusal of a resources grant by
+the client and by the node itself.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -845,8 +934,8 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 93 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 25 cases against real nodes; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 118 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 28 cases against real nodes; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
@@ -874,7 +963,15 @@ read before signing, and `run --hold` with `--approve-all` and `--deny-all` and 
 and agent adapters: the workload's `adapter` spelled last and absent without one, the
 manifest the same bytes with or without it, the id and program grammar, `adapters.hosted`
 read before signing, and `run --agent-adapter` signed, named in the outcome, replayed and
-refused on a node that does not host it.
+refused on a node that does not host it, and resource limits and capacity: the `resources`
+grant's grammar held to `ward-node-protocol`'s (the same accepted and refused limits, the
+§7.5 example signed byte for byte, after `output` and before `actions`), the capability
+document's `resources` flags and `capacity` read before signing, `run --cpu-millis`,
+`--memory-bytes` and `--pids` signed, listed, replayed and refused, and a `start` refused
+`capacity_exhausted` sent again as the same run with the same operation ids until it is
+accepted, given up once the wait is spent, revoked and sealed when cancelled while waiting (and
+never sent again when that revoke is refused),
+and never waited out by `replay`.
 The acceptance starts a real node with the client's generated
 key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
@@ -934,6 +1031,15 @@ and, against a node started with `--listen-tls` and certificates the script make
 the socket's, a run completing to a verifying sealed log, the node's key pinned the
 operator's way accepted and another refused by name, a client certified by another CA
 refused and reported in the node's log),
+and, against a shipped node started with `--max-running 1` and without `--cgroup-root`,
+`capacity_exhausted_start_is_waited_out_with_the_same_start` (while one attempt holds the
+slot, `--capacity-wait-secs 1` gives up with the attempt `ready` and the node's
+scheduling in each wait, `--capacity-wait-secs 60` completes once the holder ends under the
+same operation ids and version 1, and the replay of the first sends its start, now
+accepted) and `resources_grant_is_refused_without_cgroup_root` (the client's refusal before
+signing, the node's own `unsupported_grant` for the same grant signed without asking it,
+and a pid limit outside the grammar); a node that enforces limits needs a delegated cgroup,
+which is the Rust acceptance's capacity case (node-acceptance.md §2.4),
 verifying every evidence log with `ward-node audit --task-root` (and `ward replay --verify`
 when a `ward` binary is at hand). The shipped `ward-node` never connects to a loopback
 address and speaks only TLS upstream, so the credentials and hold nodes, alone, are
@@ -995,6 +1101,11 @@ plane deciding what to put through the node today:
   its client CA and any pins are files its operator provisions and rotates by restarting
   the node; there is no enrolment, attestation or certificate revocation, and the node
   reports handshakes on stderr, not in a durable record (#262, ADR-0038).
+- **A queue on the node.** A node at its bound on what runs at once refuses a `start`
+  `capacity_exhausted` and keeps nothing queued (§7.6 above): the client waits for a
+  bounded time with the same start, and the control plane's own queue holds the rest.
+  Resource limits are enforced only by a node whose operator delegated a cgroup to it
+  (`--cgroup-root`); elsewhere a grant is refused, never run unlimited (#260).
 
 ## 12. Checklist for #490
 
@@ -1033,6 +1144,11 @@ Operator side:
       the port reachable only from the control plane's network; a restart planned for every
       certificate or CA rotation; the node's stderr (refused and served handshakes) kept in
       the journal.
+- [ ] Where workloads need limits: the node started with `--cgroup-root <dir>`, a cgroup
+      v2 directory delegated to the node user (for systemd, `Delegate=yes`); `resources`
+      reads `true` for each limit the institution grants from the client's user. Where the
+      host must not run more than it can: `--max-running <n>` (and `--memory-floor`,
+      `--disk-floor` as needed); `scheduling` reads that bound.
 - [ ] Where a real Claude Code or Codex runs there: the node started with
       `--agent-shim <file>` naming the release's `ward-agent` (from the runtime tarball or
       the image, owned by root or the node user, writable by no one else) and
@@ -1091,6 +1207,16 @@ behind an adapter:
       environment, the base URL (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`) set by a node with
       a shim only for the provider the manifest grants; the sealed log's `agent_adapter`
       binding and hook claims read as the agent's account, never as authority.
+- [ ] Where an action has a CPU, memory or process budget: the `resources` grant in its
+      manifest (§7.6 above), signed only after `requireResourceEnforcement` accepted the
+      node's capability document; `NodeAttemptResourceUsage` in the sealed log read as the
+      attempt's accounting, and `memory_oom_kills` or `pids_max_events` as a limit hit,
+      not a workload bug.
+- [ ] `capacity_exhausted` from `start` treated as backpressure: the same run sent again
+      with backoff within a bounded wait (`capacityWaitMs`), never a new version, attempt
+      or signature; past the wait the work item stays queued with the attempt admitted
+      and `ready`, its recorded run replayed later (or, once the envelope expired, a new
+      admission).
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.
