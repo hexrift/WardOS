@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # Acceptance of the Node.js reference control plane (examples/node-control-plane,
 # docs/node-integration-from-nodejs.md) against a real `ward-node`: the client generates
-# its issuer key, the node is started with that key in its trust store, a task root and
-# --output-return, and every byte the client sends is validated by the node itself. A
-# second node without --output-return proves the refusal of an output grant. One verdict
-# line per case on stdout,
+# its issuer key, the node is started with that key in its trust store, a task root,
+# --output-return and --action-channel, and every byte the client sends is validated by the
+# node itself. A second node without either flag proves the refusal of an output grant and
+# of an actions grant. The action-channel cases run a Python agent in the sandbox that asks
+# through /run/ward/actions.sock and proceeds only on an approval, and read the sealed
+# evidence log's action records back byte for byte. One verdict line per case on stdout,
 #   node-js acceptance <case>: PASS|FAIL -- <what it proves>
 # then a summary; everything else goes to stderr. Exit status: 0 when every case passed
 # (or isolation is unavailable and not required, which prints SKIPPED), 1 otherwise.
@@ -76,10 +78,11 @@ work="$(mktemp -d)"
 chmod 700 "$work"
 node_pid=""
 plain_pid=""
+background=()
 # shellcheck disable=SC2317  # reached through the EXIT trap
 cleanup() {
   local pid
-  for pid in "$node_pid" "$plain_pid"; do
+  for pid in "${background[@]}" "$node_pid" "$plain_pid"; do
     if [[ -n "$pid" ]]; then
       kill "$pid" 2>/dev/null || true
       wait "$pid" 2>/dev/null || true
@@ -103,6 +106,74 @@ field() {
 # compare against the digest the node returned for the same file.
 host_digest() {
   node --input-type=module -e 'import { readFileSync } from "node:fs"; import { blake3Hex } from "./examples/node-control-plane/blake3.mjs"; process.stdout.write(blake3Hex(readFileSync(process.argv[1])));' -- "$1"
+}
+
+# text_digest <text>: BLAKE3-256 of the UTF-8 bytes of a text, as the node digests a summary,
+# detail or note (node-integration.md §6.7).
+text_digest() {
+  node --input-type=module -e 'import { blake3Hex } from "./examples/node-control-plane/blake3.mjs"; process.stdout.write(blake3Hex(Buffer.from(process.argv[1], "utf8")));' -- "$1"
+}
+
+# action_records <log> <out>: the evidence log's records as one JSON line, read from the raw
+# bytes: every frame (`WE`, version 1, kind 1, u32 length, the postcard record) is walked,
+# each record's event named by its variant, and the three action records decoded field by
+# field (ward-events' NodeActionRequested, NodeActionAnswered, NodeActionRefused; ADR-0031
+# §4). A record that does not decode exactly up to its own hash fails the read.
+action_records() {
+  # shellcheck disable=SC2016  # JavaScript, not shell: its ${…} are template literals
+  node --input-type=module -e '
+    import { readFileSync, writeFileSync } from "node:fs";
+    const NAMES = { 40: "NodeAttemptAdmitted", 41: "NodeAttemptLaunched", 42: "NodeAttemptIntervened", 43: "NodeAttemptEnded", 44: "NodeAttemptRecovered", 45: "NodeAttemptSealed", 46: "NodeAttemptOutputCollected", 47: "NodeAttemptResourceUsage", 48: "NodeActionRequested", 49: "NodeActionAnswered", 50: "NodeActionRefused" };
+    const KINDS = ["approval", "decision"];
+    const DECISIONS = ["approved", "denied", "expired", "cancelled"];
+    const REFUSALS = ["oversized", "malformed", "control_request", "kind_not_granted", "duplicate_id", "too_many_pending", "too_many_requests"];
+    const bytes = readFileSync(process.argv[1]);
+    const records = [];
+    let at = 0;
+    while (at < bytes.length) {
+      if (bytes.toString("latin1", at, at + 2) !== "WE" || bytes[at + 2] !== 1 || bytes[at + 3] !== 1) throw new Error(`no record frame at byte ${at}`);
+      const payload = bytes.subarray(at + 8, at + 8 + bytes.readUInt32LE(at + 4));
+      at += 8 + payload.length;
+      let p = 16;
+      const varint = () => {
+        let value = 0;
+        for (let shift = 0; ; shift += 7) {
+          const byte = payload[p++];
+          value += (byte & 0x7f) * 2 ** shift;
+          if ((byte & 0x80) === 0) return value;
+        }
+      };
+      const hash = () => payload.subarray(p, (p += 32)).toString("hex");
+      const seq = varint();
+      varint(); varint();
+      if (payload[p++] === 1) { varint(); varint(); }
+      varint();
+      p += 32;
+      const variant = varint();
+      const record = { seq, event: NAMES[variant] ?? `event ${variant}` };
+      if (variant === 48) Object.assign(record, { action: varint(), kind: KINDS[varint()], summary_bytes: varint(), summary: hash(), detail_bytes: varint(), detail: hash() });
+      if (variant === 49) Object.assign(record, { action: varint(), decision: DECISIONS[varint()], operation: payload[p++] === 1 ? varint() : null, note_bytes: varint(), note: payload[p++] === 1 ? hash() : null });
+      if (variant === 50) Object.assign(record, { reason: REFUSALS[varint()], bytes: varint() });
+      if (variant >= 48 && variant <= 50 && p + 32 !== payload.length) throw new Error(`record ${seq} does not decode as ${record.event}`);
+      records.push(record);
+    }
+    writeFileSync(process.argv[2], JSON.stringify(records));
+  ' -- "$1" "$2"
+}
+
+# wait_listing <attempt> <expression> <expected-json> <out>: poll the client's own `actions`
+# (from the run record) until the expression on the listing has the expected value; 60 s at
+# most. A condition, not a fixed sleep.
+wait_listing() {
+  local attempt=$1 expression=$2 expected=$3 out=$4
+  for _ in $(seq 1 600); do
+    if node "$client" actions "${common[@]}" --state-dir "$work/cp" --attempt "$attempt" >"$out" 2>/dev/null \
+      && [[ "$(field "$out" "$expression")" == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
 }
 
 # log_holds_digest <log> <hex>: whether the evidence log's bytes contain the 32-byte digest.
@@ -143,10 +214,51 @@ chmod 600 "$work/trusted-issuers"
 node_id="$(node "$client" derive-id node acceptance-host)"
 mkdir -p "$work/project/src"
 echo "from the snapshot" >"$work/project/src/input.txt"
+# The action-channel workload (node-integration.md §6.7): asks each id given on its command
+# line in turn, on one connection, records every reply, and proceeds (writes `proceeded`,
+# exits 0) only when every answer was `approved`; denied, expired and cancelled exit 3, 4
+# and 5, a missing channel 8 and an end of file without a reply 6.
+cat >"$work/project/agent.py" <<'AGENT'
+import json
+import os
+import socket
+import sys
+
+SUMMARY = "deploy to staging"
+DETAIL = "plan: rotate 3 services"
+EXIT = {"denied": 3, "expired": 4, "cancelled": 5}
+
+path = os.environ.get("WARD_ACTION_SOCKET")
+if path != "/run/ward/actions.sock":
+    sys.exit(8)
+peer = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+peer.settimeout(900)
+peer.connect(path)
+replies = []
+for rid in sys.argv[1:]:
+    line = json.dumps({"id": rid, "kind": "approval", "summary": SUMMARY, "detail": DETAIL})
+    peer.sendall((line + "\n").encode())
+    data = b""
+    while not data.endswith(b"\n"):
+        chunk = peer.recv(4096)
+        if not chunk:
+            break
+        data += chunk
+    reply = json.loads(data) if data.endswith(b"\n") else None
+    replies.append(reply)
+    with open("replies.json", "w") as out:
+        json.dump(replies, out)
+    if reply is None:
+        sys.exit(6)
+    if reply.get("id") != rid or reply.get("decision") != "approved":
+        sys.exit(EXIT.get(reply.get("decision"), 7))
+with open("proceeded", "w") as out:
+    out.write("yes")
+AGENT
 snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/state" "$work/project")"
 [[ "$snapshot" =~ ^[0-9a-f]{64}$ ]] || die "snapshot import printed no id: $snapshot"
 
-node_pid="$(start_node "$work/node.sock" "$work/state" "$work/tasks" --output-return)"
+node_pid="$(start_node "$work/node.sock" "$work/state" "$work/tasks" --output-return --action-channel)"
 
 common=(--socket "$work/node.sock" --adapter "$WARD_NODE_ADAPTER_BIN")
 node "$client" capabilities "${common[@]}" >"$work/capabilities.json"
@@ -154,6 +266,8 @@ node "$client" capabilities "${common[@]}" >"$work/capabilities.json"
   || die "the node does not execute here (lifecycle.start is not true): $(cat "$work/capabilities.json")"
 [[ "$(field "$work/capabilities.json" 'o.output?.stdio === true && o.output?.files === true')" == "true" ]] \
   || die "a node started with --output-return does not report output.stdio and output.files: $(cat "$work/capabilities.json")"
+[[ "$(field "$work/capabilities.json" 'o.actions')" == '{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}' ]] \
+  || die "a node started with --action-channel does not report the actions section with the ceilings: $(cat "$work/capabilities.json")"
 
 run_common=("${common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id"
   --state-dir "$work/cp" --snapshot "$snapshot" --task-root "$work/tasks" --timeout-ms 90000)
@@ -169,7 +283,7 @@ run() {
 check() {
   # check <case> <out-file> <expression> <expected-json> <what>: accumulate a failure message.
   local got
-  got="$(field "$2" "$3")"
+  got="$(field "$2" "$3" 2>/dev/null)" || got="<unreadable>"
   if [[ "$got" != "$4" ]]; then
     problems+="$5: $3 is $got, expected $4; "
   fi
@@ -450,6 +564,281 @@ if [[ -z "$problems" ]]; then
   pass output_grant_is_refused_without_the_flag "a node started without --output-return reports no output capability and refuses an output grant unsupported_grant at admit with nothing run or materialised, which the client reports as refused (certain, not unknown) and exits 1; its result is unsupported_operation; and a grant above the ceilings is refused by the client before signing"
 else
   fail output_grant_is_refused_without_the_flag "$problems"
+fi
+
+# ---- the action channel (node-integration.md §6.7, ADR-0031) ------------------------------
+
+summary_digest="$(text_digest "deploy to staging")"
+detail_digest="$(text_digest "plan: rotate 3 services")"
+
+# requested_ok <case> <records> <action>: the request is recorded with the summary's and the
+# detail's sizes and digests, never their text.
+requested_ok() {
+  check "$1" "$2" "o.filter(r => r.event === \"NodeActionRequested\" && r.action === $3).map(r => [r.kind, r.summary_bytes, r.summary, r.detail_bytes, r.detail])" \
+    "[[\"approval\",17,\"$summary_digest\",23,\"$detail_digest\"]]" "request $3 recorded with its digests"
+}
+
+# answered_before_end <case> <records> <action> <decision> <operation|null> <note|"">: the
+# one answer to the request is recorded as given, before NodeAttemptEnded.
+answered_before_end() {
+  local note_json='[0,null]'
+  if [[ -n "$6" ]]; then
+    note_json="[${#6},\"$(text_digest "$6")\"]"
+  fi
+  check "$1" "$2" "o.filter(r => r.event === \"NodeActionAnswered\" && r.action === $3).map(r => [r.decision, r.operation, [r.note_bytes, r.note]])" \
+    "[[\"$4\",$5,$note_json]]" "the answer to request $3 recorded once"
+  check "$1" "$2" 'o.findIndex(r => r.event === "NodeActionAnswered" && r.action === '"$3"') < o.findIndex(r => r.event === "NodeAttemptEnded")' 'true' "answer recorded before the end"
+}
+
+# log_free_of_text <log>: the sealed log carries no summary, detail or note text.
+log_free_of_text() {
+  ! grep -aq -e 'deploy to staging' -e 'rotate 3 services' -e 'by acceptance' -e 'second process' "$1"
+}
+
+# ---- case 9: an approval lets the workload proceed --------------------------------------
+
+problems=""
+run "$work/run9.json" --task acc-task-9 --attempt acc-attempt-9a --budget-ms 120000 \
+  --actions approval --actions-wait-secs 120 --approve-all --note "approved by acceptance" \
+  -- python3 agent.py deploy-9
+[[ "$status" == "0" ]] || problems+="exit status $status; "
+check 9 "$work/run9.json" 'o.outcome' '"completed"' "outcome"
+check 9 "$work/run9.json" 'o.exitStatus' '0' "exit status"
+check 9 "$work/run9.json" 'o.actions' '[{"request":1,"id":"deploy-9","kind":"approval","summary":"deploy to staging","decision":"approved","note":"approved by acceptance","operation_id":263,"result":"answered","replayed":false}]' "the request and its answer"
+task9="$(field "$work/run9.json" 'o.binding.task' | tr -d '"')"
+attempt9="$(field "$work/run9.json" 'o.binding.attempt' | tr -d '"')"
+workspace9="$work/tasks/$task9/$attempt9"
+check 9 "$workspace9/replies.json" 'o' '[{"id":"deploy-9","decision":"approved","note":"approved by acceptance"}]' "the workload received the approval with the note"
+[[ -f "$workspace9/proceeded" ]] || problems+="the workload did not proceed; "
+check 9 "$work/cp/runs/$attempt9.json" 'o.answers' '[{"request":1,"id":"deploy-9","kind":"approval","decision":"approved","note":"approved by acceptance","operation_id":263}]' "the answer in the run record"
+grep -q 'request 1 (approval, id deploy-9): deploy to staging' "$work/client.log" || problems+="the request was not printed; "
+grep -q 'request 1 answered approved (operation 263)' "$work/client.log" || problems+="the answer was not printed; "
+[[ ! -e "$work/tasks/$task9/$attempt9.actions/actions.sock" ]] || problems+="the channel socket outlived the attempt; "
+log9="$(field "$work/run9.json" 'o.evidenceLog' | tr -d '"')"
+if action_records "$log9" "$work/records9.json"; then
+  requested_ok 9 "$work/records9.json" 1
+  answered_before_end 9 "$work/records9.json" 1 approved 263 "approved by acceptance"
+else
+  problems+="the evidence log's records do not decode; "
+fi
+log_free_of_text "$log9" || problems+="the evidence log carries request or note text; "
+verify_log "$task9" "$log9" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass actions_approval_lets_the_workload_proceed "a workload granted the channel on a node started with --action-channel asks through /run/ward/actions.sock; run --approve-all lists the request, records the answer in the run record under operation 263 of its scheme, answers it approved with the note from a second adapter, the workload receives exactly that and exits 0, and the sealed log records the request's summary and detail digests and the approval with that operation id and the note's digest before the attempt's end, never the text"
+else
+  fail actions_approval_lets_the_workload_proceed "$problems"
+fi
+
+# ---- case 10: a denial stops it -----------------------------------------------------------
+
+problems=""
+run "$work/run10.json" --task acc-task-10 --attempt acc-attempt-10a --budget-ms 120000 \
+  --actions approval --actions-wait-secs 120 --deny-all --note "denied by acceptance" \
+  -- python3 agent.py deploy-10
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 10 "$work/run10.json" 'o.outcome' '"failed"' "outcome"
+check 10 "$work/run10.json" 'o.exitStatus' '3' "the workload's denied exit status"
+check 10 "$work/run10.json" 'o.actions.map(a => [a.request, a.decision, a.operation_id, a.result])' '[[1,"denied",263,"answered"]]' "the answer"
+task10="$(field "$work/run10.json" 'o.binding.task' | tr -d '"')"
+attempt10="$(field "$work/run10.json" 'o.binding.attempt' | tr -d '"')"
+check 10 "$work/tasks/$task10/$attempt10/replies.json" 'o' '[{"id":"deploy-10","decision":"denied","note":"denied by acceptance"}]' "the workload received the denial"
+[[ ! -e "$work/tasks/$task10/$attempt10/proceeded" ]] || problems+="the workload proceeded on a denial; "
+log10="$(field "$work/run10.json" 'o.evidenceLog' | tr -d '"')"
+if action_records "$log10" "$work/records10.json"; then
+  requested_ok 10 "$work/records10.json" 1
+  answered_before_end 10 "$work/records10.json" 1 denied 263 "denied by acceptance"
+else
+  problems+="the evidence log's records do not decode; "
+fi
+log_free_of_text "$log10" || problems+="the evidence log carries request or note text; "
+verify_log "$task10" "$log10" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass actions_denial_stops_the_workload "run --deny-all answers the request denied; the workload receives the denial, does not proceed and exits 3, the run ends failed and exits 1, and the sealed log records the denial under operation 263 with the note's digest before the end"
+else
+  fail actions_denial_stops_the_workload "$problems"
+fi
+
+# ---- case 11: a request nobody answers expires ---------------------------------------------
+
+problems=""
+run "$work/run11.json" --task acc-task-11 --attempt acc-attempt-11a --budget-ms 120000 \
+  --actions approval --actions-wait-secs 2 -- python3 agent.py deploy-11
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 11 "$work/run11.json" 'o.outcome' '"failed"' "outcome"
+check 11 "$work/run11.json" 'o.exitStatus' '4' "the workload's expired exit status"
+check 11 "$work/run11.json" 'o.actions' '[]' "nobody here answered"
+task11="$(field "$work/run11.json" 'o.binding.task' | tr -d '"')"
+attempt11="$(field "$work/run11.json" 'o.binding.attempt' | tr -d '"')"
+check 11 "$work/tasks/$task11/$attempt11/replies.json" 'o' '[{"id":"deploy-11","decision":"expired"}]' "the workload received expired"
+log11="$(field "$work/run11.json" 'o.evidenceLog' | tr -d '"')"
+if action_records "$log11" "$work/records11.json"; then
+  requested_ok 11 "$work/records11.json" 1
+  answered_before_end 11 "$work/records11.json" 1 expired null ""
+else
+  problems+="the evidence log's records do not decode; "
+fi
+verify_log "$task11" "$log11" || problems+="the evidence log does not verify; "
+# A late answer, from the run record, is refused: the attempt has ended.
+status=0
+node "$client" answer "${common[@]}" --state-dir "$work/cp" --attempt "$attempt11" --request 1 --decision approved \
+  >"$work/answer11.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="late answer exit status $status, expected 1; "
+check 11 "$work/answer11.json" 'o' '{"result":"rejected","reason":"invalid_state","operation_id":263}' "late answer"
+status=0
+node "$client" actions "${common[@]}" --state-dir "$work/cp" --attempt "$attempt11" >"$work/actions11.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "0" ]] || problems+="actions exit status $status; "
+check 11 "$work/actions11.json" 'o' '{"state":"sealed","pending":[]}' "nothing pending once sealed"
+if [[ -z "$problems" ]]; then
+  pass actions_unanswered_request_expires "a request nobody answers is answered expired by the node once the grant's wait_secs (2) ran out; the workload fails closed with exit 4, the sealed log records the expiry with no operation id and no note before the end, a late answer from the run record is refused invalid_state and the listing of the sealed attempt is empty"
+else
+  fail actions_unanswered_request_expires "$problems"
+fi
+
+# ---- case 12: cancelling while a request is pending answers it cancelled ------------------
+
+problems=""
+marker12="cancel-12-$$-$(date +%s%N)"
+attempt12="$(node "$client" derive-id exec acc-attempt-12a)"
+node "$client" run "${run_common[@]}" --task acc-task-12 --attempt acc-attempt-12a --budget-ms 600000 \
+  --actions approval --actions-wait-secs 600 -- python3 agent.py "$marker12" >"$work/run12.json" 2>>"$work/client.log" &
+run12_pid=$!
+background+=("$run12_pid")
+if wait_listing "$attempt12" 'o.pending.length' '1' "$work/actions12.json"; then
+  check 12 "$work/actions12.json" 'o.state' '"running"' "listed running"
+  check 12 "$work/actions12.json" 'o.pending.map(p => [p.action, p.id, p.kind, p.summary, p.detail])' "[[1,\"$marker12\",\"approval\",\"deploy to staging\",\"plan: rotate 3 services\"]]" "the pending request"
+  check 12 "$work/actions12.json" 'o.pending[0].expires_in_ms > 0 && o.pending[0].expires_in_ms <= 600000' 'true' "its wait"
+else
+  problems+="the request was never listed; "
+fi
+kill -TERM "$run12_pid" 2>/dev/null || true
+status=0
+wait "$run12_pid" || status=$?
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 12 "$work/run12.json" 'o.cancelled' 'true' "cancelled"
+check 12 "$work/run12.json" 'o.finalState' '"sealed"' "final state"
+check 12 "$work/run12.json" 'o.operations.map(x => x.verb).join()' '"create,admit,start,revoke,seal"' "revoke, then seal"
+for _ in $(seq 1 150); do
+  pgrep -f "$marker12" >/dev/null 2>&1 || break
+  sleep 0.1
+done
+pgrep -f "$marker12" >/dev/null 2>&1 && problems+="a workload process outlived the cancellation; "
+task12="$(field "$work/run12.json" 'o.binding.task' | tr -d '"')"
+log12="$(field "$work/run12.json" 'o.evidenceLog' | tr -d '"')"
+if action_records "$log12" "$work/records12.json"; then
+  requested_ok 12 "$work/records12.json" 1
+  answered_before_end 12 "$work/records12.json" 1 cancelled null ""
+else
+  problems+="the evidence log's records do not decode; "
+fi
+verify_log "$task12" "$log12" || problems+="the evidence log does not verify; "
+status=0
+node "$client" answer "${common[@]}" --state-dir "$work/cp" --attempt "$attempt12" --request 1 --decision approved \
+  >"$work/answer12.json" 2>>"$work/client.log" || status=$?
+check 12 "$work/answer12.json" 'o.reason' '"invalid_state"' "a late answer"
+node "$client" actions "${common[@]}" --state-dir "$work/cp" --attempt "$attempt12" >"$work/actions12-end.json" 2>>"$work/client.log" || true
+check 12 "$work/actions12-end.json" 'o' '{"state":"sealed","pending":[]}' "nothing pending once sealed"
+if [[ -z "$problems" ]]; then
+  pass actions_cancel_while_pending_answers_cancelled "while the workload waits on a request the client's actions lists it with its id, kind, summary, detail and wait; cancelling the run (SIGTERM: revoke, then seal) kills the workload, the node answers the request cancelled and the sealed log records that with no operation id before the end, a late answer is refused invalid_state and nothing is pending"
+else
+  fail actions_cancel_while_pending_answers_cancelled "$problems"
+fi
+
+# ---- case 13: answered from a second process, idempotently, with each refusal ------------
+
+problems=""
+attempt13="$(node "$client" derive-id exec acc-attempt-13a)"
+node "$client" run "${run_common[@]}" --task acc-task-13 --attempt acc-attempt-13a --budget-ms 300000 \
+  --actions approval --actions-wait-secs 300 -- python3 agent.py second-13a second-13b >"$work/run13.json" 2>>"$work/client.log" &
+run13_pid=$!
+background+=("$run13_pid")
+answer13() {
+  local out=$1
+  shift
+  status=0
+  node "$client" answer "${common[@]}" "$@" >"$out" 2>>"$work/client.log" || status=$?
+}
+wait_listing "$attempt13" 'o.pending.length' '1' "$work/actions13a.json" || problems+="the first request was never listed; "
+check 13 "$work/actions13a.json" 'o.pending.map(p => [p.action, p.id])' '[[1,"second-13a"]]' "the first request"
+answer13 "$work/answer13a.json" --state-dir "$work/cp" --attempt "$attempt13" --request 1 --decision approved --note "from a second process"
+[[ "$status" == "0" ]] || problems+="first answer exit status $status; "
+check 13 "$work/answer13a.json" 'o' '{"result":"answered","request":1,"decision":"approved","operation_id":263}' "first answer"
+# The workload received it and asks again; while it waits, the first request is answered.
+wait_listing "$attempt13" 'o.pending.map(p => p.action).join()' '"2"' "$work/actions13b.json" || problems+="the second request was never listed; "
+check 13 "$work/actions13b.json" 'o.pending.map(p => [p.action, p.id])' '[[2,"second-13b"]]' "the second request, after the approval"
+answer13 "$work/answer13-replay.json" --state-dir "$work/cp" --attempt "$attempt13" --request 1 --decision approved --note "from a second process"
+[[ "$status" == "0" ]] || problems+="replay exit status $status; "
+check 13 "$work/answer13-replay.json" 'o' '{"result":"answered","request":1,"decision":"approved","operation_id":263}' "the replay is answered again"
+binding13=(--task "$(node "$client" derive-id task acc-task-13)" --attempt "$attempt13" --lease "$(node "$client" derive-id lease acc-attempt-13a)")
+answer13 "$work/answer13-stale.json" "${binding13[@]}" --operation-id 263 --request 1 --decision denied
+[[ "$status" == "1" ]] || problems+="stale exit status $status; "
+check 13 "$work/answer13-stale.json" 'o' '{"result":"rejected","reason":"stale_operation","operation_id":263}' "the same id with another answer"
+answer13 "$work/answer13-again.json" "${binding13[@]}" --operation-id 300 --request 1 --decision denied
+check 13 "$work/answer13-again.json" 'o' '{"result":"rejected","reason":"already_answered","operation_id":300}' "another answer to an answered request"
+answer13 "$work/answer13-unknown.json" "${binding13[@]}" --operation-id 301 --request 9 --decision denied
+check 13 "$work/answer13-unknown.json" 'o' '{"result":"rejected","reason":"unknown_request","operation_id":301}' "a request number never recorded"
+answer13 "$work/answer13b.json" --state-dir "$work/cp" --attempt "$attempt13" --request 2 --decision approved
+check 13 "$work/answer13b.json" 'o' '{"result":"answered","request":2,"decision":"approved","operation_id":264}' "second answer"
+status=0
+wait "$run13_pid" || status=$?
+[[ "$status" == "0" ]] || problems+="run exit status $status; "
+check 13 "$work/run13.json" 'o.outcome' '"completed"' "outcome"
+check 13 "$work/run13.json" 'o.actions' '[]' "the run itself answered nothing"
+task13="$(field "$work/run13.json" 'o.binding.task' | tr -d '"')"
+check 13 "$work/tasks/$task13/$attempt13/replies.json" 'o.map(r => r.decision).join()' '"approved,approved"' "the workload's replies"
+[[ -f "$work/tasks/$task13/$attempt13/proceeded" ]] || problems+="the workload did not proceed; "
+check 13 "$work/cp/runs/$attempt13.json" 'o.answers.map(a => [a.request, a.decision, a.operation_id])' '[[1,"approved",263],[2,"approved",264]]' "the run record"
+log13="$(field "$work/run13.json" 'o.evidenceLog' | tr -d '"')"
+if action_records "$log13" "$work/records13.json"; then
+  check 13 "$work/records13.json" 'o.filter(r => r.event === "NodeActionAnswered").map(r => [r.action, r.decision, r.operation])' '[[1,"approved",263],[2,"approved",264]]' "exactly the two applied answers, nothing for the replay or the refusals"
+  answered_before_end 13 "$work/records13.json" 1 approved 263 "from a second process"
+else
+  problems+="the evidence log's records do not decode; "
+fi
+log_free_of_text "$log13" || problems+="the evidence log carries request or note text; "
+verify_log "$task13" "$log13" || problems+="the evidence log does not verify; "
+if [[ -z "$problems" ]]; then
+  pass actions_answered_from_a_second_process "a run granted the channel without a policy is answered from separate actions and answer processes through the run record: the answer takes operation 263 of the record's scheme, replaying it is answered again, the same id with another answer is stale_operation, another answer to the request already_answered and an unknown number unknown_request; the workload proceeds after both approvals and the sealed log holds exactly the two applied answers"
+else
+  fail actions_answered_from_a_second_process "$problems"
+fi
+
+# ---- case 14: a node without the flag, or a grant above the ceilings, is refused ---------
+
+problems=""
+[[ "$(field "$work/plain-capabilities.json" 'o.actions')" == "undefined" ]] || problems+="a node without the flag reports an actions section; "
+status=0
+node "$client" run "${plain_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id" \
+  --state-dir "$work/cp" --snapshot "$plain_snapshot" --task-root "$work/plain-tasks" --timeout-ms 90000 \
+  --task acc-task-14 --attempt acc-attempt-14a --budget-ms 60000 --actions approval --approve-all \
+  -- python3 agent.py never-14 >"$work/run14.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="exit status $status, expected 1; "
+check 14 "$work/run14.json" 'o.outcome' '"refused"' "outcome"
+check 14 "$work/run14.json" 'o.refused' '{"verb":"admit","reason":"unsupported_grant"}' "refusal"
+check 14 "$work/run14.json" 'o.actions' '[]' "nothing answered"
+task14="$(field "$work/run14.json" 'o.binding.task' | tr -d '"')"
+[[ ! -e "$work/plain-tasks/$task14" ]] || problems+="a refused grant materialised a task directory; "
+status=0
+node "$client" actions "${plain_common[@]}" --state-dir "$work/cp" --attempt "$(node "$client" derive-id exec acc-attempt-14a)" \
+  >"$work/actions14.json" 2>>"$work/client.log" || status=$?
+[[ "$status" == "1" ]] || problems+="actions exit status $status, expected 1; "
+check 14 "$work/actions14.json" 'o' '{"rejected":"unsupported_operation"}' "actions on a node without the flag"
+status=0
+node "$client" run "${run_common[@]}" --task acc-task-14 --attempt acc-attempt-14b --budget-ms 60000 \
+  --actions approval --actions-max-pending 9 --actions-max-total 9 --approve-all \
+  -- python3 agent.py never-14 >"$work/run14b.json" 2>"$work/run14b.err" || status=$?
+[[ "$status" == "2" ]] || problems+="over-ceiling exit status $status, expected 2; "
+grep -q 'unsupported_grant' "$work/run14b.err" || problems+="the client's refusal does not name unsupported_grant: $(cat "$work/run14b.err"); "
+[[ ! -s "$work/run14b.json" ]] || problems+="an over-ceiling grant printed an outcome; "
+[[ ! -e "$work/cp/runs/$(node "$client" derive-id exec acc-attempt-14b).json" ]] || problems+="an over-ceiling grant was recorded as a run; "
+status=0
+node "$client" run "${run_common[@]}" --task acc-task-14 --attempt acc-attempt-14c --budget-ms 60000 \
+  --actions credential -- python3 agent.py never-14 >"$work/run14c.json" 2>"$work/run14c.err" || status=$?
+[[ "$status" == "2" ]] || problems+="unknown kind exit status $status, expected 2; "
+grep -q 'credential' "$work/run14c.err" || problems+="the client's refusal does not name the kind: $(cat "$work/run14c.err"); "
+if [[ -z "$problems" ]]; then
+  pass actions_grant_is_refused_without_the_flag_or_outside_the_grammar "a node started without --action-channel reports no actions section and refuses an actions grant unsupported_grant at admit with nothing materialised, which the client reports refused and exits 1, and answers actions unsupported_operation; a grant above the ceilings or with an unknown kind is refused by the client before signing or recording"
+else
+  fail actions_grant_is_refused_without_the_flag_or_outside_the_grammar "$problems"
 fi
 
 echo

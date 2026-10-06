@@ -51,11 +51,17 @@ scripts/acceptance/node.sh
 After the table, `node.sh` runs [`scripts/acceptance/node-js.sh`](../scripts/acceptance/node-js.sh),
 the acceptance of the Node.js reference control plane
 ([node-integration-from-nodejs.md](node-integration-from-nodejs.md) §10) against a second
-real node started with `--output-return` (and a third without it), under the same
-isolation requirement; its eight verdicts (five of the attempt's lifecycle, three of
-result return: declared content with digests the host agrees with, truncation past the
-budgets, and the refusal of a grant by a node without the flag) follow the table and a
-failure of either fails the run. The cases below are the Rust suite's.
+real node started with `--output-return` and `--action-channel` (and a third without
+either), under the same isolation requirement; its fourteen verdicts (five of the
+attempt's lifecycle; three of result return: declared content with digests the host
+agrees with, truncation past the budgets, and the refusal of a grant by a node without
+the flag; six of the action channel, with a workload in the sandbox that proceeds only on
+an approval: `--approve-all` lets it proceed, `--deny-all` stops it, an unanswered request
+expires, cancelling the run answers a pending request `cancelled`, a second process
+answers idempotently and meets each refusal, and a node without the flag or a grant
+outside the grammar is refused, each checked against the sealed log's action records)
+follow the table and a failure of either fails the run. The cases below are the Rust
+suite's.
 
 The cases also run, in parallel with the rest of the workspace, under the merge gate
 (`scripts/verify/tamperward.sh`, which CI runs with `WARD_REQUIRE_ISOLATION=1` and a

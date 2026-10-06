@@ -6,7 +6,29 @@
 // with an `output` grant gets a canned result (§6.6) in `done` and through `result`;
 // FAKE_ADAPTER_CORRUPT_DIGEST=1 serves the first returned file with a digest that is not
 // its content's, and FAKE_ADAPTER_RESULT_REJECT=<reason> refuses `result` with it.
-import { appendFileSync } from "node:fs";
+//
+// FAKE_ADAPTER_ACTIONS names a JSON file that scripts the attempt's action channel (§6.7)
+// and holds the node's side of it, so that several adapter processes in turn (a run and an
+// answering loop, or a control plane before and after a restart) see one channel:
+//
+//   requests          the requests the workload makes, each a §6.7 pending entry, plus
+//                     `after: N` to appear only from the (N+1)th `actions` on
+//   state             the attempt's state (default `running`); `end_after: N` makes it
+//                     `exited` from the (N+1)th `actions` on; `missing_until: N` refuses the
+//                     first N `actions` task_not_found (the run has not created the task)
+//   reject_actions    refuse every `actions` with this reason
+//   answer_reject     {request: [reason, …]}: refuse that many answers to the request, in turn
+//   answer_override   fields merged into the next answer event (a node that answers wrong)
+//   die_on_answer     exit without answering the next `answer` (a crash before delivery)
+//   keep_listing_answered  keep answered requests in the listing (a stale read)
+//   applied, answered the node's own record: operation id → answer, request → operation id
+//
+// `answer` is refused as the node refuses it, in the node's order: a replayed operation id
+// is answered again (or stale_operation for another answer), then invalid_state off a live
+// attempt, unknown_request, already_answered. A `run` whose manifest grants `actions`
+// marks the attempt running in `<file>.run`, waits until every request is answered, exits 0
+// only if all were approved (3 otherwise), and marks it sealed.
+import { appendFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 import { blake3Hex } from "../blake3.mjs";
@@ -15,6 +37,7 @@ const log = process.env.FAKE_ADAPTER_LOG;
 const hold = process.env.FAKE_ADAPTER_HOLD === "1";
 const corruptDigest = process.env.FAKE_ADAPTER_CORRUPT_DIGEST === "1";
 const resultReject = process.env.FAKE_ADAPTER_RESULT_REJECT;
+const channelFile = process.env.FAKE_ADAPTER_ACTIONS;
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -57,10 +80,116 @@ function cannedOutput(grant) {
   return { stdout: stream("hello stdout\n"), stderr: stream("hello stderr\n"), files };
 }
 
-function grantOf(envelope) {
+function manifestOf(envelope) {
   const bytes = envelope.workload?.capability_manifest?.bytes;
-  if (typeof bytes !== "string") return null;
-  return JSON.parse(Buffer.from(bytes, "hex").toString("utf8")).output ?? null;
+  if (typeof bytes !== "string") return {};
+  return JSON.parse(Buffer.from(bytes, "hex").toString("utf8"));
+}
+
+function grantOf(envelope) {
+  return manifestOf(envelope).output ?? null;
+}
+
+// ---- the scripted action channel -------------------------------------------------------
+
+const LIVE = ["running", "paused"];
+
+function readChannel() {
+  const channel = JSON.parse(readFileSync(channelFile, "utf8"));
+  channel.polls ??= 0;
+  channel.applied ??= {};
+  channel.answered ??= {};
+  return channel;
+}
+
+// Written to a temporary file and renamed, so a run polling the channel from another
+// process never reads it half written.
+function writeChannel(channel) {
+  writeFileSync(`${channelFile}.${process.pid}`, JSON.stringify(channel));
+  renameSync(`${channelFile}.${process.pid}`, channelFile);
+}
+
+/** The attempt's state: the run's own when one is driving it, else the script's. */
+function channelState(channel) {
+  if (existsSync(`${channelFile}.run`)) return readFileSync(`${channelFile}.run`, "utf8");
+  if (channel.end_after !== undefined && channel.polls > channel.end_after) return "exited";
+  return channel.state ?? "running";
+}
+
+function listActions(binding) {
+  const channel = readChannel();
+  channel.polls += 1;
+  writeChannel(channel);
+  if (channel.reject_actions || channel.polls <= (channel.missing_until ?? 0)) {
+    emit({ event: "rejected", verb: "actions", operation_id: null, reason: channel.reject_actions ?? "task_not_found" });
+    return;
+  }
+  const state = channelState(channel);
+  const pending = LIVE.includes(state)
+    ? channel.requests
+        .filter((request) => channel.polls > (request.after ?? 0))
+        .filter((request) => channel.keep_listing_answered || channel.answered[request.action] === undefined)
+        .map(({ after, ...request }) => request)
+    : [];
+  void binding;
+  emit({ event: "actions", state, pending });
+}
+
+function sameAnswer(applied, command) {
+  return applied.request === command.request && applied.decision === command.decision && (applied.note ?? null) === (command.note ?? null);
+}
+
+function answerAction(command) {
+  const channel = readChannel();
+  if (channel.die_on_answer) {
+    channel.die_on_answer = false;
+    writeChannel(channel);
+    process.exit(1);
+  }
+  const reply = (event) => {
+    const override = channel.answer_override;
+    delete channel.answer_override;
+    writeChannel(channel);
+    emit({ ...event, ...override });
+  };
+  const rejected = (reason) => reply({ event: "rejected", verb: "answer", operation_id: command.operation_id, reason });
+  const scripted = channel.answer_reject?.[command.request];
+  if (Array.isArray(scripted) && scripted.length > 0) {
+    const reason = scripted.shift();
+    if (reason === "already_answered") channel.answered[command.request] ??= "expired";
+    return rejected(reason);
+  }
+  const applied = channel.applied[command.operation_id];
+  if (applied) {
+    if (!sameAnswer(applied, command)) return rejected("stale_operation");
+    return reply({ event: "answered", operation_id: command.operation_id, request: command.request, decision: applied.decision });
+  }
+  if (!LIVE.includes(channelState(channel))) return rejected("invalid_state");
+  if (!channel.requests.some((request) => request.action === command.request)) return rejected("unknown_request");
+  if (channel.answered[command.request] !== undefined) return rejected("already_answered");
+  channel.applied[command.operation_id] = { request: command.request, decision: command.decision, note: command.note ?? null };
+  channel.answered[command.request] = command.operation_id;
+  return reply({ event: "answered", operation_id: command.operation_id, request: command.request, decision: command.decision });
+}
+
+function writeRunState(state) {
+  writeFileSync(`${channelFile}.run.${process.pid}`, state);
+  renameSync(`${channelFile}.run.${process.pid}`, `${channelFile}.run`);
+}
+
+/** Hold a run whose manifest grants `actions` until every request is answered. */
+function waitForAnswers(done) {
+  writeRunState("running");
+  const deadline = Date.now() + 20_000;
+  const timer = setInterval(() => {
+    const channel = readChannel();
+    const decisions = channel.requests.map((request) => channel.applied[channel.answered[request.action]]?.decision ?? channel.answered[request.action]);
+    if (decisions.every((decision) => decision !== undefined) || Date.now() > deadline) {
+      clearInterval(timer);
+      writeRunState("sealed");
+      done(decisions.every((decision) => decision === "approved") ? 0 : 3);
+    }
+  }, 10);
 }
 
 function finish(binding, ids, state, outcome, cancelled, operations, evidence, grant = null) {
@@ -124,6 +253,12 @@ lines.on("line", (line) => {
     case "revoke":
       emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "accepted", state: "revoked" });
       return;
+    case "actions":
+      listActions(command.binding);
+      return;
+    case "answer":
+      answerAction(command);
+      return;
     case "result":
       if (resultReject) {
         emit({ event: "rejected", verb: "result", operation_id: null, reason: resultReject });
@@ -161,13 +296,21 @@ lines.on("line", (line) => {
         running = { binding, ids, operations, evidence };
         return;
       }
+      if (channelFile && manifestOf(envelope).actions) {
+        running = { binding, ids, operations, evidence };
+        waitForAnswers((exitStatus) => {
+          running = null;
+          finish(binding, ids, "exited", exitStatus === 0 ? "completed" : "failed", false, operations, evidence, grantOf(envelope));
+        });
+        return;
+      }
       const exitStatus = envelope.workload.argv.at(-1) === "exit 3" ? 3 : 0;
       finish(binding, ids, "exited", exitStatus === 0 ? "completed" : "failed", false, operations, evidence, grantOf(envelope));
       return;
     }
     default:
       failed = true;
-      emit({ event: "error", error: `unknown command \`${command.cmd}\`; the commands are capabilities, run, revoke, inspect and result` });
+      emit({ event: "error", error: `unknown command \`${command.cmd}\`; the commands are capabilities, run, revoke, inspect, result, actions and answer` });
   }
 });
 lines.on("close", () => process.exit(failed ? 1 : 0));
