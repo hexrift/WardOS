@@ -19,7 +19,9 @@
 //! [`CapabilityManifest`]: a required `network` grant, spelled as `ward-policy` spells
 //! its `network` capability (`"offline"`, or `{"custom": [hosts]}` in its host-pattern
 //! grammar), and an optional `output` grant ([`OutputGrant`]: the stdio and workspace
-//! files to return). Bytes outside the grammar fail envelope decoding, so a node never
+//! files to return), and an optional `resources` grant ([`ResourceGrant`]: the cgroup
+//! limits on the attempt's process tree). Bytes outside the grammar fail envelope
+//! decoding, so a node never
 //! admits a manifest it cannot read. Which decoded grants a node honours is the node's
 //! decision, made at `admit`.
 
@@ -33,6 +35,7 @@ use ward_events::{AgentId, Blake3Hash, NodeId, SessionId, SnapshotId};
 
 use crate::TaskBinding;
 use crate::output::{OutputError, OutputGrant, OutputGrantWire};
+use crate::resources::{ResourceGrant, ResourceGrantWire};
 
 /// Maximum number of ancestor leases one admission envelope may carry.
 pub const MAX_ADMISSION_LINEAGE: usize = 16;
@@ -77,6 +80,8 @@ pub enum TaskAdmissionError {
     /// The `output` grant is outside its grammar (too many files, an invalid or repeated
     /// path).
     MalformedOutputGrant(OutputError),
+    /// The `resources` grant is outside its grammar (no limit named, or a zero limit).
+    MalformedResourceGrant,
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -111,6 +116,7 @@ impl Display for TaskAdmissionError {
             Self::InvalidHostPattern => "capability manifest host pattern is invalid",
             Self::DuplicateHost => "capability manifest host pattern is repeated",
             Self::MalformedOutputGrant(_) => "capability manifest output grant is invalid",
+            Self::MalformedResourceGrant => "capability manifest resources grant is invalid",
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -266,14 +272,17 @@ pub enum NetworkGrant {
 /// The decoded capability manifest of an admitted workload.
 ///
 /// This is the manifest grammar of protocol 1.3: the required field `network`, a
-/// [`NetworkGrant`], and the optional field `output`, an [`OutputGrant`] (absent means
-/// no output is returned). Unknown fields, a repeated field, anything that is not one
-/// JSON object and any value outside the grammar fail decoding.
+/// [`NetworkGrant`], the optional field `output`, an [`OutputGrant`] (absent means
+/// no output is returned), and the optional field `resources`, a [`ResourceGrant`]
+/// (absent means the manifest asks for no limit). Unknown fields, a repeated field,
+/// anything that is not one JSON object and any value outside the grammar fail decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CapabilityManifest {
     network: NetworkGrant,
     #[serde(skip_serializing_if = "Option::is_none")]
     output: Option<OutputGrant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: Option<ResourceGrant>,
 }
 
 impl CapabilityManifest {
@@ -283,6 +292,7 @@ impl CapabilityManifest {
         Self {
             network,
             output: None,
+            resources: None,
         }
     }
 
@@ -290,6 +300,13 @@ impl CapabilityManifest {
     #[must_use]
     pub fn with_output(mut self, output: OutputGrant) -> Self {
         self.output = Some(output);
+        self
+    }
+
+    /// The same manifest also asking for the limits of `resources` to be enforced.
+    #[must_use]
+    pub const fn with_resources(mut self, resources: ResourceGrant) -> Self {
+        self.resources = Some(resources);
         self
     }
 
@@ -314,7 +331,16 @@ impl CapabilityManifest {
             .map(OutputGrant::try_from)
             .transpose()
             .map_err(TaskAdmissionError::MalformedOutputGrant)?;
-        Ok(Self { network, output })
+        let resources = wire
+            .resources
+            .map(ResourceGrant::try_from)
+            .transpose()
+            .map_err(|_| TaskAdmissionError::MalformedResourceGrant)?;
+        Ok(Self {
+            network,
+            output,
+            resources,
+        })
     }
 
     /// The egress the manifest asks for.
@@ -328,6 +354,12 @@ impl CapabilityManifest {
     pub const fn output(&self) -> Option<&OutputGrant> {
         self.output.as_ref()
     }
+
+    /// The limits the manifest asks the node to enforce, if any.
+    #[must_use]
+    pub const fn resources(&self) -> Option<&ResourceGrant> {
+        self.resources.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -336,6 +368,17 @@ struct CapabilityManifestWire {
     network: NetworkGrantWire,
     #[serde(default, deserialize_with = "deserialize_present_output")]
     output: Option<OutputGrantWire>,
+    #[serde(default, deserialize_with = "deserialize_present_resources")]
+    resources: Option<ResourceGrantWire>,
+}
+
+fn deserialize_present_resources<'de, D>(
+    deserializer: D,
+) -> Result<Option<ResourceGrantWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    ResourceGrantWire::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_output<'de, D>(deserializer: D) -> Result<Option<OutputGrantWire>, D::Error>

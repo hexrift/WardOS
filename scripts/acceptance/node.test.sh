@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Regressions for node.sh's rendering: a log in which every case passed renders a PASS
-# table and exits 0; a failed case, a failed suite and a log with no case at all each
-# exit 1 and name the failure.
+# table and exits 0; a skipped case is shown with its reason and fails nothing; a failed
+# case, a failed suite and a log with no case at all each exit 1 and name the failure.
 set -euo pipefail
 
 sut="$(cd "$(dirname "$0")" && pwd)/node.sh"
@@ -70,6 +70,21 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 EOF
 expect 1 "a log with no acceptance case exits 1" "$work/skipped.log"
 grep -q 'no acceptance case ran' "$work/last" || fail "the empty run is not explained: $(cat "$work/last")"
+
+cat >"$work/skip.log" <<'EOF'
+running 2 tests
+test capacity_cgroup_limits_hold_and_usage_is_recorded ... acceptance capacity_cgroup_limits_hold_and_usage_is_recorded: SKIP -- no cgroup v2 directory delegated to this test
+ok
+test isolation_holds_against_an_in_sandbox_probe ... acceptance isolation_holds_against_an_in_sandbox_probe: PASS in 223 ms -- a criterion
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s
+EOF
+expect 0 "a skipped case beside a passing one renders SKIP and still passes" "$work/skip.log"
+grep -q 'capacity_cgroup_limits_hold_and_usage_is_recorded *SKIP *no cgroup v2 directory delegated to this test' "$work/last" \
+  || fail "the skipped case is not shown with its reason: $(cat "$work/last")"
+grep -q '^acceptance: 1 passed, 0 failed, 1 skipped$' "$work/last" || fail "wrong summary: $(cat "$work/last")"
+grep -q '^acceptance: PASS$' "$work/last" || fail "no PASS verdict: $(cat "$work/last")"
 
 printf 'error: could not compile\n' >"$work/broken.log"
 expect 1 "a build failure exits 1" "$work/broken.log"

@@ -2,7 +2,9 @@
 
 Status: living document. It describes the `ward-node` protocol 1.3 contract as
 implemented today (ADR-0030 steps 1–9, 12 and 13: the network allowlist and bounded
-result return, both additive within 1.3), and the client and process adapter that drive it
+result return, both additive within 1.3; and the first single-node slice of #260:
+cgroup resource limits and accounting, and a bound on attempts executing at once, also
+additive within 1.3), and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
 documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
@@ -37,8 +39,16 @@ admission example is a working test vector (§7.4).
   allowing exactly those hosts (§7.5, §9), and an `output` grant only on a node started
   with `--output-return`, which then keeps the head of the workload's stdout and stderr,
   collects the declared workspace files once the attempt has ended and returns the bounded
-  result through `result` (§6.6, §7.5); any other grant is refused `unsupported_grant` at
-  `admit`, never run with less silently.
+  result through `result` (§6.6, §7.5), and a `resources` grant (CPU, memory and pid
+  limits) only on a node started with `--cgroup-root`, which then runs every attempt in a
+  cgroup of its own, enforces the limits there and records what each attempt used
+  (§6.5, §7.5, §9); any other grant is refused `unsupported_grant` at `admit`, never run
+  with less silently.
+- How much the node runs at once is the operator's choice: a node started with
+  `--max-running` executes at most that many attempts at once and refuses a `start` past
+  it, or below a memory or disk headroom floor, `capacity_exhausted` with the task still
+  `ready` (§5, §8.2). The node keeps no queue; the control plane's waiting attempts are its
+  `ready` tasks.
 - WardOS ships one client for this contract: the `ward-node-client` crate (a transport,
   a typed client, an issuer signer and a fail-closed attempt driver for Rust control
   planes) and its `ward-node-adapter` binary (the same over stdin/stdout for control
@@ -62,6 +72,7 @@ admission example is a working test vector (§7.4).
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] [--output-return] \
+  [--cgroup-root <dir>] [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
   [--client-uid <uid>]… [--client-group <group>]
 ```
 
@@ -74,6 +85,9 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--task-root` | no | Directory under which the node allocates workspaces and keeps each admitted attempt's evidence log (§6.5), created mode 0700 and refused if group- or world-accessible or not a real directory. With it the node executes (`start`, `pause`, `resume`, `stop`, `revoke`, `seal`); the node refuses to start if bubblewrap is unusable. Without it, all six are `unsupported_operation` and no evidence log is kept. |
 | `--network-allowlist` | no | Honour a manifest's `network.custom` host allowlist (§7.5): the attempt runs behind a node-owned egress proxy allowing exactly those hosts, with IP literals, private ranges and the metadata endpoint always refused (§9), and the node reports `network.proxy_allowlist` `true` (§5). Needs `--task-root`. Without it every `network.custom` manifest is refused `unsupported_grant`. |
 | `--output-return` | no | Honour a manifest's `output` grant (§7.5): the node keeps the first `stdio_bytes` of the workload's stdout and stderr, collects the declared workspace files once the attempt has ended (relative paths only, nothing followed outside the workspace, bounded), stores the result in `<task-root>/<task>/<attempt>.output/` (§6.6) and returns it through `result`; the capability document then carries `output` with `stdio` and `files` `true` (§5). Needs `--task-root`. Without it every manifest with `output` is refused `unsupported_grant` and `result` is `unsupported_operation`. |
+| `--cgroup-root` | no | A cgroup v2 directory delegated to the node: writable by the node's uid and holding no process of its own (for systemd, a unit with `Delegate=yes` whose main process sits in a sub-cgroup, `DelegateSubgroup=`). The node refuses to start if it is not on a cgroup v2 filesystem, if one of the `cpu`, `memory` and `pids` controllers it offers cannot be enabled in its `cgroup.subtree_control`, or if no cgroup can be created under it. Every attempt then runs in a cgroup of its own, `<dir>/<attempt>`, created before the spawn and removed once the workload is reaped; a manifest's `resources` limits are written there (§7.5, §9); what the attempt used is read from the kernel's counters and recorded (§6.5); and the node reports `resources` with the controllers it enabled (§5). At start the node also kills and removes every attempt cgroup (`exec_…`) a previous run left under it. Needs `--task-root`. Without it every manifest with `resources` is refused `unsupported_grant` and nothing is measured. |
+| `--max-running` | no | At most this many attempts (1 to 1 024) execute at once: from the spawn until the reaper has reaped the workload, paused attempts and attempts whose kill is pending included. A `start` past it is refused `capacity_exhausted` with the task still `ready` and nothing materialised (§8.2); the node reports the bound, the running count and its headroom in `scheduling` (§5). Needs `--task-root`. Without it the node bounds nothing, as before. |
+| `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 
@@ -346,11 +360,14 @@ well, `network.proxy_allowlist` reads `true`):
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
 | `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
+| `resources.cpu`, `resources.memory`, `resources.pids` | Present, as `"resources":{"cpu":…,"memory":…,"pids":…}` after `output` (or after `verifier` when `output` is absent), exactly when `lifecycle.start` is and the node was started with `--cgroup-root` (§2.1): every attempt then runs in a cgroup of its own and what it used is recorded (§6.5). Each flag is `true` when the node enabled that controller and enforces the matching limit of a `resources` grant (`cpu_millis`, `memory_bytes`, `pids`, §7.5). Otherwise the section is absent, nothing is measured, and every `resources` grant is refused `unsupported_grant`. New in this revision of 1.3, with the same caveat as `output`: a strict decoder of an earlier revision refuses a document that carries it. |
+| `scheduling` | Present, as `"scheduling":{"max_running":…,"running":…,"memory_floor_bytes":…,"memory_available_bytes":…,"disk_floor_bytes":…,"disk_available_bytes":…}` after `resources` (or where `resources` would be), exactly when `lifecycle.start` is and the node was started with `--max-running`. Read when the document is served: `running` counts the attempts executing now (spawned and not yet reaped), the `*_available_bytes` are the host's `MemAvailable` and the task root filesystem's available space (`0` if they cannot be read), and a floor of `0` means none. A `start` is refused `capacity_exhausted` while `running` is at `max_running` or an available amount is below its floor (§8.2). New in this revision of 1.3, with the same caveat as `output`. |
 | `output.stdio`, `output.files` | Present, as `"output":{"stdio":true,"files":true}` after `verifier`, exactly when `lifecycle.start` is and the node was started with `--output-return` (§2.1): a manifest's `output` grant (§7.5) is then honoured and `result` returns an ended attempt's bounded stdout, stderr and declared files (§6.6). Otherwise the section is absent, which means both `false`, and such a manifest is refused `unsupported_grant` at `admit`. The section is new in this revision of 1.3: a strict decoder of an earlier 1.3 revision refuses a document that carries it, so start a node with `--output-return` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
 Everything else (`isolation.backends`, `credentials`, `snapshots.diff`,
 `snapshots.read`, `verifier`) is `false`: the node offers none of it yet. 1.1 and 1.2
-documents keep their earlier content: they never carry `admit`, `start` or `output`,
+documents keep their earlier content: they never carry `admit`, `start`, `output`,
+`resources` or `scheduling`,
 report `stop`, `pause` and `revoke` as `false`, and report the execution flags
 above as `false`, because a 1.1 or 1.2 connection cannot run anything.
 
@@ -389,6 +406,21 @@ An ambiguous launch is answered `accepted` with state `exited` (its outcome is
 ```json
 {"response":"accepted","protocol":{"major":1,"minor":3},"operation_id":3,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"state":"exited"}
 ```
+
+On a node started with `--max-running` (§2.1), a `start` that would pass the bound, or
+that finds the host's available memory or disk below its floor, is refused and changes
+nothing: the task stays `ready`, no workspace is materialised and nothing is recorded, so
+the same request (same `operation_id`) may be sent again once an attempt has ended:
+
+```json
+{"response":"rejected","protocol":{"major":1,"minor":3},"operation_id":3,"binding":{"task":"task_01M45YYRG00001249248SK6H24","attempt":"exec_01M45YYRG00005ANB6CSVQF248","lease":"lease_01M45YYRG00009K6DANAXVQK6C"},"reason":"capacity_exhausted"}
+```
+
+The node keeps no queue of its own: a refused `start` is forgotten, so nothing waits on
+the node, nothing can starve there and nothing is lost or reordered by a restart. The
+control plane's waiting attempts are its `ready` tasks, which `inspect` shows and the
+registry bounds (1 024 tasks, §10); `scheduling` in the capability document (§5) says how
+many run and how many may.
 
 `pause` stops the running workload's whole process tree and answers once the freeze is
 confirmed; `resume` continues it and answers once nothing is still stopped:
@@ -580,7 +612,10 @@ transition is written to it (temporary file, fsync, rename, directory fsync) bef
 node answers the verb; if that write fails, the verb is refused `resource_unavailable`
 and nothing changed (a `pause` or `resume` undoes its freeze or thaw first). The record of
 an admitted attempt also keeps the authority chain its `admit` verified, which
-`ward-node audit` reads (§2.6). `start`
+`ward-node audit` reads (§2.6). On a node started with `--cgroup-root`, the record of
+an ended attempt also keeps what it used (`usage`: the limits enforced and the kernel's
+counters, as in `NodeAttemptResourceUsage`, §6.5), and keeps it across a restart; a record
+without a measurement carries no `usage` field and reads exactly as before. `start`
 records that it is about to spawn before it spawns, and the spawned process once the
 spawn is confirmed; if that second write fails, the node kills the workload and answers
 `accepted` with `exited` (`unknown`), as for an ambiguous launch.
@@ -646,6 +681,7 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `NodeAttemptIntervened` | A `pause` or `resume` took effect. | `pause` or `resume`, and the operation id. |
 | `NetworkRequested`, `NetworkDenied` | The attempt's egress proxy (§9: a `network.custom` manifest on a node with `--network-allowlist`) allowed or refused a destination. The node records the proxy's verdicts itself while the attempt runs, in the order they were made, at most 512 per attempt. | The destination host or literal and port; for an allow, the pinned addresses as the rule and the workload's host pid; for a denial, the reason (not allowlisted, private range). Never a request body. |
 | `ObservationsDropped` | Verdicts of the attempt's proxy could not be recorded: past the 512 bound, refused by the log's own bound, or still undecided when the attempt ended. One marker, before `NodeAttemptEnded`. | `source` `network`, the count and the bound. |
+| `NodeAttemptResourceUsage` | The attempt ran on a node started with `--cgroup-root` (§2.1), its workload ended and was reaped, and the node read its cgroup's counters. One record, before `NodeAttemptOutputCollected` (if any) and `NodeAttemptEnded`; not written for an attempt whose end was recorded before its reap (a `revoke` whose reap was not confirmed) or that never spawned. | The limits enforced (`cpu_millis_limit`, `memory_limit_bytes`, `pids_limit`, absent when not asked for) and what the tree used: `cpu_usage_usec` (`cpu.stat`), `memory_peak_bytes` (`memory.peak`), `pids_peak` (`pids.peak`), `memory_oom_kills` (`memory.events` `oom_kill`) and `pids_max_events` (forks refused at the limit, `pids.events` `max`); a counter the host's kernel or controllers do not provide is absent. |
 | `NodeAttemptOutputCollected` | The attempt was admitted with an `output` grant on a node started with `--output-return` (§6.6, §7.5), its workload ended and was reaped, and the node collected the output and stored it. One record, right before `NodeAttemptEnded`; never written for a workload the node lost track of. | For stdout and for stderr, the bytes returned and the bytes dropped past them; for every declared file, in declaration order, its workspace path, size, `BLAKE3-256` digest and status (`returned`, `digest_only`, `missing`, `not_a_regular_file`, `too_large`). Never the bytes. `result` returns exactly what this record digests. |
 | `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
 | `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
@@ -981,15 +1017,22 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | `network.custom` | 1–64 host patterns, no repeats, in `ward-policy`'s host grammar: a lowercase DNS name (`github.com`), or `*.` and a name (`*.crates.io`), which covers any name with at least one more label and never the name itself. Labels are 1–63 characters of `a-z 0-9 -`, neither starting nor ending with `-`; a name is at most 253 bytes. Lower case only, so a signed pattern has one spelling. |
 | `output` | Optional (new in this revision of 1.3; a node of an earlier revision fails to decode a manifest that carries it). `{"stdio_bytes": N, "files": [paths], "files_bytes": M}`, all three required: return the first `N` bytes of each of stdout and stderr, and the declared `files` with up to `M` bytes of content in all (§6.6). |
 | `output.stdio_bytes`, `output.files_bytes` | Integers ≥ 0. The grammar bounds neither; the node honours at most 1 MiB (1 048 576) per stream and 8 MiB (8 388 608) of file content, and refuses a larger grant `unsupported_grant`. `0` is a grant too: the streams come back empty with their dropped counts. |
+| `resources` | Optional (new in this revision of 1.3; a node of an earlier revision fails to decode a manifest that carries it). `{"cpu_millis": N, "memory_bytes": M, "pids": P}`, each field optional and at least one present: the limits the node must enforce on the attempt's whole process tree through its cgroup (§9). An absent field is not limited by the grant. |
+| `resources.cpu_millis` | Integer ≥ 1: CPU time per second of wall clock, in thousandths of one CPU (`cpu.max`; `1000` is one full CPU). The node honours at most 1 000 per logical CPU it reports in `capacity`. |
+| `resources.memory_bytes` | Integer ≥ 1: memory the tree may use, tmpfs writes included (`memory.max`), with no swap where the kernel accounts swap (`memory.swap.max` `0`); a tree that passes it is killed whole (`memory.oom.group`). The node honours at most the `capacity.memory_bytes` it reports. |
+| `resources.pids` | Integer ≥ 1: processes and threads that may exist in the tree at once, bubblewrap's own included (`pids.max`); a fork past it fails. The node honours at most 65 536. |
 | `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
 enforce it: `offline` always, `custom` only when `network.proxy_allowlist` is `true`,
 which a node started with `--network-allowlist` reports (§2.1), and `output` only when
 `output.stdio` and `output.files` are `true`, which a node started with
-`--output-return` reports, and only within the ceilings above; the workload then runs
-behind the attempt's own egress proxy allowing exactly the listed patterns (§9), and its
-output is kept and returned as §6.6 says. A
+`--output-return` reports, and only within the ceilings above, and `resources` only when
+every limit it names has its flag `true` in the document's `resources` section, which a
+node started with `--cgroup-root` reports, and only within the ceilings above; the
+workload then runs behind the attempt's own egress proxy allowing exactly the listed
+patterns (§9), its output is kept and returned as §6.6 says, and its process tree is
+held to the limits as §9 says. A
 manifest that asks for a grant the node does not honour is refused `unsupported_grant`
 (§8.1 step 16): the node refuses what it cannot enforce
 rather than run the workload with less than its manifest says. The refusal comes after
@@ -1019,13 +1062,23 @@ Decodes; honoured on a node started with `--output-return`, refused `unsupported
 on any other, as is `{"stdio_bytes":1048577,…}` on every node.
 
 ```json
+{"network":"offline","resources":{"cpu_millis":500,"memory_bytes":268435456,"pids":64}}
+```
+
+Decodes; honoured on a node started with `--cgroup-root` whose `resources` section
+reports `cpu`, `memory` and `pids` `true` and whose `capacity` is at least half a CPU and
+256 MiB, refused `unsupported_grant` on any other. `{"network":"offline","resources":{}}`,
+a limit of `0`, a `null` limit and an unknown limit (`"disk_bytes"`) fail decoding
+(`authority_denied`).
+
+```json
 {"network":"development"}
 ```
 
 `ward-policy`'s presets are not in the grammar: the envelope fails decoding
 (`authority_denied`), as do `{}`, `{"network":{"custom":[]}}`,
 `{"network":"offline","output":{"stdio_bytes":1,"files":["../x"],"files_bytes":1}}` and
-any manifest with a field other than `network` and `output`.
+any manifest with a field other than `network`, `output` and `resources`.
 
 ## 8. Verification order and rejection reasons
 
@@ -1051,7 +1104,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1063,9 +1116,14 @@ Each of the six execution verbs is `unsupported_operation` without `--task-root`
 
 `start`: checks 1–2; replay; not
 `ready` → `invalid_state`; envelope `issued_at` in the future → `authority_denied`;
-envelope or lease expired → `lease_expired`; revoked → `lease_revoked`; snapshot missing
-from the store, the attempt's workspace already existing (`<task-root>/<task>/<attempt>/`)
-or the sandbox failing to spawn → `resource_unavailable` with the task still `ready`.
+envelope or lease expired → `lease_expired`; revoked → `lease_revoked`; on a node started
+with `--max-running`, as many attempts executing as the bound, or available memory or
+disk below its floor → `capacity_exhausted`, a floor that cannot be measured →
+`resource_unavailable`, both with the task still `ready` and nothing materialised;
+snapshot missing
+from the store, the attempt's workspace already existing (`<task-root>/<task>/<attempt>/`),
+the attempt's cgroup not created or its limits not written (`--cgroup-root`), or the
+sandbox failing to spawn → `resource_unavailable` with the task still `ready`.
 
 `stop`: checks 1–2; replay; `ready` → `stopped`; `running` or `paused` → kill
 (continuing a paused tree first, after which the task reads `running`, §6.2), wait up to
@@ -1119,7 +1177,8 @@ task to evict it is refused `resource_unavailable`.
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. From `result`: the attempt has not ended yet (§6.6). |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope (a capability manifest outside the grammar of §7.5 included), a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, or an `output` grant on a node without `--output-return` or above its ceilings (§6.6). The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings (§6.6), or a `resources` grant on a node without `--cgroup-root`, naming a limit whose controller the node has not enabled, or above its ceilings. The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `capacity_exhausted` | From `start` only, on a node started with `--max-running` (§2.1): the node already executes as many attempts as its bound, or the host's available memory or the task root's available disk is below the configured floor. Nothing changed: the task stays `ready`, nothing is materialised or recorded; send the same `start` again once an attempt has ended (§6.1). New in this revision of 1.3: a strict decoder of an earlier revision does not know the string, which is why only a node started with `--max-running` sends it. |
 | `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. From `result`: no stored result exists for the ended attempt (§6.6). |
 | `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2; `result` without `--output-return`). |
 
@@ -1149,6 +1208,23 @@ bubblewrap's, set to `/work` when it enters the working directory; nothing of th
 own environment is passed on). Output is drained; without an `output` grant none of it
 is kept, and with one (on a node started with `--output-return`) the first `stdio_bytes`
 of each stream are kept and returned by `result` with the declared files (§6.6).
+
+Without `--cgroup-root` the node creates no cgroup for a workload: the wall-clock budget
+is its only bound and nothing it uses is measured. With it (§2.1), the node creates
+`<cgroup-root>/<attempt>` before the spawn, writes the manifest's `resources` limits there
+(`cpu.max` as quota and period, a 100 ms period stretched to one second below the
+kernel's 1 ms minimum quota; `memory.max`, `memory.swap.max` `0` and `memory.oom.group`
+`1` where the kernel has them; `pids.max`), and spawns through a host `/bin/sh` that stops
+itself until the node has moved it into that cgroup and only then executes `bwrap`; a move
+that fails kills the shell and refuses the `start` `resource_unavailable` with nothing run.
+Bubblewrap and every process of the sandbox are therefore created inside the cgroup; the
+sandbox has no cgroup filesystem (no `/sys` is bound) and, where the kernel supports one,
+a cgroup namespace rooted at that cgroup (bubblewrap's `--unshare-cgroup-try`), so
+nothing in it can move itself out.
+When the workload has been reaped the node kills whatever is left in the cgroup
+(`cgroup.kill`, or `SIGKILL` to each member), reads the counters it records (§6.5) and
+removes the cgroup. CPU time, peak memory and peak pids are the kernel's own counters for
+the whole tree, including anything the reap killed.
 
 An `offline` manifest (§7.5) binds nothing else: there is no route off the host. A
 `network.custom` manifest, on a node started with `--network-allowlist` (§2.1), runs the
@@ -1248,6 +1324,12 @@ no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the
   complete without it (§11.2).
 - **Clocks.** Validity is judged at the node clock at `admit` and at `start`; no other
   verb rechecks it. Leave margin for skew and for the delay between the two.
+- **Capacity exhausted.** `capacity_exhausted` from `start` is backpressure, not an
+  error: the task is still `ready` and its admission still valid until it expires. Keep
+  the attempt in the control plane's own queue and send the same `start` (same
+  `operation_id`) again once one of the node's attempts has ended; read `scheduling` in
+  the capability document (§5) to see when. A start retried after the envelope expired is
+  `lease_expired`; admit a new envelope then.
 - **Capacity.** The node holds at most 1 024 tasks. `exited`, `stopped` and `revoked`
   tasks count until they are sealed; seal each finished task once you have read its
   outcome. When a `create` for a new task finds the registry full, the node evicts the

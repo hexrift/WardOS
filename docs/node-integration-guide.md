@@ -231,7 +231,7 @@ wrong most often:
   and `authority.lease.task` equals `binding.task` (§7.3).
 - `workload.snapshot` is the line of §4 unchanged; `workload.argv` is what runs, resolved
   on the sandbox `PATH`; `workload.wall_clock_budget_ms` is mandatory and is the only
-  limit the node enforces.
+  limit the node enforces unless the node runs attempts in cgroups (below).
 - `workload.capability_manifest.bytes` is the hex of `{"network":"offline"}` and `hash`
   its `BLAKE3-256`: `7b226e6574776f726b223a226f66666c696e65227d` and
   `eb3e889be30ae8dd712a52c33e37aaca72e52ccff1aa770ecbd962d0cdb0d0c3`. It is the only
@@ -242,7 +242,11 @@ wrong most often:
   `"output":{"stdio_bytes":N,"files":["out/report.json",…],"files_bytes":M}` (at most
   1 MiB per stream, 8 MiB of files, 64 exact relative paths): the report's `output` then
   carries the first `N` bytes of stdout and stderr and the declared files with their
-  digests (§6.6, §7.5).
+  digests (§6.6, §7.5). On a node started with `--cgroup-root`, a manifest may also carry
+  `"resources":{"cpu_millis":N,"memory_bytes":M,"pids":P}` (any of the three): the
+  kernel then holds the workload's whole process tree to those limits, and the attempt's
+  evidence log records what it used (`NodeAttemptResourceUsage`). Ask only for limits the
+  capability document's `resources` section reports `true` (§5, §7.5).
 - `version` is `1` for a task's first envelope and strictly higher than every version
   the node accepted for that task before, across attempts and restarts (§10).
 - `issued_at_unix_ms <= now < expires_at_unix_ms` at the node's clock, with margin.
@@ -333,8 +337,9 @@ Node-integration.md §10 is the full list; these are the cases every control pla
 | `rejected` at `admit` with `authority_denied` | Untrusted key, bad signature, malformed envelope, wrong audience, wrong issuer principal, or not yet valid (§8.1). Nothing changed, no version consumed. | Fix the envelope or the trust store; re-admit under the same version. |
 | `lease_expired`, `lease_revoked` | Validity or revocation, at the node clock (§8.3). | Issue a fresh lease (a revoked one, and anything delegated from it, is gone for good on that node). |
 | `stale_operation` at `admit` | The version is not above the last accepted for the task (§8.3). | Raise `version`; your per-task counter is behind the node's. |
-| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5): a network allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings. No version consumed. | Re-admit with `{"network":"offline"}` and no `output`, start the node with `--network-allowlist` if the workload needs egress or `--output-return` if you need its output back, or do not run this workload here. |
+| `unsupported_grant` | The manifest asks for a grant this node does not honour (§7.5): a network allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings, a `resources` grant on a node without `--cgroup-root`, naming a limit the node has no controller for, or above its ceilings. No version consumed. | Re-admit with `{"network":"offline"}` and no `output`, start the node with `--network-allowlist` if the workload needs egress or `--output-return` if you need its output back, or do not run this workload here. |
 | `rejected` at `result` with `resource_unavailable` | No stored result for the ended attempt: the manifest carried no `output` grant, the attempt never ran or was lost, or the node restarted before collecting (§6.6). | Nothing to recover: read the workspace on the host if you need it, and declare the files next time. |
+| `capacity_exhausted` at `start` | The node was started with `--max-running` and already runs that many attempts, or the host's available memory or disk is below the node's floor (§8.2). Nothing changed; the task stays `ready`. | Keep the attempt queued on your side and send the same `start` (same id) again once one of the node's attempts has ended; `scheduling` in the capability document says how many run (§5). |
 | `resource_unavailable` at `start` | Snapshot missing from the store, workspace already exists, or the spawn failed; the task stays `ready`. | Import the snapshot (§4), or retry `start` with the same id; never reuse an attempt id. |
 | `done` with `outcome` `unknown` | Ambiguous launch, lost child, node restart mid-run, or a transport failure the driver could not recover (§11.2). | Treat as failed. Retry as a **new attempt**: `create` the same task under a new attempt id, `admit` a new envelope with a higher `version`, `start`. The old attempt never runs again. |
 | `recovering` events, then `done` | A lost answer was recovered by `inspect` and one replay of the same id (§11.2). | Nothing; this is the contract working. |

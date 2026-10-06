@@ -337,6 +337,7 @@ struct FakeState {
     blocked_on_launch: Option<std::path::PathBuf>,
     egress: Option<Arc<crate::egress::AttemptEgress>>,
     stdio: (Vec<u8>, Vec<u8>),
+    usage: Option<ward_events::NodeResourceUsage>,
 }
 
 /// A deterministic launcher: workloads end only when the test says so, or on stop.
@@ -371,6 +372,7 @@ impl FakeLauncher {
                 blocked_on_launch: None,
                 egress: None,
                 stdio: (Vec::new(), Vec::new()),
+                usage: None,
             }),
             std::sync::Condvar::new(),
         )))
@@ -456,6 +458,11 @@ impl FakeLauncher {
     /// launch's output grant asked for and the full byte count, as the sandbox does.
     pub fn set_stdio(&self, stdout: &[u8], stderr: &[u8]) {
         self.state().stdio = (stdout.to_vec(), stderr.to_vec());
+    }
+
+    /// What the fake workload's reaper reports it used, as a cgroup launcher measures it.
+    pub fn set_usage(&self, usage: Option<ward_events::NodeResourceUsage>) {
+        self.state().usage = usage;
     }
 }
 
@@ -607,6 +614,7 @@ impl crate::execution::RunningWorkload for FakeWorkload {
                 stdout: stream(&state.stdio.0),
                 stderr: stream(&state.stdio.1),
             },
+            usage: state.usage,
         }
     }
 }

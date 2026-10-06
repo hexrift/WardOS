@@ -22,7 +22,10 @@
 //!     the registry from its execution), and an `output` grant only on a node that returns
 //!     output ([`NodeAdmission::with_output_return`]) and only within its ceilings
 //!     ([`ward_node_protocol::MAX_OUTPUT_STDIO_BYTES`],
-//!     [`ward_node_protocol::MAX_OUTPUT_FILES_BYTES`]); any other grant is refused
+//!     [`ward_node_protocol::MAX_OUTPUT_FILES_BYTES`]), and a `resources` grant only on a
+//!     node that runs attempts in cgroups, only for limits it has a controller for and
+//!     within the host's ceilings ([`NodeAdmission::with_resource_enforcement`]); any other
+//!     grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
 //!
@@ -45,6 +48,7 @@ use ward_node_protocol::{
 };
 
 use crate::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
+use crate::cgroup::ResourceEnforcement;
 use crate::issuer::TrustedIssuers;
 use crate::state::{NodeState, NodeStateError};
 
@@ -114,6 +118,7 @@ pub struct NodeAdmission {
     clock: Box<dyn NodeClock>,
     network_allowlist: bool,
     output_return: bool,
+    resources: Option<ResourceEnforcement>,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -124,6 +129,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("state", &self.state)
             .field("network_allowlist", &self.network_allowlist)
             .field("output_return", &self.output_return)
+            .field("resources", &self.resources)
             .finish_non_exhaustive()
     }
 }
@@ -138,6 +144,7 @@ impl NodeAdmission {
             clock,
             network_allowlist: false,
             output_return: false,
+            resources: None,
         }
     }
 
@@ -169,6 +176,19 @@ impl NodeAdmission {
     #[must_use]
     pub const fn honours_output_return(&self) -> bool {
         self.output_return
+    }
+
+    /// Which `resources` grants are honoured (check 10): only on a node that runs attempts
+    /// in cgroups, only limits it has a controller for, within the host's ceilings. The
+    /// task registry sets this from its execution, so what `admit` accepts is exactly what
+    /// the launcher writes into the attempt's cgroup.
+    #[must_use]
+    pub const fn with_resource_enforcement(
+        mut self,
+        resources: Option<ResourceEnforcement>,
+    ) -> Self {
+        self.resources = resources;
+        self
     }
 
     /// This node's identity: the only audience it admits.
@@ -260,11 +280,15 @@ impl NodeAdmission {
         authority
             .revalidate(self.state.revocations(), now)
             .map_err(|_| Reason::LeaseRevoked)?;
-        check_grants(
-            envelope.workload().capability_manifest().manifest(),
-            self.network_allowlist,
-            self.output_return,
-        )?;
+        let manifest = envelope.workload().capability_manifest().manifest();
+        check_grants(manifest, self.network_allowlist, self.output_return)?;
+        if let Some(grant) = manifest.resources()
+            && !self
+                .resources
+                .is_some_and(|enforcement| enforcement.honours(grant))
+        {
+            return Err(Reason::UnsupportedGrant);
+        }
 
         Ok(VerifiedAdmission {
             envelope,

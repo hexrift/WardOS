@@ -733,6 +733,33 @@ pub struct NodeOutputFile {
     pub status: NodeOutputFileStatus,
 }
 
+/// What a node execution attempt's process tree was limited to and what it used, as the
+/// node read it from the attempt's own cgroup once the workload had been reaped (#260).
+///
+/// A limit is `None` when the manifest asked for none; a measurement is `None` when the
+/// host's cgroup does not report it (no such controller, or a kernel without the file).
+/// Every value is the kernel's own counter, never an estimate.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct NodeResourceUsage {
+    /// The enforced CPU limit, in thousandths of one CPU (`cpu.max`).
+    pub cpu_millis_limit: Option<u64>,
+    /// The enforced memory limit in bytes, with no swap (`memory.max`).
+    pub memory_limit_bytes: Option<u64>,
+    /// The enforced limit on processes and threads (`pids.max`).
+    pub pids_limit: Option<u64>,
+    /// CPU time the tree used, in microseconds (`cpu.stat` `usage_usec`).
+    pub cpu_usage_usec: Option<u64>,
+    /// The tree's peak memory use in bytes (`memory.peak`).
+    pub memory_peak_bytes: Option<u64>,
+    /// The tree's peak count of processes and threads (`pids.peak`).
+    pub pids_peak: Option<u64>,
+    /// Processes the kernel killed for passing the memory limit (`memory.events`
+    /// `oom_kill`).
+    pub memory_oom_kills: Option<u64>,
+    /// Forks refused at the pid limit (`pids.events` `max`).
+    pub pids_max_events: Option<u64>,
+}
+
 // ---------------------------------------------------------------------------------------
 // The catalogue
 // ---------------------------------------------------------------------------------------
@@ -1379,6 +1406,16 @@ pub enum WardEvent {
         /// The declared files, in declaration order.
         files: Vec<NodeOutputFile>,
     },
+    /// The node measured what the attempt's process tree used, from the cgroup the node ran
+    /// it in, once its workload had ended and been reaped (#260): the limits it enforced
+    /// and the kernel's counters. Written before `NodeAttemptOutputCollected` (if any) and
+    /// `NodeAttemptEnded`, and only by a node that runs attempts in cgroups. Appended at the
+    /// end of the catalogue, as every late variant is: postcard identifies variants by
+    /// declaration index.
+    NodeAttemptResourceUsage {
+        /// The limits and the measurements.
+        usage: NodeResourceUsage,
+    },
 }
 
 /// The kind (variant) of a [`WardEvent`], for filtering.
@@ -1435,11 +1472,12 @@ pub enum EventKind {
     NodeAttemptRecovered = 44,
     NodeAttemptSealed = 45,
     NodeAttemptOutputCollected = 46,
+    NodeAttemptResourceUsage = 47,
 }
 
 impl EventKind {
     /// Every kind, in declaration order.
-    pub const ALL: [EventKind; 47] = [
+    pub const ALL: [EventKind; 48] = [
         EventKind::SessionStarted,
         EventKind::SessionEnded,
         EventKind::AgentStateChanged,
@@ -1487,6 +1525,7 @@ impl EventKind {
         EventKind::NodeAttemptRecovered,
         EventKind::NodeAttemptSealed,
         EventKind::NodeAttemptOutputCollected,
+        EventKind::NodeAttemptResourceUsage,
     ];
 
     /// Bit position of this kind in an [`EventKindSet`].
@@ -1546,6 +1585,7 @@ impl EventKind {
             EventKind::NodeAttemptRecovered => "node_attempt_recovered",
             EventKind::NodeAttemptSealed => "node_attempt_sealed",
             EventKind::NodeAttemptOutputCollected => "node_attempt_output_collected",
+            EventKind::NodeAttemptResourceUsage => "node_attempt_resource_usage",
         }
     }
 
@@ -1588,6 +1628,7 @@ impl EventKind {
                 | EventKind::NodeAttemptRecovered
                 | EventKind::NodeAttemptSealed
                 | EventKind::NodeAttemptOutputCollected
+                | EventKind::NodeAttemptResourceUsage
         )
     }
 }
@@ -1782,6 +1823,7 @@ impl WardEvent {
             WardEvent::NodeAttemptRecovered { .. } => EventKind::NodeAttemptRecovered,
             WardEvent::NodeAttemptSealed { .. } => EventKind::NodeAttemptSealed,
             WardEvent::NodeAttemptOutputCollected { .. } => EventKind::NodeAttemptOutputCollected,
+            WardEvent::NodeAttemptResourceUsage { .. } => EventKind::NodeAttemptResourceUsage,
         }
     }
 

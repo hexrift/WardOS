@@ -1,8 +1,9 @@
 //! Local Ward node service executable.
 //!
 //! `ward-node --socket <path> --state-dir <dir> --node-id <node_…> [--trusted-issuers <file>]
-//! [--task-root <dir>] [--network-allowlist] [--output-return] [--client-uid <uid>]…
-//! [--client-group <group>]`
+//! [--task-root <dir>] [--network-allowlist] [--output-return] [--cgroup-root <dir>]
+//! [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]]
+//! [--client-uid <uid>]… [--client-group <group>]`
 //! serves the local node protocol. `--node-id` is this node's
 //! audience identity; the state directory pins it at first start and holds the durable
 //! admission version, revocation and retired-attempt stores, one record per registered task
@@ -19,7 +20,13 @@
 //! honoured: the node keeps the head of the workload's stdout and stderr, collects the
 //! declared workspace files once the attempt has ended, stores the bounded result beside
 //! the workspace and returns it through `result`, advertising `output`; without it such a
-//! manifest is refused `unsupported_grant`. The socket is served to the node's own
+//! manifest is refused `unsupported_grant`. With `--cgroup-root` as well, every attempt
+//! runs in a cgroup of its own under that delegated cgroup v2 directory, a manifest's
+//! `resources` limits are enforced there and what each attempt used is recorded in its task
+//! record and evidence log; without it such a manifest is refused `unsupported_grant`. With
+//! `--max-running` as well, at most that many attempts execute at once and a `start` past
+//! it, or below `--memory-floor` or `--disk-floor`, is refused `capacity_exhausted` with the
+//! task still `ready`. The socket is served to the node's own
 //! uid and to each `--client-uid` (a uid or user name); every other peer is closed without
 //! a response. With `--client-group` the socket is created mode 0660 owned by that group,
 //! in a directory owned by it with mode 0750 or stricter, so a client of another uid can
@@ -43,9 +50,11 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
-use ward_node::execution::{NodeExecution, SandboxLauncher};
+use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
+use ward_node::execution::{NodeExecution, SandboxLauncher, TaskLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
 use ward_node::peer::{ClientGroup, ClientUids};
+use ward_node::scheduling::SchedulingLimits;
 use ward_node::state::{NodeState, open_private_dir};
 use ward_node::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 use ward_node::{NodeService, SocketAccess, serve_local};
@@ -95,6 +104,32 @@ struct Cli {
     /// `unsupported_grant`.
     #[arg(long, requires = "task_root")]
     output_return: bool,
+    /// A cgroup v2 directory delegated to the node (writable by its uid, with no process of
+    /// its own): every attempt runs in a cgroup of its own under it, its manifest's
+    /// `resources` limits are enforced there (`cpu.max`, `memory.max` with no swap,
+    /// `pids.max`, for the controllers the directory offers) and what it used is recorded;
+    /// advertise `resources`. Needs `--task-root`. Without it every manifest with
+    /// `resources` is refused `unsupported_grant`.
+    #[arg(long, value_name = "DIR", requires = "task_root")]
+    cgroup_root: Option<PathBuf>,
+    /// Execute at most this many attempts at once (1 to 1024); a `start` past it is refused
+    /// `capacity_exhausted` with the task still `ready`; advertise `scheduling`. Needs
+    /// `--task-root`. Without it the node bounds nothing.
+    #[arg(
+        long,
+        value_name = "N",
+        requires = "task_root",
+        value_parser = clap::value_parser!(u32).range(1..=1024)
+    )]
+    max_running: Option<u32>,
+    /// Refuse a `start` `capacity_exhausted` while the host's available memory
+    /// (`MemAvailable`) is below this many bytes. Needs `--max-running`.
+    #[arg(long, value_name = "BYTES", requires = "max_running")]
+    memory_floor: Option<u64>,
+    /// Refuse a `start` `capacity_exhausted` while the task root's filesystem has fewer
+    /// than this many bytes available. Needs `--max-running`.
+    #[arg(long, value_name = "BYTES", requires = "max_running")]
+    disk_floor: Option<u64>,
     /// A uid, or user name, served on the socket besides the node's own; repeatable. Any
     /// other peer is closed without a response. Being served grants no authority: `admit`
     /// still needs a trusted signature.
@@ -209,21 +244,44 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         )
         .into());
     }
+    let cgroups = cli
+        .cgroup_root
+        .as_deref()
+        .map(|dir| CgroupRoot::open(dir).map(Arc::new))
+        .transpose()?;
+    let scheduling = cli
+        .max_running
+        .map(|max_running| {
+            SchedulingLimits::new(
+                max_running,
+                cli.memory_floor.unwrap_or(0),
+                cli.disk_floor.unwrap_or(0),
+            )
+            .ok_or_else(|| io::Error::other("--max-running must be between 1 and 1024"))
+        })
+        .transpose()?;
     let state = NodeState::open(&state_dir, node_id)?;
     let admission = NodeAdmission::new(issuers, state, Box::new(SystemClock));
     let capabilities = conservative_host_capabilities()?;
     let service = match task_root {
-        Some(task_root) => NodeService::with_execution(
-            capabilities,
-            admission,
-            NodeExecution::new(
-                task_root,
-                open_snapshot_store(&state_dir)?,
-                Arc::new(SandboxLauncher),
-            )
-            .with_network_allowlist(cli.network_allowlist)
-            .with_output_return(cli.output_return),
-        )?,
+        Some(task_root) => {
+            let launcher: Arc<dyn TaskLauncher> = match &cgroups {
+                Some(root) => Arc::new(CgroupLauncher::new(Arc::clone(root))),
+                None => Arc::new(SandboxLauncher),
+            };
+            let enforcement = cgroups
+                .as_ref()
+                .map(|root| ResourceEnforcement::new(root.enforces(), capabilities.capacity()));
+            NodeService::with_execution(
+                capabilities,
+                admission,
+                NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, launcher)
+                    .with_network_allowlist(cli.network_allowlist)
+                    .with_output_return(cli.output_return)
+                    .with_resource_enforcement(enforcement)
+                    .with_scheduling(scheduling),
+            )?
+        }
         None => NodeService::with_admission(capabilities, admission)?,
     };
     serve_local(&socket, &service, SocketAccess::new(client_group, clients))?;
@@ -521,5 +579,60 @@ mod tests {
         let cli = Cli::try_parse_from(serve.iter().copied().chain(["--client-uid", "0"]))
             .expect("a client uid alone");
         assert_eq!(cli.client_group, None);
+    }
+
+    #[test]
+    fn cgroups_and_scheduling_need_a_task_root_and_floors_need_a_running_bound() {
+        let node = NodeId::from_u128(4).to_string();
+        let serve = [
+            "ward-node",
+            "--socket",
+            "s",
+            "--state-dir",
+            "d",
+            "--node-id",
+            &node,
+        ];
+        let cli = Cli::try_parse_from(serve).expect("serve");
+        assert_eq!(
+            (
+                cli.cgroup_root,
+                cli.max_running,
+                cli.memory_floor,
+                cli.disk_floor
+            ),
+            (None, None, None, None)
+        );
+        let cli = Cli::try_parse_from(serve.iter().copied().chain([
+            "--task-root",
+            "t",
+            "--cgroup-root",
+            "/sys/fs/cgroup/ward",
+            "--max-running",
+            "25",
+            "--memory-floor",
+            "1073741824",
+            "--disk-floor",
+            "0",
+        ]))
+        .expect("serve with cgroups and scheduling");
+        assert_eq!(cli.cgroup_root, Some(PathBuf::from("/sys/fs/cgroup/ward")));
+        assert_eq!(cli.max_running, Some(25));
+        assert_eq!(cli.memory_floor, Some(1_073_741_824));
+        assert_eq!(cli.disk_floor, Some(0));
+        for alone in [
+            &["--cgroup-root", "c"][..],
+            &["--max-running", "2"][..],
+            &["--task-root", "t", "--memory-floor", "1"][..],
+            &["--task-root", "t", "--disk-floor", "1"][..],
+            &["--task-root", "t", "--max-running", "0"][..],
+            &["--task-root", "t", "--max-running", "1025"][..],
+            &["--task-root", "t", "--max-running", "-1"][..],
+        ] {
+            assert!(
+                Cli::try_parse_from(serve.iter().copied().chain(alone.iter().copied())).is_err(),
+                "{alone:?}"
+            );
+        }
     }
 }

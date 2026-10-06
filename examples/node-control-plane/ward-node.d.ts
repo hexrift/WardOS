@@ -30,7 +30,7 @@ export type ReceiptOutcome = "completed" | "failed" | "unknown";
 export type RejectionReason =
   | "task_not_found" | "attempt_mismatch" | "lease_mismatch" | "lease_expired" | "lease_revoked"
   | "stale_operation" | "invalid_state" | "authority_denied" | "unsupported_grant"
-  | "resource_unavailable" | "unsupported_operation";
+  | "resource_unavailable" | "unsupported_operation" | "capacity_exhausted";
 
 export type Verb = "create" | "admit" | "start" | "pause" | "resume" | "stop" | "revoke" | "seal";
 

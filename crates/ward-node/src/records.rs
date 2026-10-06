@@ -39,7 +39,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use ward_authority::{AuthorityLease, GrantSet};
-use ward_events::{AgentId, Blake3Hash, DelegationId, LeaseId, PrincipalId, SessionId, TaskId};
+use ward_events::{
+    AgentId, Blake3Hash, DelegationId, LeaseId, NodeResourceUsage, PrincipalId, SessionId, TaskId,
+};
 use ward_node_protocol::{
     IssuerProof, MAX_ADMISSION_ENVELOPE_BYTES, MAX_ADMISSION_LINEAGE, OperationId, TaskBinding,
     TaskExecutionOutcome, TaskLifecycleState,
@@ -275,6 +277,10 @@ pub(crate) struct TaskRecord {
     pub(crate) outcome: Option<TaskExecutionOutcome>,
     pub(crate) workspace: Option<PathBuf>,
     pub(crate) process: Option<WorkloadProcess>,
+    /// What the attempt used, measured from its cgroup once reaped (#260); absent when it
+    /// was not measured, so a record without it is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) usage: Option<NodeResourceUsage>,
 }
 
 impl TaskRecord {
@@ -435,6 +441,7 @@ mod tests {
             outcome: None,
             workspace: Some(PathBuf::from("/tasks/t/a")),
             process: Some(WorkloadProcess::new(4242, 77, "boot".to_owned())),
+            usage: None,
         }
     }
 

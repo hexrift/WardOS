@@ -232,6 +232,7 @@ pub struct Launch {
     keep_prefix: Option<String>,
     clear_env: bool,
     host_network: bool,
+    cgroup: Option<PathBuf>,
 }
 
 /// A spawned sandbox whose child is owned until it is waited or dropped.
@@ -368,6 +369,7 @@ impl Launch {
             keep_prefix: None,
             clear_env: false,
             host_network: false,
+            cgroup: None,
         }
     }
 
@@ -450,6 +452,23 @@ impl Launch {
     #[must_use]
     pub const fn host_network(mut self) -> Self {
         self.host_network = true;
+        self
+    }
+
+    /// Run the whole sandbox in the cgroup v2 directory `dir`: the launch is moved into it
+    /// before `bwrap` is executed, so bubblewrap and every process of the sandbox are
+    /// created inside it and stay there (a process cannot leave a cgroup it cannot write
+    /// to, and the sandbox gets no cgroup filesystem). The caller creates the cgroup and
+    /// writes its limits first.
+    ///
+    /// Mechanism: a host `/bin/sh` is spawned in place of `bwrap`; it stops itself with
+    /// `SIGSTOP`, this process writes its pid to `<dir>/cgroup.procs` and continues it,
+    /// and only then does it `exec` `bwrap` (resolved on `PATH` before the spawn). If the
+    /// move cannot be made the stopped shell is killed and reaped and the spawn fails,
+    /// so nothing of the workload ever runs outside the cgroup.
+    #[must_use]
+    pub fn cgroup(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cgroup = Some(dir.into());
         self
     }
 
@@ -666,7 +685,17 @@ impl Launch {
             .worktree
             .canonicalize()
             .map_err(|e| Error::io(&self.worktree, e))?;
-        let mut cmd = Command::new("bwrap");
+        let mut cmd = match &self.cgroup {
+            Some(_) => {
+                let bwrap = find_on_path("bwrap")
+                    .ok_or_else(|| Error::Sandbox("bubblewrap (bwrap) is not installed".into()))?;
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", CGROUP_JOIN_SCRIPT, "ward-launch-cgroup-join"])
+                    .arg(bwrap);
+                cmd
+            }
+            None => Command::new("bwrap"),
+        };
         cmd.args(self.args(&worktree));
         let admitted = admit()?;
         let start = Instant::now();
@@ -688,7 +717,20 @@ impl Launch {
         if self.stdio == StdioMode::Capture {
             cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         }
-        let spawned = cmd.spawn().map_err(launch_err);
+        let spawned = cmd
+            .spawn()
+            .map_err(launch_err)
+            .and_then(|mut child| match &self.cgroup {
+                Some(dir) => match join_cgroup(&child, dir) {
+                    Ok(()) => Ok(child),
+                    Err(error) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        Err(error)
+                    }
+                },
+                None => Ok(child),
+            });
         drop(admitted);
         let mut child = spawned?;
         let bound = self.capture_bytes;
@@ -708,6 +750,56 @@ impl Launch {
             reaped: false,
         })
     }
+}
+
+/// The host shell a cgroup launch runs first: it stops itself until its parent has moved
+/// it into the cgroup, then becomes `bwrap` (`$0` is a label, `"$@"` is `bwrap` and its
+/// arguments).
+const CGROUP_JOIN_SCRIPT: &str = "kill -STOP $$ && exec \"$@\"";
+
+/// How long a cgroup launch waits for the shell to stop itself before giving up.
+const CGROUP_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Move the stopped launch shell `child` into the cgroup `dir` and continue it.
+fn join_cgroup(child: &Child, dir: &Path) -> Result<()> {
+    let refused = |what: String| Error::Sandbox(format!("cgroup {}: {what}", dir.display()));
+    let pid = child.id();
+    let deadline = Instant::now() + CGROUP_JOIN_TIMEOUT;
+    loop {
+        match process_state(pid) {
+            Some('T') => break,
+            Some(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(1)),
+            _ => return Err(refused("the launch did not stop to be moved".into())),
+        }
+    }
+    let procs = dir.join("cgroup.procs");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&procs)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, pid.to_string().as_bytes()))
+        .map_err(|error| refused(format!("cannot move the launch into it: {error}")))?;
+    let pid = i32::try_from(pid).map_err(|_| refused("pid out of range".into()))?;
+    nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), nix::sys::signal::SIGCONT)
+        .map_err(|error| refused(format!("cannot continue the launch: {error}")))
+}
+
+/// The one-letter state `/proc/<pid>/stat` reports, after the parenthesised command name.
+fn process_state(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
+
+/// The first executable regular file named `program` in a directory of the host `PATH`.
+fn find_on_path(program: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|dir| dir.join(program))
+        .find(|path| {
+            std::fs::metadata(path)
+                .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+        })
 }
 
 /// A single child stream captured within a memory budget.
@@ -1338,5 +1430,70 @@ mod tests {
             .unwrap();
         assert!(none.stdout_raw_head.is_empty(), "no raw head unless asked");
         assert_eq!(none.stdout.trim(), "hi");
+    }
+
+    /// A stand-in for a cgroup directory: a plain directory whose `cgroup.procs` records
+    /// what the launch writes to it, which is exactly the pid the kernel would move.
+    fn fake_cgroup(dir: &Path) -> PathBuf {
+        let cgroup = dir.join("cgroup");
+        std::fs::create_dir(&cgroup).unwrap();
+        std::fs::write(cgroup.join("cgroup.procs"), b"").unwrap();
+        cgroup
+    }
+
+    #[test]
+    fn a_cgroup_launch_moves_the_sandbox_into_its_cgroup_before_bwrap_runs() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let cgroup = fake_cgroup(dir.path());
+        let running = Launch::new(
+            &work,
+            vec!["sh".into(), "-c".into(), "echo ran > ran".into()],
+        )
+        .cgroup(&cgroup)
+        .spawn()
+        .unwrap();
+        let pid = running.id();
+        let outcome = running.wait().unwrap();
+        assert_eq!(outcome.code, Some(0), "{}", outcome.stderr);
+        assert_eq!(
+            std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap(),
+            pid.to_string(),
+            "the launch's own pid, which bwrap and every process of the sandbox inherit"
+        );
+        assert_eq!(std::fs::read_to_string(work.join("ran")).unwrap(), "ran\n");
+    }
+
+    #[test]
+    fn a_cgroup_that_cannot_be_joined_refuses_the_launch_with_nothing_run() {
+        if !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        for broken in ["missing", "directory"] {
+            let cgroup = dir.path().join(broken);
+            std::fs::create_dir(&cgroup).unwrap();
+            if broken == "directory" {
+                std::fs::create_dir(cgroup.join("cgroup.procs")).unwrap();
+            }
+            let refused = Launch::new(
+                &work,
+                vec!["sh".into(), "-c".into(), "echo ran > ran".into()],
+            )
+            .cgroup(&cgroup)
+            .spawn();
+            assert!(
+                matches!(&refused, Err(Error::Sandbox(message)) if message.contains("cgroup")),
+                "{broken}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!work.join("ran").exists(), "nothing ran outside its cgroup");
     }
 }

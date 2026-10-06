@@ -276,9 +276,10 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   node-integration.md §6.5). `ward replay --verify` verifies either, and `ward replay
   --json` summarises the node records (`crates/ward-cli/src/replay.rs`,
   `a_node_attempt_evidence_log_verifies_and_summarises`).
-- **The node's records are additive.** The seven `NodeAttempt*` kinds are appended at the
+- **The node's records are additive.** The eight `NodeAttempt*` kinds are appended at the
   end of the catalogue (the six of admission, launch, intervention, end, recovery and
-  seal, then `NodeAttemptOutputCollected` for a returned result), and `node` is the eighth
+  seal, then `NodeAttemptOutputCollected` for a returned result and
+  `NodeAttemptResourceUsage` for what an attempt run in a cgroup used), and `node` is the eighth
   origin, under the append-only rule of event-model.md §3.1. Adding them changed how no
   earlier record encodes, so every session log sealed by an earlier release still
   verifies under the current `ward`. An attempt with egress also carries the session

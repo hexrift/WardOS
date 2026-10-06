@@ -149,7 +149,8 @@ their state, receipt and applied operation ids (#332 slice 7).
   does not bind to the evidence head, a manually bootstrapped trust store, same-uid
   co-location of client and node unless the operator lists the client uids the socket
   serves (a peer-credential check, the first local slice of #262), and no resource limit
-  beyond the wall-clock budget.
+  beyond the wall-clock budget unless the operator delegated a cgroup (the first
+  single-node slice of #260, below).
   Each gap, its impact for a control plane, the mitigation available today and the
   issue that closes it is a row of
   [node-security-limitations.md](../node-security-limitations.md) §3.
@@ -273,6 +274,29 @@ TDD slices without guessing at semantics inside a feature PR.
     it, refusing to record a run as complete when the answer is lost. Deferred: a
     workspace export as a content-addressed snapshot (`snapshots.read`, `snapshots.diff`)
     and streamed output.
+
+Consequence of #260's first single-node slice (an amendment by consequence, not a new
+step of this decision; ownership, admission and the state machine are unchanged): the
+node's ownership of what it admits extends to the resources the workload may use and to
+how many workloads run at once, both opt-in and both fail-closed. The manifest grammar
+gains an optional `resources` grant (`cpu_millis`, `memory_bytes`, `pids`), honoured only
+on a node started with `--cgroup-root` (a cgroup v2 directory delegated to it), only for
+controllers the node enabled there and within the host's ceilings, otherwise
+`unsupported_grant`: a node never runs a workload with fewer limits than its manifest
+asked for. Such a node runs every attempt in a cgroup of its own, joined before `bwrap`
+runs, and records what each attempt used (`NodeAttemptResourceUsage`, appended at the end
+of the event catalogue, and the task record's `usage`). A node started with
+`--max-running` executes at most that many attempts and refuses a `start` past it, or
+below a memory or disk headroom floor, `capacity_exhausted`, with the task still `ready`:
+the refusal is chosen over a node-side queue because a queued `start` would need a new
+lifecycle state an earlier 1.3 decoder refuses, a re-check of the envelope's validity at
+dequeue and an asynchronous report of a launch that fails later, while a refusal leaves
+the state machine of §6 exactly as it is and the queue where the retries already are, in
+the control plane. All of it is additive within 1.3, for the same reason as steps 12 and
+13, and a node without the new flags behaves and answers exactly as before. Deferred to
+the rest of #260: disk and I/O limits, reservations and CPU oversubscription policy, a
+node-side queue with priority and fairness, a separate bound for verifier workloads, and
+a delegated cgroup in CI.
 
 Steps 1–9, 12 and 13 are written down as the external contract in
 [node-integration.md](../node-integration.md); step 10 is its acceptance,
