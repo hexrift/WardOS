@@ -1537,7 +1537,10 @@ control-plane side in plain Node.js (>= 22, no dependencies): ids and their deri
 from a control plane's own ids (§7.2), the issuer key and proof with `node:crypto` (§2.3,
 §7.4, reproduced byte for byte in its tests), the envelope (§7), a durable per-task
 version (§7.3, §10), the adapter conversation of §11.4 with cancellation, replay and
-the outcome mapping, and result return (§6.6, §7.5) with every returned digest verified;
+the outcome mapping, result return (§6.6, §7.5) with every returned digest verified,
+and the action channel (§6.7, §7.5): the `actions` grant within the ceilings, `actions`
+and `answer`, and an answer loop on a second adapter beside the `run` whose answers take
+their operation ids from the run's scheme and are recorded before they are sent;
 `scripts/acceptance/node-js.sh` proves it against a real node. It
 is the worked example for [node-integration-from-nodejs.md](node-integration-from-nodejs.md).
 

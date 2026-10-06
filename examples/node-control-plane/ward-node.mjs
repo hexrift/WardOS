@@ -2,8 +2,9 @@
 // dependencies). It is the control-plane side of docs/node-integration.md as a Node.js or
 // TypeScript control plane would write it: ids (§7.2), the issuer key and its proof
 // (§2.3, §7.4), the admission envelope (§7), the per-task version (§7.3, §10), and the
-// JSON-lines conversation with `ward-node-adapter` (§11.4). The walk through it for an
-// adapter author is docs/node-integration-from-nodejs.md.
+// JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6) and the
+// action channel (§6.7). The walk through it for an adapter author is
+// docs/node-integration-from-nodejs.md.
 //
 // Everything here fails closed: an id, hex value, grant or bound outside the contract is
 // refused before anything is signed or sent, an `unknown` outcome is never certain, and
@@ -45,6 +46,20 @@ export const ID_PREFIXES = Object.freeze(["task", "exec", "lease", "agent", "nod
  */
 export const OUTPUT_CEILINGS = Object.freeze({ stdioBytes: 1_048_576, filesBytes: 8_388_608, files: 64, pathBytes: 255 });
 
+/** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
+export const ACTION_KINDS = Object.freeze(["approval", "decision"]);
+
+/**
+ * What a node started with `--action-channel` honours of an `actions` grant (§7.5): at
+ * most 8 requests waiting at once, 64 in the attempt's lifetime, 3600 seconds each. A
+ * grant above these is refused `unsupported_grant` by every node, so the client refuses it
+ * before signing.
+ */
+export const ACTION_CEILINGS = Object.freeze({ maxPending: 8, maxTotal: 64, waitSecs: 3600 });
+
+/** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
+export const ANSWER_DECISIONS = Object.freeze(["approved", "denied"]);
+
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const ID_BODY = /^[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 const HEX_32 = /^[0-9a-f]{64}$/;
@@ -54,6 +69,27 @@ const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 const OUTPUT_SKIPS = Object.freeze(["missing", "not_a_regular_file", "too_large"]);
+const LIFECYCLE_STATES = Object.freeze(["created", "ready", "running", "paused", "exited", "stopped", "revoked", "sealed"]);
+const LIVE_STATES = Object.freeze(["running", "paused"]);
+const ENDED_STATES = Object.freeze(["exited", "stopped", "revoked", "sealed"]);
+const ACTION_ID = /^[A-Za-z0-9._:-]{1,64}$/;
+const MAX_ACTION_SUMMARY_BYTES = 512;
+const MAX_ACTION_DETAIL_BYTES = 16384;
+const MAX_ACTION_NOTE_BYTES = 512;
+const MAX_ACTION_NUMBER = 4_294_967_295;
+// The reasons `actions` and `answer` are refused with (§6.7); anything else is not this contract.
+const ACTIONS_REFUSALS = Object.freeze(["task_not_found", "attempt_mismatch", "lease_mismatch", "unsupported_operation", "resource_unavailable"]);
+const ANSWER_REFUSALS = Object.freeze([
+  ...ACTIONS_REFUSALS,
+  "invalid_state",
+  "unknown_request",
+  "already_answered",
+  "stale_operation",
+]);
+// Operation ids past the scheme's six verbs: `pause` and `resume` count up from start + 6,
+// at most 128 of each per attempt (§6.3), so answers start at start + 6 + 256, one per
+// request number (at most 64, the ceiling of `max_total`).
+const INTERVENTION_IDS = 256;
 const MAX_ENVELOPE_BYTES = 32768;
 const MAX_ARGV_ENTRY_BYTES = 4096;
 const MAX_ARGV_BYTES = 16384;
@@ -223,22 +259,64 @@ export function outputGrant({ stdioBytes, files, filesBytes }) {
   return checkOutputGrant({ stdio_bytes: stdioBytes, files, files_bytes: filesBytes });
 }
 
+function checkActionBound(value, name, ceiling) {
+  if (!Number.isSafeInteger(value) || value < 1) refuse(`actions grant \`${name}\` is an integer >= 1`);
+  if (value > ceiling) refuse(`actions grant \`${name}\` ${value} is above the ${ceiling} every node refuses as unsupported_grant`);
+  return value;
+}
+
+/** The `actions` grant of ADR-0031 §2 in wire spelling, refused outside the grammar or above the ceilings. */
+function checkActionsGrant(actions) {
+  if (actions === null || typeof actions !== "object" || Array.isArray(actions)) refuse("manifest `actions` is one object");
+  if (Object.keys(actions).sort().join() !== "kinds,max_pending,max_total,wait_secs") {
+    refuse("manifest `actions` has exactly the fields kinds, max_pending, max_total, wait_secs");
+  }
+  const { kinds } = actions;
+  if (!Array.isArray(kinds) || kinds.length < 1 || kinds.length > ACTION_KINDS.length) {
+    refuse(`actions grant \`kinds\` lists 1 to ${ACTION_KINDS.length} of ${ACTION_KINDS.join(", ")}`);
+  }
+  for (const kind of kinds) {
+    if (!ACTION_KINDS.includes(kind)) refuse(`actions grant kind ${JSON.stringify(kind)} is not one of ${ACTION_KINDS.join(", ")}`);
+  }
+  if (new Set(kinds).size !== kinds.length) refuse("actions grant `kinds` repeats a kind");
+  const grant = {
+    kinds: [...kinds],
+    max_pending: checkActionBound(actions.max_pending, "max_pending", ACTION_CEILINGS.maxPending),
+    max_total: checkActionBound(actions.max_total, "max_total", ACTION_CEILINGS.maxTotal),
+    wait_secs: checkActionBound(actions.wait_secs, "wait_secs", ACTION_CEILINGS.waitSecs),
+  };
+  if (grant.max_pending > grant.max_total) refuse(`actions grant max_pending ${grant.max_pending} is above max_total ${grant.max_total}`);
+  return grant;
+}
+
+/**
+ * The §7.5 `actions` grant in wire spelling from the control plane's words: the `kinds`
+ * the workload may send, at most `maxPending` waiting at once and `maxTotal` in the
+ * attempt's lifetime, each answered `expired` after `waitSecs`. Refused outside ADR-0031's
+ * grammar or above the node's ceilings (`ACTION_CEILINGS`).
+ */
+export function actionsGrant({ kinds, maxPending, maxTotal, waitSecs }) {
+  return checkActionsGrant({ kinds, max_pending: maxPending, max_total: maxTotal, wait_secs: waitSecs });
+}
+
 /** The manifest in canonical key order, refusing anything outside the §7.5 grammar. */
 function checkManifest(object) {
   if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
   const keys = Object.keys(object);
-  if (!keys.includes("network") || keys.some((key) => key !== "network" && key !== "output")) {
-    refuse("a manifest has the field `network` and optionally `output`, nothing else");
+  if (!keys.includes("network") || keys.some((key) => key !== "network" && key !== "output" && key !== "actions")) {
+    refuse("a manifest has the field `network` and optionally `output` and `actions`, nothing else");
   }
   const canonical = { network: checkNetwork(object.network) };
   if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
+  if (keys.includes("actions")) canonical.actions = checkActionsGrant(object.actions);
   return canonical;
 }
 
 /**
  * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
- * The bytes are compact JSON with `network` first and `output`, when granted, second,
- * whatever order the caller wrote the fields in, so one grant has one signed spelling.
+ * The bytes are compact JSON with `network` first, then `output` and `actions` when
+ * granted, whatever order the caller wrote the fields in, so one grant has one signed
+ * spelling.
  */
 export function manifest(object = OFFLINE_MANIFEST) {
   const bytes = Buffer.from(JSON.stringify(checkManifest(object)), "utf8");
@@ -252,6 +330,19 @@ export function manifest(object = OFFLINE_MANIFEST) {
  * of a signed run or a run record) and reads the manifest from its exact bytes.
  */
 export function outputGrantOf(envelopeJson) {
+  return manifestOf(envelopeJson).output ?? null;
+}
+
+/**
+ * The `actions` grant a signed envelope's manifest carries (wire spelling), or `null`
+ * without one: the channel a run of it has, and what its listings are held to.
+ */
+export function actionsGrantOf(envelopeJson) {
+  return manifestOf(envelopeJson).actions ?? null;
+}
+
+/** The checked manifest of a serialised envelope, read from its exact bytes. */
+function manifestOf(envelopeJson) {
   if (typeof envelopeJson !== "string") refuse("envelope_json is the serialised envelope");
   let envelope;
   try {
@@ -267,7 +358,7 @@ export function outputGrantOf(envelopeJson) {
   } catch {
     refuse("the envelope's manifest is not JSON");
   }
-  return checkManifest(object).output ?? null;
+  return checkManifest(object);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -636,10 +727,38 @@ export class VersionStore {
 // Run records, for replay after a control-plane restart (§6.3, §11.2)
 // ---------------------------------------------------------------------------------------
 
-/** The operation-id scheme of §11.2 shifted to start at `startAt`. */
+/**
+ * The operation-id scheme of §11.2 shifted to start at `startAt`: `create` to `seal` are
+ * `startAt` to `startAt + 5`, `pause` and `resume` count up from `startAt + 6` (at most 128
+ * of each, §6.3), and `first_answer` (`startAt + 262`) is the id of the answer to request 1
+ * of the action channel, `answerOperationId` the one for request N.
+ */
 export function operationIds(startAt = 1) {
   if (!Number.isSafeInteger(startAt) || startAt < 1) refuse("operation ids start at an integer >= 1");
-  return { start_at: startAt, create: startAt, admit: startAt + 1, start: startAt + 2, stop: startAt + 3, revoke: startAt + 4, seal: startAt + 5 };
+  return {
+    start_at: startAt,
+    create: startAt,
+    admit: startAt + 1,
+    start: startAt + 2,
+    stop: startAt + 3,
+    revoke: startAt + 4,
+    seal: startAt + 5,
+    first_answer: startAt + 6 + INTERVENTION_IDS,
+  };
+}
+
+/**
+ * The operation id of the answer to the node's request number `request` (1 to 64) under a
+ * scheme (`operationIds(N)` or a run record's `{start_at: N}`): one id per request, so a
+ * replay of an answer is the same operation and the node applies it at most once (§6.7).
+ */
+export function answerOperationId(ids, request) {
+  const startAt = ids?.start_at;
+  if (!Number.isSafeInteger(startAt) || startAt < 1) refuse("an operation-id scheme has start_at, an integer >= 1");
+  if (!Number.isSafeInteger(request) || request < 1 || request > ACTION_CEILINGS.maxTotal) {
+    refuse(`a request number is an integer from 1 to ${ACTION_CEILINGS.maxTotal}, got ${JSON.stringify(request)}`);
+  }
+  return operationIds(startAt).first_answer + request - 1;
 }
 
 /**
@@ -659,7 +778,48 @@ export function loadRunRecord(dir, attempt) {
   if (record.format !== 1 || typeof record.envelope_json !== "string" || typeof record.proof?.signature !== "string") {
     refuse(`the run record of ${attempt} is not one this client wrote`);
   }
+  if (record.answers !== undefined && !Array.isArray(record.answers)) refuse(`the run record of ${attempt} holds answers that are not a list`);
   return record;
+}
+
+function checkNote(note) {
+  if (note === undefined || note === null) return undefined;
+  if (typeof note !== "string" || Buffer.byteLength(note, "utf8") > MAX_ACTION_NOTE_BYTES) {
+    refuse(`an answer's note is a string of at most ${MAX_ACTION_NOTE_BYTES} bytes`);
+  }
+  return note;
+}
+
+function checkDecision(decision) {
+  if (!ANSWER_DECISIONS.includes(decision)) refuse(`an answer's decision is approved or denied, got ${JSON.stringify(decision)}`);
+  return decision;
+}
+
+/**
+ * Record an answer to the node's request number `request` in the run record of `attempt`
+ * under `dir`, durably, before it is sent: {request, id, kind, decision, note?,
+ * operation_id}, where `operation_id` must be the scheme's id for the request
+ * (`answerOperationId`). A request already answered in the record keeps its first answer:
+ * that one is returned and nothing is written, so a restarted control plane sends the
+ * answer it recorded, under the same id, and never a second one.
+ */
+export function recordAnswer(dir, attempt, { request, id, kind, decision, note, operation_id: operationId }) {
+  const record = loadRunRecord(dir, attempt);
+  const recorded = (record.answers ?? []).find((answer) => answer.request === request);
+  if (recorded) return recorded;
+  checkDecision(decision);
+  const expected = answerOperationId(record.operation_ids, request);
+  if (operationId !== expected) refuse(`the answer to request ${request} takes operation id ${expected} of the record's scheme, not ${operationId}`);
+  const entry = { request };
+  if (id !== undefined) entry.id = id;
+  if (kind !== undefined) entry.kind = kind;
+  entry.decision = decision;
+  if (checkNote(note) !== undefined) entry.note = note;
+  entry.operation_id = operationId;
+  const { format, ...rest } = record;
+  void format;
+  saveRunRecord(dir, { ...rest, answers: [...(record.answers ?? []), entry] });
+  return entry;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -689,6 +849,8 @@ export class Adapter {
     this.#trace = trace;
     this.#child = spawn(executable, args, { stdio: ["pipe", "pipe", "inherit"], env });
     this.#child.on("error", (error) => this.#push({ error }));
+    // A write to an adapter that has exited fails with EPIPE; its exit is reported as `eof`.
+    this.#child.stdin.on("error", () => {});
     this.#child.on("exit", (code, signal) => {
       this.#exit = { code, signal };
       this.#push({ eof: true });
@@ -807,6 +969,155 @@ export class Adapter {
     }
   }
 
+  /**
+   * `actions` for the binding (§6.7): {state, pending} with every pending request held to
+   * the contract (`decodeActions`), oldest first, or a rejection {rejected: reason}. Read-only
+   * and without an operation id; ask it from an adapter that is not running the attempt.
+   */
+  async actions(binding) {
+    checkBinding(binding);
+    const event = await this.#one({ cmd: "actions", binding }, ["actions", "rejected"]);
+    if (event.event === "rejected") return { rejected: checkRefusal(event, "actions", null, ACTIONS_REFUSALS) };
+    return decodeActions({ state: event.state, pending: event.pending });
+  }
+
+  /**
+   * `answer` the node's request number `request` of the binding (§6.7) with `decision`
+   * (`approved` or `denied`) under `operationId`, with an optional `note` (at most 512
+   * bytes) relayed to the workload. Resolves with {result: "answered", request, decision,
+   * operation_id}, or {result: "rejected", reason, operation_id} with one of the §6.7
+   * reasons (`already_answered`, `unknown_request`, `invalid_state`, `stale_operation`,
+   * `resource_unavailable`, …). Replaying the same id with the same answer is answered
+   * again and applies nothing (take the id from `answerOperationId`). An answer that names
+   * another request, decision or operation id than the one sent is refused.
+   */
+  async answer(binding, request, decision, operationId, note) {
+    checkBinding(binding);
+    if (!Number.isSafeInteger(request) || request < 1 || request > MAX_ACTION_NUMBER) {
+      refuse(`the request number is an integer from 1 to ${MAX_ACTION_NUMBER}, got ${JSON.stringify(request)}`);
+    }
+    checkDecision(decision);
+    if (!Number.isSafeInteger(operationId) || operationId < 1) refuse(`an answer's operation id is an integer >= 1, got ${JSON.stringify(operationId)}`);
+    const command = { cmd: "answer", binding, request, decision, operation_id: operationId };
+    if (checkNote(note) !== undefined) command.note = note;
+    const event = await this.#one(command, ["answered", "rejected"]);
+    if (event.event === "rejected") {
+      return { result: "rejected", reason: checkRefusal(event, "answer", operationId, ANSWER_REFUSALS), operation_id: operationId };
+    }
+    if (event.operation_id !== operationId) refuse(`the adapter answered operation ${event.operation_id}, not ${operationId}`);
+    if (event.request !== request) refuse(`the adapter answered request ${event.request}, not request ${request}`);
+    if (event.decision !== decision) refuse(`the adapter answered decision ${event.decision}, not ${decision}`);
+    return { result: "answered", request, decision, operation_id: operationId };
+  }
+
+  /**
+   * Answer the binding's action-channel requests by `policy` until the attempt ends: poll
+   * `actions` every `pollMs` (default 250), and for each pending request not yet answered
+   * ask `policy(request, {signal})` once, which returns `"approved"`, `"denied"`,
+   * `{decision, note}`, or `null` to leave the request to someone else (it then expires).
+   * Run it on a second adapter while the first one's `run` blocks (§11.4).
+   *
+   * With `runDir` (the directory of `saveRunRecord`) the answers take their operation ids
+   * from the record's scheme (`answerOperationId`) and each is written to the record
+   * (`recordAnswer`) before it is sent; a request the record already answered is sent that
+   * answer again, under the same id, and the policy is not asked. So a control plane that
+   * restarts mid-answer replays rather than answers twice. Without `runDir`, `operationIds`
+   * gives the scheme and answers live in memory only.
+   *
+   * Refusals: `resource_unavailable` is retried at the next poll with the same id and
+   * answer; `already_answered` (expired, cancelled or answered elsewhere), `stale_operation`,
+   * `unknown_request` and `invalid_state` are final for the request. Before the attempt
+   * exists (`task_not_found`, `attempt_mismatch` until the run's `create`) the loop waits;
+   * a listing outside the contract or the record's grant, or a node that cannot serve the
+   * channel, is refused. Resolves with {state, answers} once a listing reads an ended state
+   * (`exited`, `stopped`, `revoked`, `sealed`), or with state `null` when `signal` aborts;
+   * `answers` holds every answer sent and how the node took it, also reported to
+   * `onAnswer`, and each request is reported to `onRequest` when first seen.
+   */
+  async answerLoop(binding, policy, { pollMs = 250, signal, runDir, operationIds: ids, grant, onRequest, onAnswer } = {}) {
+    checkBinding(binding);
+    if (typeof policy !== "function") refuse("the answer policy is a function");
+    if (!Number.isSafeInteger(pollMs) || pollMs < 1) refuse("pollMs is an integer >= 1");
+    let scheme = ids;
+    let held = grant ?? null;
+    if (runDir !== undefined) {
+      const record = loadRunRecord(runDir, binding.attempt);
+      if (["task", "attempt", "lease"].some((key) => record.binding?.[key] !== binding[key])) refuse("the run record is not this binding's");
+      scheme = record.operation_ids;
+      if (grant === undefined) held = actionsGrantOf(record.envelope_json);
+    } else if (scheme === undefined) {
+      refuse("the answer loop needs runDir or operationIds: its answers take their operation ids from a scheme");
+    }
+    if (held !== null) held = checkActionsGrant(held);
+    answerOperationId(scheme, 1); // refuses a scheme without a valid start_at before anything is sent
+    const inMemory = new Map();
+    const recorded = (request) =>
+      runDir !== undefined ? (loadRunRecord(runDir, binding.attempt).answers ?? []).find((answer) => answer.request === request) : inMemory.get(request);
+    const settled = new Set();
+    const seen = new Set();
+    const answers = [];
+    let exists = false;
+    while (!signal?.aborted) {
+      const listed = await this.actions(binding);
+      if (listed.rejected !== undefined) {
+        const absent = listed.rejected === "task_not_found" || listed.rejected === "attempt_mismatch";
+        if (absent && exists) return { state: null, answers };
+        if (!absent && listed.rejected !== "resource_unavailable") refuse(`the node refused actions: ${listed.rejected}`);
+        await pause(pollMs, signal);
+        continue;
+      }
+      exists = true;
+      const listing = decodeActions(listed, held);
+      if (ENDED_STATES.includes(listing.state)) return { state: listing.state, answers };
+      for (const request of listing.pending) {
+        if (signal?.aborted) break;
+        if (settled.has(request.action)) continue;
+        if (!seen.has(request.action)) {
+          seen.add(request.action);
+          if (onRequest) onRequest(request);
+        }
+        let entry = recorded(request.action);
+        const replayed = entry !== undefined;
+        if (replayed && entry.id !== undefined && entry.id !== request.id) {
+          refuse(`request ${request.action} is ${request.id} on the node but ${entry.id} in the record; refusing to answer it`);
+        }
+        if (!replayed) {
+          const verdict = verdictOf(await policy(request, { signal }));
+          if (signal?.aborted) break;
+          if (verdict === null) {
+            settled.add(request.action);
+            continue;
+          }
+          const candidate = { request: request.action, id: request.id, kind: request.kind, ...verdict, operation_id: answerOperationId(scheme, request.action) };
+          if (runDir !== undefined) {
+            entry = recordAnswer(runDir, binding.attempt, candidate);
+          } else {
+            entry = candidate;
+            inMemory.set(request.action, entry);
+          }
+        }
+        const answered = await this.answer(binding, entry.request, entry.decision, entry.operation_id, entry.note);
+        const outcome = {
+          request: request.action,
+          id: request.id,
+          kind: request.kind,
+          summary: request.summary,
+          decision: entry.decision,
+          ...(entry.note === undefined ? {} : { note: entry.note }),
+          operation_id: entry.operation_id,
+          result: answered.result,
+          ...(answered.reason === undefined ? {} : { reason: answered.reason }),
+          replayed,
+        };
+        answers.push(outcome);
+        if (onAnswer) onAnswer(outcome);
+        if (answered.reason !== "resource_unavailable") settled.add(request.action);
+      }
+      await pause(pollMs, signal);
+    }
+    return { state: null, answers };
+  }
+
   /** Cancel the attempt this adapter is running: the adapter revokes, seals and writes `done`. */
   cancel() {
     if (this.#exit === null) this.#child.kill("SIGTERM");
@@ -821,6 +1132,103 @@ export class Adapter {
     }
     return this.#exit.code ?? 1;
   }
+}
+
+function checkBinding(binding) {
+  if (binding === null || typeof binding !== "object") refuse("binding is {task, attempt, lease}");
+  requireId(binding.task, "task", "binding.task");
+  requireId(binding.attempt, "exec", "binding.attempt");
+  requireId(binding.lease, "lease", "binding.lease");
+}
+
+/** The reason of a `rejected` event for `verb`, refusing one that is not this verb's or not in `reasons`. */
+function checkRefusal(event, verb, operationId, reasons) {
+  if (event.verb !== verb) refuse(`a rejected ${verb} names verb ${event.verb}`);
+  if (event.operation_id !== operationId) refuse(`a rejected ${verb} names operation ${event.operation_id}, not ${operationId}`);
+  if (!reasons.includes(event.reason)) refuse(`a rejected ${verb} gives reason ${JSON.stringify(event.reason)}, which is not one of ${reasons.join(", ")}`);
+  return event.reason;
+}
+
+/** A policy's verdict as {decision, note?}, or `null` for no answer. */
+function verdictOf(verdict) {
+  if (verdict === null || verdict === undefined) return null;
+  if (typeof verdict === "string") return { decision: checkDecision(verdict) };
+  if (typeof verdict !== "object" || Array.isArray(verdict)) refuse("a policy returns approved, denied, {decision, note} or null");
+  const note = checkNote(verdict.note);
+  return note === undefined ? { decision: checkDecision(verdict.decision) } : { decision: checkDecision(verdict.decision), note };
+}
+
+/** Wait `ms`, or less when `signal` aborts. Polling, never synchronisation: the loop re-reads the node. */
+function pause(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve();
+      return;
+    }
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
+}
+
+// ---------------------------------------------------------------------------------------
+// The action channel's listing (§6.7)
+// ---------------------------------------------------------------------------------------
+
+function textBytes(value, what, min, max) {
+  if (typeof value !== "string") refuse(`${what} is a string`);
+  const bytes = Buffer.byteLength(value, "utf8");
+  if (bytes < min || bytes > max) refuse(`${what} is ${min} to ${max} bytes, got ${bytes}`);
+  return value;
+}
+
+/**
+ * Decode an `actions` answer (§6.7): {state, pending}, each pending request {action, id,
+ * kind, summary, detail, expires_in_ms} within the channel's bounds, oldest first (strictly
+ * increasing `action`), ids unique, at most 8, and none unless the attempt is `running` or
+ * `paused`. With the `grant` the attempt was admitted under (`actionsGrantOf`), also held to
+ * it: only granted kinds, at most `max_pending`, numbers up to `max_total`, and no wait
+ * longer than `wait_secs`. A listing outside these is refused, not acted on.
+ */
+export function decodeActions(listing, grant = null) {
+  if (listing === null || typeof listing !== "object" || Array.isArray(listing)) refuse("a listing is {state, pending}");
+  if (!LIFECYCLE_STATES.includes(listing.state)) refuse(`a listing's state ${JSON.stringify(listing.state)} is not a lifecycle state`);
+  if (!Array.isArray(listing.pending)) refuse("a listing's pending is a list");
+  const held = grant === null || grant === undefined ? null : checkActionsGrant(grant);
+  const limit = held ? held.max_pending : ACTION_CEILINGS.maxPending;
+  if (listing.pending.length > limit) {
+    refuse(`a listing holds at most ${limit} pending requests (${held ? "the grant's max_pending" : "the node's ceiling"}), got ${listing.pending.length}`);
+  }
+  if (listing.pending.length > 0 && !LIVE_STATES.includes(listing.state)) {
+    refuse(`only a running or paused attempt has pending requests; this one is ${listing.state}`);
+  }
+  const ids = new Set();
+  let previous = 0;
+  const pending = listing.pending.map((entry) => {
+    if (entry === null || typeof entry !== "object" || Object.keys(entry).sort().join() !== "action,detail,expires_in_ms,id,kind,summary") {
+      refuse("a pending request is {action, id, kind, summary, detail, expires_in_ms}");
+    }
+    const { action } = entry;
+    if (!Number.isSafeInteger(action) || action < 1 || action > MAX_ACTION_NUMBER) refuse(`a pending request's action is an integer from 1 to ${MAX_ACTION_NUMBER}`);
+    if (action <= previous) refuse("pending requests are listed oldest first, by strictly increasing action");
+    previous = action;
+    if (held && action > held.max_total) refuse(`request ${action} is above the grant's max_total ${held.max_total}`);
+    if (typeof entry.id !== "string" || !ACTION_ID.test(entry.id)) refuse(`request ${action}'s id ${JSON.stringify(entry.id)} is not 1-64 bytes of A-Z a-z 0-9 . _ : -`);
+    if (ids.has(entry.id)) refuse(`the listing repeats the id ${entry.id}`);
+    ids.add(entry.id);
+    if (!ACTION_KINDS.includes(entry.kind)) refuse(`request ${action}'s kind ${JSON.stringify(entry.kind)} is not one of ${ACTION_KINDS.join(", ")}`);
+    if (held && !held.kinds.includes(entry.kind)) refuse(`request ${action}'s kind ${entry.kind} is not granted (${held.kinds.join(", ")})`);
+    textBytes(entry.summary, `request ${action}'s summary`, 1, MAX_ACTION_SUMMARY_BYTES);
+    textBytes(entry.detail, `request ${action}'s detail`, 0, MAX_ACTION_DETAIL_BYTES);
+    if (!Number.isSafeInteger(entry.expires_in_ms) || entry.expires_in_ms < 0) refuse(`request ${action}'s expires_in_ms is an integer >= 0`);
+    if (held && entry.expires_in_ms > held.wait_secs * 1000) refuse(`request ${action} expires in ${entry.expires_in_ms} ms, longer than the grant's wait_secs ${held.wait_secs}`);
+    return { action, id: entry.id, kind: entry.kind, summary: entry.summary, detail: entry.detail, expires_in_ms: entry.expires_in_ms };
+  });
+  return { state: listing.state, pending };
 }
 
 // ---------------------------------------------------------------------------------------

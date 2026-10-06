@@ -6,8 +6,9 @@ TypeScript — concretely, the worker execution boundary of
 that wants `ward-node` to run its bounded workloads. It says what to install, what to
 keep where, how to derive the ids and the version, how to build and sign the envelope with
 `node:crypto`, how to spawn `ward-node-adapter` and speak its JSON lines, how to read the
-outcome, how to ask for and read back a bounded result, how to cancel and how to recover
-after a restart on either side. Every rule
+outcome, how to ask for and read back a bounded result, how to grant the action channel
+and answer the workload's requests while it runs, how to cancel and how to recover after
+a restart on either side. Every rule
 here is the contract's, [node-integration.md](node-integration.md), cited by section;
 nothing here adds to it. The reference implementation of everything below is
 [`examples/node-control-plane`](../examples/node-control-plane/README.md): a
@@ -21,7 +22,8 @@ The shape of the integration is the one of node-integration.md §11.5: the contr
 keeps its agent loop and its authority on its own side, and hands the node one bounded,
 offline action at a time — an `argv` over a snapshot with a wall-clock budget — reading
 back the receipt, the bounded output the manifest declared (§7.1 below) and, on the host, the
-evidence log. What the node cannot do yet for
+evidence log, and answering on its own side the approvals and decisions the workload asks
+for through the action channel (§7.2 below). What the node cannot do yet for
 such a control plane is §11 below; read it before deciding which actions go through the
 node.
 
@@ -67,7 +69,9 @@ $ node examples/node-control-plane/control-plane.mjs capabilities --socket /run/
 
 `lifecycle.start` must be `true` (§5). For result return (§7.1 below) start the node with
 `--output-return` as well; its document then also carries
-`"output":{"stdio":true,"files":true}`.
+`"output":{"stdio":true,"files":true}`. For the action channel (§7.2 below) start it with
+`--action-channel`; its document then carries
+`"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}`.
 
 ## 2. Key custody
 
@@ -217,8 +221,8 @@ const signed = signEnvelope(issuer, envelope);    // { envelope_json, proof, bin
 or lower-case id, a lease that is not the binding's lease or task or whose subject is not
 `agent`, an empty or oversized `argv`, a NUL, unsorted or duplicate grants, a budget below
 1, a snapshot that is not 64 lowercase hex digits, `expires_at <= issued_at`, a version
-below 1, a manifest outside §7.5's grammar or with an `output` grant above the node's
-ceilings (§7.1 below), or an envelope over 32 KiB. It writes the keys
+below 1, a manifest outside §7.5's grammar or with an `output` or `actions` grant above
+the node's ceilings (§7.1 and §7.2 below), or an envelope over 32 KiB. It writes the keys
 in the order the §7.4 vector has them; `serialiseEnvelope` is `JSON.stringify`, compact,
 which is also what the node's own encoder produces.
 
@@ -256,17 +260,20 @@ child.stdin.write(JSON.stringify({ cmd: "run", envelope_json: signed.envelope_js
 
 Rules of the conversation:
 
-- **One command, one answer stream.** `capabilities`, `inspect`, `result` and `revoke`
-  answer with one event each; `run` answers with a stream that ends in exactly one `done`. Do not send
-  the next command before the stream ended: during a `run` the adapter is driving the
-  node and reads stdin only afterwards.
+- **One command, one answer stream.** `capabilities`, `inspect`, `result`, `revoke`,
+  `actions` and `answer` answer with one event each; `run` answers with a stream that ends
+  in exactly one `done`. Do not send the next command before the stream ended: during a
+  `run` the adapter is driving the node and reads stdin only afterwards, which is why the
+  action channel is answered from a second adapter (§7.2 below).
 - **Pre-signed only.** Send `envelope_json` (the signed string) and `proof`; never
   `issuer_seed_file` and `envelope`, which would put the key on the node's host. The
   adapter forwards the bytes unchanged.
 - **Operation ids are yours** (`operation_ids`, §11.2): the scheme `create` N, `admit`
-  N+1, `start` N+2, `stop` N+3, `revoke` N+4, `seal` N+5. Keep N with the signed bytes
-  (§9); the reference client uses N = 1 for every attempt, since the node keeps ids per
-  attempt.
+  N+1, `start` N+2, `stop` N+3, `revoke` N+4, `seal` N+5, `pause` and `resume` counting up
+  from N+6 (at most 128 of each, §6.3). The reference client puts the answers of the
+  action channel after them: the answer to request number R is N+261+R (`first_answer` is
+  N+262; R is at most 64). Keep N with the signed bytes (§9); the reference client uses
+  N = 1 for every attempt, since the node keeps ids per attempt.
 - **`task_root`** (the node's `--task-root`) makes the report carry the evidence log path,
   its sealed head and the cause (exit code, budget, kill). Give it even when the client
   cannot read the log: the path is what the operator verifies.
@@ -401,6 +408,134 @@ has. A file entry `skipped` or digest-only is a fact about the workspace, report
 truthfully; whether a verdict file that came back `missing` fails the action is the
 control plane's policy, and the conservative reading is that it does.
 
+### 7.2 The action channel
+
+A node started with `--action-channel` gives an attempt whose manifest grants `actions` a
+channel from the workload to the control plane (node-integration.md §6.7,
+[ADR-0031](decisions/ADR-0031-node-action-channel.md)): the workload connects to the Unix
+socket named by `WARD_ACTION_SOCKET` (`/run/ward/actions.sock`), writes one request per
+line, `{"id","kind","summary","detail"}`, and waits for one line back,
+`{"id","decision","note"?}`. The control plane lists the pending requests with `actions`
+and answers each with `answer`. Without the flag the capability document has no
+`actions` section and a manifest with the grant is refused `unsupported_grant` at
+`admit`, with nothing run.
+
+**The grant** is part of the signed manifest, next to `network` (and `output`):
+
+```json
+{"network":"offline","actions":{"kinds":["approval"],"max_pending":2,"max_total":8,"wait_secs":300}}
+```
+
+`kinds` are the requests the workload may send, `approval` (permission to do what the
+summary says) and `decision` (a yes-or-no choice made for it), one or both, without
+repeats; `max_pending` is how many may wait at once, `max_total` how many in the attempt's
+lifetime, `wait_secs` how long each waits before the node answers it `expired`. All three
+are integers of at least 1, with `max_pending` ≤ `max_total`; the node honours at most 8
+pending, 64 in all and 3600 seconds (`ACTION_CEILINGS`) and refuses a larger grant
+`unsupported_grant`. `workload.manifest` takes the object, `actionsGrant({kinds,
+maxPending, maxTotal, waitSecs})` builds it, and both refuse a kind outside the two, a
+repeat, a zero or a non-integer bound, `max_pending` above `max_total` and a bound above a
+ceiling before anything is signed; `actionsGrantOf(envelope_json)` reads the grant back
+from the signed bytes. The command line takes `--actions <kind>[,<kind>]` with
+`--actions-max-pending` (default 2), `--actions-max-total` (default 8) and
+`--actions-wait-secs` (default 300).
+
+**Reading.** `Adapter.actions(binding)` sends `{"cmd":"actions","binding":{…}}` and
+resolves with `{state, pending}`: the attempt's lifecycle state and its pending requests,
+oldest first, each `{action, id, kind, summary, detail, expires_in_ms}`. `action` is the
+node's request number, the one `answer` names; `id` is the workload's; `expires_in_ms` is
+frozen while the attempt is paused. `decodeActions` holds the listing to the contract
+before anything acts on it (ids of 1–64 bytes of `A-Z a-z 0-9 . _ : -`, unique; a summary
+of 1–512 bytes; a detail of at most 16 KiB; strictly increasing numbers; at most 8, and
+none unless the attempt is `running` or `paused`) and, given the grant, to it (only
+granted kinds, at most `max_pending`, numbers up to `max_total`, no longer wait than
+`wait_secs`); a listing outside them is refused, not answered. A refusal resolves
+`{rejected: reason}`: `unsupported_operation` from a node without the flag,
+`task_not_found` or `attempt_mismatch` before the run's `create` has registered the
+attempt, `lease_mismatch`.
+
+**Answering.** `Adapter.answer(binding, request, decision, operationId, note?)` sends
+`{"cmd":"answer","binding":{…},"request":R,"decision":"approved"|"denied","operation_id":M,"note"?}`
+and resolves with `{result: "answered", request, decision, operation_id}` or
+`{result: "rejected", reason, operation_id}`. A control plane answers `approved` or
+`denied` only (`expired` and `cancelled` are the node's) and the note is at most 512 bytes;
+anything else is refused before it is sent. An answer event that names another request,
+decision or operation id than the one sent, or a reason outside §6.7, is refused. The
+reasons, and what the reference loop does with each:
+
+| Reason | Means | The loop |
+| --- | --- | --- |
+| `already_answered` | Answered already: by another `answer`, or `expired` or `cancelled` by the node | Final for the request. |
+| `stale_operation` | This operation id already applied a different answer | Final; never resent under another id. |
+| `unknown_request` | The attempt never recorded that number | Final. |
+| `invalid_state` | The attempt is no longer `running` or `paused` | Final; the next listing reads the end. |
+| `resource_unavailable` | The node could not record the answer; the request is still pending | Sent again at the next poll, same id and answer. |
+
+**The second process.** The adapter's `run` holds its process until the attempt is sealed
+(§6 above), so the answers come from a second `ward-node-adapter` beside it.
+`Adapter.answerLoop(binding, policy, {pollMs, signal, runDir})` is that loop: on its own
+adapter it polls `actions` every `pollMs` (default 250), asks `policy(request)` once per
+request (`"approved"`, `"denied"`, `{decision, note}`, or `null` to leave it to someone
+else), answers, and resolves `{state, answers}` once a listing reads an ended state, or
+with state `null` when `signal` aborts. Before the run's `create` it waits through
+`task_not_found`; a node that cannot serve the channel, or a listing outside the grant,
+ends it with an error. `control-plane.mjs run` starts it beside the run when given a
+policy, aborts it when `done` arrives, prints each request and its answer on stderr and
+lists the answers in the outcome's `actions`:
+
+```text
+$ node control-plane.mjs run … --actions approval --approve-all --note "ok by policy" -- python3 agent.py
+control-plane: request 1 (approval, id deploy-1): deploy to staging
+control-plane:   plan: rotate 3 services
+control-plane:   expires in 300 s unless answered
+control-plane: request 1 answered approved (operation 263) with note "ok by policy"
+{"outcome":"completed",…,"actions":[{"request":1,"id":"deploy-1","kind":"approval","summary":"deploy to staging","decision":"approved","note":"ok by policy","operation_id":263,"result":"answered","replayed":false}]}
+```
+
+`--deny-all` answers every request `denied`; `--ask` shows each one on stderr and reads
+`y [note]` or `n [note]` from stdin (anything but `y` or `yes` denies; the end of stdin
+denies with the note `no answer on stdin`). Without a policy nobody in that process
+answers: a run driven elsewhere is answered with `control-plane.mjs actions` and
+`control-plane.mjs answer --state-dir <dir> --attempt <exec_…> --request R --decision
+approved|denied [--note …]`, or with an explicit binding and `--operation-id`.
+
+**Idempotent answers.** An answer is a mutating request with an operation id, and the
+node applies an id once: the same id with the same request, decision and note is
+answered `answered` again and appends nothing, also once the attempt has ended; the same
+id with anything else is `stale_operation` (§6.7). The reference client takes the id from
+the run record's scheme, one per request number (`answerOperationId(ids, R)`, N+261+R),
+and writes the answer into the run record (`recordAnswer`, the record's `answers`)
+**before** sending it. A control plane that restarts after deciding but before the node
+answered finds the answer in its record and sends exactly that answer again, under the
+same id, without asking its policy again; one that restarts after the node applied it
+finds the request no longer pending, or, replaying anyway, gets `answered` again. Either
+way the request is answered once, as the record says. `control-plane.mjs answer` with
+`--state-dir` does the same and refuses a different answer to a recorded request before
+sending it. Keep one answerer per run record at a time: the record is rewritten whole.
+The applied ids live in the node process: after a node restart the attempt has ended
+(recovered `exited`, its pending requests answered `cancelled`) and a replay is
+`invalid_state`; the evidence log is the durable record of what was answered.
+
+**What the evidence log says.** Every request is recorded `NodeActionRequested` (its
+number, kind, and the size and BLAKE3-256 of the summary and of the detail) before it is
+listed, and every answer `NodeActionAnswered` (the number, the decision, the `answer`'s
+operation id or none for `expired` and `cancelled`, and the size and digest of the note)
+before the workload is told; never the text. A check on the host binds what the control
+plane saw to the sealed log by hashing the UTF-8 bytes of the summary, detail and note
+with `blake3Hex`; the acceptance decodes the log's action records from its raw bytes and
+finds exactly the digests and operation ids the client used. When the attempt ends (the
+workload exits, it is cancelled, its budget runs out) every pending request is answered
+`cancelled` before `NodeAttemptEnded`.
+
+**What an approval is.** A recorded statement, relayed. The workload proceeds because it
+chose to wait for the answer, and must treat everything but `approved` (`denied`,
+`expired`, `cancelled`, an end of file without a reply) as "do not proceed". The node
+enforces nothing on it: an approval widens no capability, credential or network, and is
+not signed per answer; it is authorised by the exact binding on the node's socket
+(node-security-limitations.md §3.2). Governance that must hold whatever the workload does
+stays where it is today: in the control plane's policy, before `admit`, in the grants and
+the manifest it signs.
+
 ## 8. Cancel
 
 Cancellation is `revoke`, never `stop` (§11.2): the lease is durably revoked first, then
@@ -430,7 +565,10 @@ to ask again without acting twice (§6.3, §6.4, §11.2). Persist, **before the 
 sent**: the binding, the signed `envelope_json` string and `proof`, the operation-id
 scheme, the version and the task root. The reference client writes this as
 `<state-dir>/runs/<exec_…>.json` (`saveRunRecord`) and `control-plane.mjs replay
---attempt <exec_…>` resends it.
+--attempt <exec_…>` resends it. With an action channel the record also holds every answer
+given, written before it was sent (§7.2 above); `replay` with a policy answers the
+attempt's requests through the same loop and sends a recorded answer again, under its
+id, instead of deciding anew.
 
 After the restart, replay the recorded run through a fresh adapter: same bytes, same
 proof, same ids. The node answers each replayed id with the task's **current** state and
@@ -461,8 +599,8 @@ before replacing an attempt, because a new attempt discards the old receipt (§9
 ## 10. The proof
 
 ```bash
-cd examples/node-control-plane && node --test       # 42 cases, no node, no sandbox
-scripts/acceptance/node-js.sh                        # 8 cases against a real node; skips loudly without bubblewrap
+cd examples/node-control-plane && node --test       # 67 cases, no node, no sandbox
+scripts/acceptance/node-js.sh                        # 14 cases against a real node; skips loudly without bubblewrap
 WARD_REQUIRE_ISOLATION=1 scripts/acceptance/node-js.sh   # fail instead of skipping, as CI does
 ```
 
@@ -471,9 +609,15 @@ and the complete `admit` line), the id rendering and derivation, the version cou
 across a process restart, the JSON-lines framing against a fake adapter that records
 every line, and result return: the `output` grant's grammar and ceilings, decoding with
 every digest recomputed (a mismatch refused), the result held to its grant, a granted
-output that did not come back reported missing, and writing returned files without
-escaping their directory. The acceptance starts a real node with the client's generated
-key in its trust store and `--output-return` and proves `completes_and_seals`,
+output that did not come back reported missing, writing returned files without
+escaping their directory, and the action channel: the `actions` grant's grammar and
+ceilings, listings and answers held to the contract, the answer loop against a fake
+adapter scripted with requests (each answered once by the policy, persisted before it is
+sent, the loop stopping at the attempt's end), a restarted loop replaying the recorded
+answer under the same operation id without asking again, each refusal handled by what it
+means, and `run --approve-all`, `--deny-all` and `--ask` and the standalone `actions` and
+`answer` commands end to end. The acceptance starts a real node with the client's generated
+key in its trust store, `--output-return` and `--action-channel` and proves `completes_and_seals`,
 `fails_with_exit_status`, `cancel_is_revoke_then_seal`, `replay_acts_on_nothing`,
 `version_is_held_strictly_increasing`,
 `output_returns_declared_content_with_matching_digests` (both streams and two declared
@@ -482,7 +626,19 @@ the sealed log, `--out-dir` holding them),
 `output_marks_truncation_past_the_budgets` (the heads with `truncated` and the dropped
 counts, a file past the budget digest-only with the host file's digest) and, against a
 second node without the flag, `output_grant_is_refused_without_the_flag`
-(`unsupported_grant`, reported `refused` and certain, not `unknown`), verifying every
+(`unsupported_grant`, reported `refused` and certain, not `unknown`); and, with a Python
+workload in the sandbox that asks through `/run/ward/actions.sock` and proceeds only on
+`approved`, `actions_approval_lets_the_workload_proceed` (`--approve-all`: the workload
+exits 0 and the sealed log records the request's digests and the approval under operation
+263 with the note's digest before the end), `actions_denial_stops_the_workload`
+(`--deny-all`: exit 3, the run fails), `actions_unanswered_request_expires` (`wait_secs`
+2: the node answers `expired`, recorded with no operation id; a late answer is
+`invalid_state`), `actions_cancel_while_pending_answers_cancelled` (cancelling the run
+while the request is listed answers it `cancelled` before the end),
+`actions_answered_from_a_second_process` (the standalone `actions` and `answer`: a replay
+answered again, `stale_operation`, `already_answered` and `unknown_request` from the real
+node, exactly two answers in the log) and, against the node without the flag,
+`actions_grant_is_refused_without_the_flag_or_outside_the_grammar`, verifying every
 evidence log with `ward-node audit --task-root` (and `ward replay --verify` when a `ward`
 binary is at hand). It runs
 as part of `scripts/acceptance/node.sh` in CI, so the table in the verify job's summary
@@ -503,21 +659,17 @@ plane deciding what to put through the node today:
   readable only as the node's uid. Design workloads to leave their verdict in a small
   declared file (a JSON report) and their exit status, and read anything larger on the
   host out of band.
-- **In-sandbox callbacks.** A node started with `--action-channel` gives an attempt a
-  channel from the workload to the control plane (node-integration.md §6.7, ADR-0031):
-  bounded `approval` and `decision` requests the control plane reads with `actions` and
-  answers with `answer`. The JS reference client does not speak it yet: its manifest
-  builder refuses an `actions` field before anything is signed (it knows `network` and
-  `output` only), and it has no `actions` or `answer` call. A Node.js control plane that
-  needs the channel today builds and signs the manifest bytes itself (§5) and sends the
-  `ward-node-adapter` process's `actions` and `answer` commands (node-integration.md
-  §11.4) from a second adapter while the first one runs the attempt. There is no `stream` either (§6.1, §11.5), so an
-  agent loop that needs tool results or model calls from outside the sandbox stays on the
-  control plane; the node runs the bounded actions it delegates.
+- **In-sandbox callbacks beyond questions.** The action channel (§7.2 above) carries
+  bounded `approval` and `decision` requests out of the sandbox and a yes or no, with an
+  optional note of at most 512 bytes, back in; nothing else. There is no `stream` (§6.1,
+  §11.5), and no tool results, model calls or credentials reach the workload through the
+  channel, so an agent loop that needs them stays on the control plane; the node runs the
+  bounded actions it delegates.
 - **Approvals.** The node has no approval step of its own; governance is the control
   plane's (ai-institution's action policy and approval resolution) and happens before
-  `admit`. An approval given through the action channel is a recorded statement the
-  workload acts on, not a hold the node enforces (node-security-limitations.md §3.2). The grants the envelope carries record the decision; the node checks their
+  `admit`. An approval given through the action channel (§7.2 above) is a recorded
+  statement the workload acts on, not a hold the node enforces, and it is not signed per
+  answer (node-security-limitations.md §3.2). The grants the envelope carries record the decision; the node checks their
   shape and lineage, not their meaning.
 - **Credentials.** Nothing is injected into the sandbox (#267); the only egress is an
   HTTP(S) proxy over a Unix socket on a node started with `--network-allowlist` (§9).
@@ -556,6 +708,13 @@ behind an adapter:
       budget declared in its manifest's `output` grant within the ceilings (§7.1 above); every
       returned file's digest verified before use; a granted output that is missing treated
       as failure, never success.
+- [ ] Where a workload must ask before an irreversible step: nodes started with
+      `--action-channel`, the kinds it may ask and its bounds in the manifest's `actions`
+      grant within the ceilings (§7.2 above), its requests answered by the institution's
+      approval resolution from a second adapter (`answerLoop`), each answer recorded with
+      its operation id of the attempt's scheme before it is sent and replayed, never
+      re-decided, after a restart; the workload proceeding only on `approved`, and the
+      answer understood as a recorded statement, not a hold the node enforces.
 - [ ] The signed bytes, proof, ids and version persisted before the first send; replay on
       restart with the same adapter conversation (§9); no second attempt until the first is
       ended.

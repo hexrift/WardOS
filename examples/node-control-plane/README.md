@@ -8,11 +8,11 @@ through it is [`docs/node-integration-from-nodejs.md`](../../docs/node-integrati
 
 | File | What it is |
 | --- | --- |
-| `ward-node.mjs` | The library: ids (§7.2) and their derivation from caller ids, the issuer key and proof (§2.3, §7.4), the envelope (§7), the durable per-task version (§10), run records for replay, the `ward-node-adapter` conversation (§11.4), the receipt-to-outcome mapping (§9, §11.3), and result return: the manifest's `output` grant within the node's ceilings (§7.5), the returned output decoded with every digest recomputed and held to its grant, and returned files written under one directory (§6.6). |
+| `ward-node.mjs` | The library: ids (§7.2) and their derivation from caller ids, the issuer key and proof (§2.3, §7.4), the envelope (§7), the durable per-task version (§10), run records for replay, the `ward-node-adapter` conversation (§11.4), the receipt-to-outcome mapping (§9, §11.3), result return: the manifest's `output` grant within the node's ceilings (§7.5), the returned output decoded with every digest recomputed and held to its grant, and returned files written under one directory (§6.6), and the action channel: the manifest's `actions` grant within ADR-0031's grammar and the node's ceilings (§7.5), `actions` and `answer` with every listing and answer held to the contract, and `answerLoop`, which answers a running attempt's requests by a policy from a second adapter, recording each answer with its operation id in the run record before sending it (§6.7). |
 | `ward-node.d.ts` | Hand-written TypeScript declarations for it. |
 | `blake3.mjs` | BLAKE3-256 in plain JavaScript, for key ids and manifest hashes; held to the reference vectors. |
-| `control-plane.mjs` | The command line: `keygen`, `derive-id`, `capabilities`, `run` (with `--stdio-bytes`, `--files`, `--files-bytes` for an output grant and `--out-dir` for the returned files), `replay`, `inspect`, `result`, `revoke`. |
-| `test/` | `node --test` cases that need no node and no sandbox: the §7.4 vector byte for byte, ids, the version counter across a restart, the JSON-lines framing against `fixtures/fake-adapter.mjs`, the output grant's grammar and ceilings, result decoding and digest verification, and writing returned files without escaping their directory. |
+| `control-plane.mjs` | The command line: `keygen`, `derive-id`, `capabilities`, `run` (with `--stdio-bytes`, `--files`, `--files-bytes` for an output grant and `--out-dir` for the returned files; `--actions` with `--actions-max-pending`, `--actions-max-total`, `--actions-wait-secs` for an actions grant and `--approve-all`, `--deny-all` or `--ask` to answer it), `replay`, `inspect`, `result`, `revoke`, `actions`, `answer`. |
+| `test/` | `node --test` cases (67) that need no node and no sandbox: the §7.4 vector byte for byte, ids, the version counter across a restart, the JSON-lines framing against `fixtures/fake-adapter.mjs`, the output grant's grammar and ceilings, result decoding and digest verification, writing returned files without escaping their directory, the actions grant's grammar and ceilings, the answer loop against a scripted channel (answers persisted before sending, replayed after a restart under the same id, each refusal, the end of the attempt), and the command line's `--approve-all`, `--deny-all`, `--ask`, `actions` and `answer`. |
 
 ```bash
 cd examples/node-control-plane && node --test          # the unit suite
@@ -22,13 +22,20 @@ scripts/acceptance/node-js.sh                           # the same client agains
 The acceptance (`scripts/acceptance/node-js.sh`) starts a real node with the client's own
 key in its trust store and proves, with nothing mocked, that a workload completes, fails
 with its exit status, is cancelled by revoke-then-seal, replays without acting twice,
-that the node holds the version strictly increasing, and, on a node started with
+that the node holds the version strictly increasing, on a node started with
 `--output-return`, that a declared result comes back byte for byte with digests equal to
 the files on the host, is marked truncated past its budgets, and is refused
-`unsupported_grant` by a node without the flag; its evidence logs are verified with the
-node's own audit.
+`unsupported_grant` by a node without the flag, and, on a node started with
+`--action-channel`, that a workload asking through the channel proceeds on
+`--approve-all`, stops on `--deny-all`, fails closed when its request expires or the run is
+cancelled while it waits, is answered idempotently from a second process, and that a node
+without the flag refuses the grant; its evidence logs are verified with the node's own
+audit, and the action records in them are decoded from the raw bytes and checked against
+the digests and operation ids the client used (14 cases).
 
 The signing key is a PKCS#8 PEM file (mode 0600) that never leaves the control plane's
 process; the node sees signatures only. Everything the client builds is checked against
 the contract's bounds before it is signed, and neither an `unknown` outcome nor a
-granted output that did not come back is ever success.
+granted output that did not come back is ever success. An approval through the action
+channel is a statement the node records and relays to a workload that chose to wait for
+it, not a hold the node enforces.

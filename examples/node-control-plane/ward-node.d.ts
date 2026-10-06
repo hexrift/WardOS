@@ -17,6 +17,18 @@ export const ID_PREFIXES: ReadonlyArray<IdPrefix>;
  */
 export const OUTPUT_CEILINGS: Readonly<{ stdioBytes: 1048576; filesBytes: 8388608; files: 64; pathBytes: 255 }>;
 
+/** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
+export const ACTION_KINDS: ReadonlyArray<ActionKind>;
+
+/**
+ * What a node started with `--action-channel` honours of an `actions` grant (§7.5): 8
+ * pending, 64 in all, 3600 seconds each. A grant above these is refused before signing.
+ */
+export const ACTION_CEILINGS: Readonly<{ maxPending: 8; maxTotal: 64; waitSecs: 3600 }>;
+
+/** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
+export const ANSWER_DECISIONS: ReadonlyArray<AnswerDecision>;
+
 export type IdPrefix = "task" | "exec" | "lease" | "agent" | "node" | "sess" | "deleg" | "prn";
 
 /** `<prefix>_` and 26 upper-case Crockford base32 characters, first character 0–7 (§7.2). */
@@ -34,8 +46,25 @@ export type RejectionReason =
 
 export type Verb = "create" | "admit" | "start" | "pause" | "resume" | "stop" | "revoke" | "seal";
 
-/** The verbs a `rejected` event may name: the mutating verbs and the two read-only requests. */
-export type RejectedVerb = Verb | "inspect" | "result";
+/** The verbs a `rejected` event may name: the mutating verbs, the read-only requests and `answer`. */
+export type RejectedVerb = Verb | "inspect" | "result" | "actions" | "answer";
+
+/** What a workload may ask on the action channel (§6.7). */
+export type ActionKind = "approval" | "decision";
+
+/** What a control plane may answer. */
+export type AnswerDecision = "approved" | "denied";
+
+/** Every decision a workload may receive: the control plane's, or the node's `expired` and `cancelled`. */
+export type ActionDecision = AnswerDecision | "expired" | "cancelled";
+
+/** Why `actions` is refused (§6.7). */
+export type ActionsRejectionReason =
+  | "task_not_found" | "attempt_mismatch" | "lease_mismatch" | "unsupported_operation" | "resource_unavailable";
+
+/** Why `answer` is refused (§6.7). */
+export type AnswerRejectionReason =
+  | ActionsRejectionReason | "invalid_state" | "unknown_request" | "already_answered" | "stale_operation";
 
 export interface Binding {
   task: WardId<"task">;
@@ -76,7 +105,21 @@ export interface OutputGrant {
   files_bytes: number;
 }
 
-export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & { output?: OutputGrant };
+/**
+ * The `actions` grant of §7.5 in wire spelling (ADR-0031 §2): the `kinds` the workload may
+ * send (1–2, no repeats), at most `max_pending` waiting at once and `max_total` in the
+ * attempt's lifetime (`max_pending` ≤ `max_total`), each answered `expired` after
+ * `wait_secs`; all ≥ 1 and within `ACTION_CEILINGS`. Honoured only by a node started with
+ * `--action-channel`; refused `unsupported_grant` otherwise.
+ */
+export interface ActionsGrant {
+  kinds: ActionKind[];
+  max_pending: number;
+  max_total: number;
+  wait_secs: number;
+}
+
+export type Manifest = ({ network: "offline" } | { network: { custom: string[] } }) & { output?: OutputGrant; actions?: ActionsGrant };
 
 export interface ManifestBytes {
   /** BLAKE3-256 of `bytes`, 64 lowercase hex digits. */
@@ -165,6 +208,10 @@ export function manifest(object?: Manifest): ManifestBytes;
 export function outputGrantOf(envelopeJson: string): OutputGrant | null;
 /** The §7.5 grant from the control plane's words, refused outside the grammar or above the ceilings. */
 export function outputGrant(input: { stdioBytes: number; files: string[]; filesBytes: number }): OutputGrant;
+/** The `actions` grant a signed envelope's manifest carries, read from its exact bytes, or `null`. */
+export function actionsGrantOf(envelopeJson: string): ActionsGrant | null;
+/** The §7.5 grant from the control plane's words, refused outside ADR-0031's grammar or above the ceilings. */
+export function actionsGrant(input: { kinds: ActionKind[]; maxPending: number; maxTotal: number; waitSecs: number }): ActionsGrant;
 
 export class Issuer {
   private constructor(privateKey: unknown);
@@ -209,10 +256,25 @@ export interface OperationIds {
   stop: number;
   revoke: number;
   seal: number;
+  /** The answer to action-channel request 1: `start_at` + 262, past 128 pauses and 128 resumes. */
+  first_answer: number;
 }
 
 /** The scheme of §11.2 shifted to start at `startAt` (default 1). */
 export function operationIds(startAt?: number): OperationIds;
+
+/** The operation id of the answer to request number `request` (1–64): one id per request, so a replay is the same operation. */
+export function answerOperationId(ids: { start_at: number }, request: number): number;
+
+/** An answer as the run record keeps it, written before it is sent. */
+export interface RecordedAnswer {
+  request: number;
+  id?: string;
+  kind?: ActionKind;
+  decision: AnswerDecision;
+  note?: string;
+  operation_id: number;
+}
 
 export interface RunRecord {
   binding: Binding;
@@ -220,17 +282,25 @@ export interface RunRecord {
   proof: Proof;
   operation_ids: { start_at: number };
   task_root?: string | null;
+  /** The answers given to the attempt's action-channel requests, one per request. */
+  answers?: RecordedAnswer[];
   [extra: string]: unknown;
 }
 
 export function saveRunRecord(dir: string, record: RunRecord): void;
 export function loadRunRecord(dir: string, attempt: WardId<"exec">): RunRecord & { format: 1 };
+/**
+ * Record an answer in the run record before it is sent, durably; `operation_id` must be
+ * `answerOperationId` of the record's scheme. A request already answered keeps its first
+ * answer, which is returned, and nothing is written.
+ */
+export function recordAnswer(dir: string, attempt: WardId<"exec">, answer: RecordedAnswer): RecordedAnswer;
 
 /** One event line of `ward-node-adapter` (§11.4). */
 export interface AdapterEvent {
   schema: 1;
   event: "state" | "rejected" | "admitted" | "recovering" | "receipt" | "evidence" | "output" | "done"
-    | "capabilities" | "inspected" | "result" | "verb" | "error";
+    | "capabilities" | "inspected" | "result" | "verb" | "actions" | "answered" | "error";
   [field: string]: unknown;
 }
 
@@ -300,6 +370,72 @@ export function decodeOutput(output: null | undefined, grant?: OutputGrant | nul
  */
 export function writeReturnedFiles(dir: string, files: OutputFile[]): Array<{ path: string; written: string }>;
 
+/** One pending action-channel request as `actions` lists it (§6.7). */
+export interface PendingAction {
+  /** The node's request number, what `answer` names. */
+  action: number;
+  /** The workload's id: 1–64 bytes of `A-Z a-z 0-9 . _ : -`. */
+  id: string;
+  kind: ActionKind;
+  /** 1–512 bytes: what the control plane is asked. */
+  summary: string;
+  /** 0–16 KiB: the context. */
+  detail: string;
+  /** Milliseconds before the node answers it `expired` (frozen while paused). */
+  expires_in_ms: number;
+}
+
+export interface ActionsListing {
+  state: LifecycleState;
+  /** Oldest first; empty unless the attempt is `running` or `paused`. */
+  pending: PendingAction[];
+}
+
+/**
+ * Hold an `actions` answer to §6.7 (and, given the grant, to it): bounds, ids, kinds,
+ * order and count. A listing outside them is refused, not acted on.
+ */
+export function decodeActions(listing: ActionsListing, grant?: ActionsGrant | null): ActionsListing;
+
+export type AnswerResult =
+  | { result: "answered"; request: number; decision: AnswerDecision; operation_id: number }
+  | { result: "rejected"; reason: AnswerRejectionReason; operation_id: number };
+
+/** A policy's verdict on one request: a decision, a decision with a note for the workload, or `null` for no answer. */
+export type AnswerVerdict = AnswerDecision | { decision: AnswerDecision; note?: string } | null | undefined;
+
+export type AnswerPolicy = (request: PendingAction, context: { signal?: AbortSignal }) => AnswerVerdict | Promise<AnswerVerdict>;
+
+/** One answer the loop sent and how the node took it. */
+export interface LoopAnswer {
+  request: number;
+  id: string;
+  kind: ActionKind;
+  summary: string;
+  decision: AnswerDecision;
+  note?: string;
+  operation_id: number;
+  result: "answered" | "rejected";
+  reason?: AnswerRejectionReason;
+  /** Whether the answer came from the run record (or this loop's memory) rather than the policy. */
+  replayed: boolean;
+}
+
+export interface AnswerLoopOptions {
+  /** Default 250. */
+  pollMs?: number;
+  /** Stops the loop; it then resolves with state `null`. */
+  signal?: AbortSignal;
+  /** The run records' directory: answers take ids from the record's scheme and are recorded before they are sent. */
+  runDir?: string;
+  /** The scheme when there is no run record; answers then live in memory only. */
+  operationIds?: { start_at: number };
+  /** The grant listings are held to; default the run record's. */
+  grant?: ActionsGrant | null;
+  onRequest?: (request: PendingAction) => void;
+  onAnswer?: (answer: LoopAnswer) => void;
+}
+
 export interface Operation {
   verb: Verb;
   operation_id: number;
@@ -360,6 +496,21 @@ export class Adapter {
     | { result: "accepted"; state: LifecycleState; operation_id: number }
     | { result: "rejected"; reason: RejectionReason; operation_id: number }
   >;
+  /** `actions` (§6.7): the state and pending requests, held to the contract, or the node's refusal. */
+  actions(binding: Binding): Promise<ActionsListing | { rejected: ActionsRejectionReason }>;
+  /**
+   * `answer` request number `request` with `decision` under `operationId` (§6.7); an
+   * optional note (≤ 512 bytes) is relayed to the workload. Replaying the same id and answer
+   * is answered again and applies nothing.
+   */
+  answer(binding: Binding, request: number, decision: AnswerDecision, operationId: number, note?: string): Promise<AnswerResult>;
+  /**
+   * Poll `actions` and answer each request once by `policy` until a listing reads an ended
+   * state (resolving with it) or `signal` aborts (state `null`). Run it on a second adapter
+   * beside a `run`. With `runDir` each answer is recorded before it is sent and a recorded
+   * answer is replayed under its id instead of asking the policy again.
+   */
+  answerLoop(binding: Binding, policy: AnswerPolicy, options?: AnswerLoopOptions): Promise<{ state: LifecycleState | null; answers: LoopAnswer[] }>;
   run(signed: Pick<SignedEnvelope, "envelope_json" | "proof">, options?: RunOptions): Promise<{ events: AdapterEvent[]; report: AttemptReport }>;
   /** SIGTERM to the adapter: it revokes and seals the running attempt and writes `done`. */
   cancel(): void;
