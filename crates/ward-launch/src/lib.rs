@@ -169,6 +169,39 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/ssl",
     "/etc/ca-certificates",
 ];
+const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
+const PROC_MASKED_FILES: [&str; 6] = [
+    "kcore",
+    "keys",
+    "latency_stats",
+    "sched_debug",
+    "timer_list",
+    "timer_stats",
+];
+
+fn append_proc_masks(args: &mut Vec<String>, proc_root: &Path) {
+    for path in PROC_MASKED_DIRECTORIES {
+        if proc_root.join(path).is_dir() {
+            let destination = format!("/proc/{path}");
+            args.extend([
+                "--tmpfs".into(),
+                destination.clone(),
+                "--remount-ro".into(),
+                destination,
+            ]);
+        }
+    }
+    for path in PROC_MASKED_FILES {
+        if proc_root.join(path).exists() {
+            args.extend([
+                "--ro-bind".into(),
+                "/dev/null".into(),
+                format!("/proc/{path}"),
+            ]);
+        }
+    }
+}
+
 /// Whether `path` is guaranteed to exist, read-only, at this same path inside
 /// every sandbox `Launch::args` builds — one of the fixed `SYSTEM_RO`
 /// `--ro-bind`s, always added when the host has the directory. Never true for a
@@ -538,6 +571,10 @@ impl Launch {
 
     /// The `bwrap` argument vector (without the program name). Pure, for tests.
     pub fn args(&self, worktree: &Path) -> Vec<String> {
+        self.args_with_proc_root(worktree, Path::new("/proc"))
+    }
+
+    fn args_with_proc_root(&self, worktree: &Path, proc_root: &Path) -> Vec<String> {
         fn push(a: &mut Vec<String>, xs: &[&str]) {
             a.extend(xs.iter().map(|x| (*x).to_string()));
         }
@@ -558,6 +595,7 @@ impl Launch {
                 "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/home",
             ],
         );
+        append_proc_masks(&mut a, proc_root);
         push(&mut a, &["--tmpfs", "/run"]);
         // The shim's read-write set is /work, /env, /tmp and $HOME; every one must exist
         // (it fails closed otherwise), so create the sandbox-private ones here.
@@ -1077,6 +1115,70 @@ mod tests {
         let first_set = a.iter().position(|x| x == "--setenv").unwrap();
         assert!(clear < first_set, "{a:?}");
         assert!(a.join(" ").contains("--setenv FOO bar"));
+    }
+
+    #[test]
+    fn args_remask_only_present_sensitive_proc_paths_after_mounting_private_proc() {
+        let proc_root = tempfile::tempdir().unwrap();
+        for path in ["acpi", "asound", "scsi"] {
+            std::fs::create_dir(proc_root.path().join(path)).unwrap();
+        }
+        for path in [
+            "kcore",
+            "keys",
+            "latency_stats",
+            "sched_debug",
+            "timer_list",
+            "timer_stats",
+        ] {
+            std::fs::File::create(proc_root.path().join(path)).unwrap();
+        }
+
+        let args = Launch::new("/tmp", vec!["true".into()])
+            .args_with_proc_root(Path::new("/tmp"), proc_root.path());
+        let proc_mount = args.iter().position(|arg| arg == "--proc").unwrap();
+        for path in ["/proc/acpi", "/proc/asound", "/proc/scsi"] {
+            let mask = args
+                .windows(4)
+                .position(|window| window == ["--tmpfs", path, "--remount-ro", path])
+                .unwrap();
+            assert!(proc_mount < mask);
+        }
+        for path in [
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/sched_debug",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+        ] {
+            assert!(
+                args.windows(3)
+                    .any(|window| window == ["--ro-bind", "/dev/null", path])
+            );
+        }
+    }
+
+    #[test]
+    fn args_do_not_add_proc_masks_for_paths_absent_from_the_kernel() {
+        let proc_root = tempfile::tempdir().unwrap();
+
+        let args = Launch::new("/tmp", vec!["true".into()])
+            .args_with_proc_root(Path::new("/tmp"), proc_root.path());
+
+        for path in [
+            "/proc/acpi",
+            "/proc/asound",
+            "/proc/scsi",
+            "/proc/kcore",
+            "/proc/keys",
+            "/proc/latency_stats",
+            "/proc/sched_debug",
+            "/proc/timer_list",
+            "/proc/timer_stats",
+        ] {
+            assert!(!args.iter().any(|arg| arg == path), "unexpected {path}");
+        }
     }
 
     #[test]
