@@ -30,6 +30,7 @@
 #![forbid(unsafe_code)]
 
 mod actions;
+mod adapter;
 mod admission;
 mod credentials;
 mod hold;
@@ -46,6 +47,7 @@ pub use actions::{
     MAX_ACTION_SUMMARY_BYTES, MAX_ACTION_TOTAL, MAX_ACTION_WAIT_SECS, MAX_ACTIONS_RESPONSE_BYTES,
     PendingAction, TaskActionsRequest, TaskActionsResponse,
 };
+pub use adapter::{AdapterCapabilities, AdapterCapabilitiesError, HostedAdapter, WorkloadAdapter};
 pub use admission::{
     AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
     HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
@@ -490,6 +492,7 @@ pub struct NodeCapabilities {
     resources: Option<ResourceCapabilities>,
     scheduling: Option<SchedulingCapabilities>,
     actions: ActionCapabilities,
+    adapters: Option<AdapterCapabilities>,
 }
 
 impl NodeCapabilities {
@@ -537,6 +540,7 @@ impl NodeCapabilities {
             resources: None,
             scheduling: None,
             actions: ActionCapabilities::NONE,
+            adapters: None,
         })
     }
 
@@ -613,6 +617,25 @@ impl NodeCapabilities {
             return Err(NodeCapabilitiesError::ProtocolDoesNotSupportActions);
         }
         self.actions = actions;
+        Ok(self)
+    }
+
+    /// The same document advertising `adapters`: the agent adapters the node hosts on
+    /// admitted workloads (ADR-0036). Protocol 1.3 and later only; `None` leaves the
+    /// section out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NodeCapabilitiesError::ProtocolDoesNotSupportAdapters`] for a section
+    /// under a protocol version before 1.3.
+    pub const fn with_adapters(
+        mut self,
+        adapters: Option<AdapterCapabilities>,
+    ) -> Result<Self, NodeCapabilitiesError> {
+        if adapters.is_some() && !supports_task_admission(self.protocol) {
+            return Err(NodeCapabilitiesError::ProtocolDoesNotSupportAdapters);
+        }
+        self.adapters = adapters;
         Ok(self)
     }
 
@@ -695,6 +718,12 @@ impl NodeCapabilities {
     pub const fn actions(self) -> ActionCapabilities {
         self.actions
     }
+
+    /// The agent adapters the node hosts; `None` when it hosts none.
+    #[must_use]
+    pub const fn adapters(self) -> Option<AdapterCapabilities> {
+        self.adapters
+    }
 }
 
 /// Invalid capability document.
@@ -715,6 +744,8 @@ pub enum NodeCapabilitiesError {
     ProtocolDoesNotSupportResources,
     /// `actions` was advertised under a protocol version that predates the action channel.
     ProtocolDoesNotSupportActions,
+    /// `adapters` was advertised under a protocol version before 1.3.
+    ProtocolDoesNotSupportAdapters,
 }
 
 impl Display for NodeCapabilitiesError {
@@ -740,6 +771,9 @@ impl Display for NodeCapabilitiesError {
             }
             Self::ProtocolDoesNotSupportActions => {
                 formatter.write_str("protocol version does not support the action channel")
+            }
+            Self::ProtocolDoesNotSupportAdapters => {
+                formatter.write_str("protocol version does not support hosted agent adapters")
             }
         }
     }
@@ -809,6 +843,12 @@ struct NodeCapabilitiesWire {
         deserialize_with = "deserialize_present_action_capabilities"
     )]
     actions: Option<ActionCapabilities>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_present_adapter_capabilities"
+    )]
+    adapters: Option<AdapterCapabilities>,
     lifecycle: LifecycleCapabilitiesWire,
 }
 
@@ -837,6 +877,15 @@ where
     D: Deserializer<'de>,
 {
     ActionCapabilities::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_adapter_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Option<AdapterCapabilities>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    AdapterCapabilities::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_output_capabilities<'de, D>(
@@ -887,6 +936,8 @@ impl NodeCapabilitiesWire {
         .with_scheduling(self.scheduling)
         .ok()?
         .with_actions(actions)
+        .ok()?
+        .with_adapters(self.adapters)
         .ok()
     }
 }
@@ -918,6 +969,7 @@ impl Serialize for NodeCapabilities {
             resources: self.resources,
             scheduling: self.scheduling,
             actions: self.actions.any().then_some(self.actions),
+            adapters: self.adapters,
             lifecycle: LifecycleCapabilitiesWire {
                 pause: self.lifecycle.pause,
                 stop: self.lifecycle.stop,
@@ -3706,6 +3758,77 @@ mod tests {
         );
         assert!(
             !NodeCapabilitiesError::ProtocolDoesNotSupportActions
+                .to_string()
+                .is_empty()
+        );
+    }
+    #[test]
+    fn a_capability_document_carries_adapters_only_when_the_operator_hosts_one_at_one_three() {
+        let one_three = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, 3)).unwrap();
+        let minimal = capabilities_at(3, false);
+        assert_eq!(minimal.adapters(), None);
+        let plain = serde_json::to_string(&one_three.response(minimal).unwrap()).unwrap();
+        assert!(!plain.contains("adapters"), "{plain}");
+        let hosting = minimal
+            .with_actions(ActionCapabilities::CEILINGS)
+            .unwrap()
+            .with_adapters(AdapterCapabilities::hosting([
+                HostedAdapter::ClaudeCode,
+                HostedAdapter::Codex,
+            ]))
+            .unwrap();
+        let json = serde_json::to_string(&one_three.response(hosting).unwrap()).unwrap();
+        assert_eq!(
+            json,
+            plain.replace(
+                r#""verifier":{"isolated":false}"#,
+                r#""verifier":{"isolated":false},"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600},"adapters":{"contract":"1.0","hosted":["claude-code","codex"]}"#
+            )
+        );
+        match one_three.decode_response(&json).unwrap() {
+            CapabilityDiscoveryResponse::Capabilities { capabilities } => {
+                assert_eq!(capabilities, hosting);
+                let adapters = capabilities.adapters().unwrap();
+                assert!(adapters.hosts(HostedAdapter::Codex));
+                assert!(!adapters.hosts(HostedAdapter::Process));
+            }
+        }
+        for minor in [1, 2] {
+            let early = capabilities_at(minor, false);
+            assert_eq!(
+                early.with_adapters(AdapterCapabilities::hosting([HostedAdapter::Process])),
+                Err(NodeCapabilitiesError::ProtocolDoesNotSupportAdapters)
+            );
+            assert_eq!(early.with_adapters(None), Ok(early));
+            let context = CapabilityDiscoveryContext::new(ProtocolVersion::new(1, minor)).unwrap();
+            let early_json = plain
+                .replace(r#""minor":3"#, &format!(r#""minor":{minor}"#))
+                .replace(
+                    r#""verifier":{"isolated":false}"#,
+                    r#""verifier":{"isolated":false},"adapters":{"contract":"1.0","hosted":["process"]}"#,
+                );
+            assert_eq!(
+                context.decode_response(&early_json),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "a 1.{minor} document never carries adapters"
+            );
+        }
+        for bad in [
+            r#""adapters":{"contract":"1.0","hosted":[]}"#,
+            r#""adapters":{"contract":"1.0","hosted":["gemini-cli"]}"#,
+            r#""adapters":null"#,
+        ] {
+            assert_eq!(
+                one_three.decode_response(&json.replace(
+                    r#""adapters":{"contract":"1.0","hosted":["claude-code","codex"]}"#,
+                    bad
+                )),
+                Err(CapabilityDiscoveryError::MalformedMessage),
+                "{bad}"
+            );
+        }
+        assert!(
+            !NodeCapabilitiesError::ProtocolDoesNotSupportAdapters
                 .to_string()
                 .is_empty()
         );

@@ -31,6 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 toml = { workspace = true }
+ward-agent-adapter = { path = "../ward-agent-adapter", version = "0.18.0" }
 ward-authority = { path = "../ward-authority", version = "0.18.0" }
 ward-credentials = { path = "../ward-credentials", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }

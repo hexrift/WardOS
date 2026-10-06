@@ -12,7 +12,9 @@
 //! [`verify`] check it like any other. Its chain is bound to the attempt: the chain's
 //! session id carries the execution attempt id's 128-bit value ([`session`]) and its genesis
 //! hash is [`genesis`] of the attempt's binding. Every record has origin
-//! [`Origin::Node`] and is fsynced before the append returns.
+//! [`Origin::Node`], except the claims of a hosted agent adapter (#279, ADR-0036:
+//! `AgentClaim` records only, with origin [`Origin::Agent`], so nothing can read them as
+//! an enforcement fact), and is fsynced before the append returns.
 //!
 //! Records, all metadata (the workload's output is never logged):
 //!
@@ -196,7 +198,8 @@ impl VerifiedEvidence {
 }
 
 /// Read and verify the evidence log of `binding` in its evidence directory `dir`: every
-/// record has origin [`Origin::Node`] and chains from [`genesis`] of `binding` under
+/// record has origin [`Origin::Node`], or is an `AgentClaim` with origin
+/// [`Origin::Agent`], and chains from [`genesis`] of `binding` under
 /// [`session`], and a sealed `HEAD`, if there is one, names exactly the chain's head.
 ///
 /// # Errors
@@ -224,7 +227,7 @@ fn load(dir: &Path, binding: TaskBinding) -> Result<Option<VerifiedEvidence>, Ev
     let mut reader = LogReader::open(&path)?;
     let mut records = Vec::new();
     while let Some(record) = reader.next_record()? {
-        let foreign = record.origin != Origin::Node
+        let foreign = !written_by_the_node(&record)
             || (records.is_empty()
                 && (record.session != expected.session || record.prev != expected.genesis));
         if foreign {
@@ -251,6 +254,16 @@ fn load(dir: &Path, binding: TaskBinding) -> Result<Option<VerifiedEvidence>, Ev
     }))
 }
 
+/// Whether the node writes records like `record`: its own, with origin [`Origin::Node`],
+/// and the claims of a hosted adapter, with origin [`Origin::Agent`].
+const fn written_by_the_node(record: &EventRecord) -> bool {
+    match record.origin {
+        Origin::Node => true,
+        Origin::Agent => matches!(record.event, WardEvent::AgentClaim { .. }),
+        _ => false,
+    }
+}
+
 /// The evidence log of one attempt. The registry is its only writer, under its lock.
 #[derive(Clone, Debug)]
 pub(crate) struct AttemptEvidence {
@@ -273,7 +286,20 @@ impl AttemptEvidence {
         if current.as_ref().is_some_and(VerifiedEvidence::is_sealed) {
             return Err(EvidenceError::Sealed);
         }
-        self.write(current.as_ref(), event)
+        self.write(current.as_ref(), Origin::Node, event)
+    }
+
+    /// Durably append a hosted adapter's claim, with origin [`Origin::Agent`]; any other
+    /// event is refused with nothing written.
+    pub(crate) fn append_claim(&self, event: WardEvent) -> Result<(), EvidenceError> {
+        if !matches!(event, WardEvent::AgentClaim { .. }) {
+            return Err(EvidenceError::ForeignLog);
+        }
+        let current = self.open()?;
+        if current.as_ref().is_some_and(VerifiedEvidence::is_sealed) {
+            return Err(EvidenceError::Sealed);
+        }
+        self.write(current.as_ref(), Origin::Agent, event)
     }
 
     /// Seal the log as `operation` sealed the attempt, which ended `ended` with `outcome`:
@@ -300,6 +326,7 @@ impl AttemptEvidence {
             if current.as_ref().and_then(VerifiedEvidence::state) != Some((ended, outcome)) {
                 self.write(
                     current.as_ref(),
+                    Origin::Node,
                     WardEvent::NodeAttemptRecovered {
                         state: ended,
                         outcome,
@@ -307,7 +334,11 @@ impl AttemptEvidence {
                 )?;
                 current = self.open()?;
             }
-            self.write(current.as_ref(), WardEvent::NodeAttemptSealed { operation })?;
+            self.write(
+                current.as_ref(),
+                Origin::Node,
+                WardEvent::NodeAttemptSealed { operation },
+            )?;
         }
         LogWriter::open(self.dir.join(EVIDENCE_LOG), FsyncPolicy::Always)?.seal()?;
         Ok(())
@@ -349,7 +380,7 @@ impl AttemptEvidence {
         let mut current = self.cancel_unanswered(current)?;
         if current.as_ref().is_some_and(|log| !log.is_sealed()) {
             for record in records {
-                self.write(current.as_ref(), record)?;
+                self.write(current.as_ref(), Origin::Node, record)?;
                 current = self.open()?;
             }
         }
@@ -369,6 +400,7 @@ impl AttemptEvidence {
         }
         self.write(
             current.as_ref(),
+            Origin::Node,
             WardEvent::NodeAttemptRecovered { state, outcome },
         )
     }
@@ -385,6 +417,7 @@ impl AttemptEvidence {
         for action in unanswered {
             self.write(
                 current.as_ref(),
+                Origin::Node,
                 WardEvent::NodeActionAnswered {
                     action,
                     decision: NodeActionDecision::Cancelled,
@@ -409,6 +442,7 @@ impl AttemptEvidence {
     fn write(
         &self,
         current: Option<&VerifiedEvidence>,
+        origin: Origin,
         event: WardEvent,
     ) -> Result<(), EvidenceError> {
         let path = self.dir.join(EVIDENCE_LOG);
@@ -430,7 +464,7 @@ impl AttemptEvidence {
             .and_then(|first| now.duration_since(first).ok())
             .unwrap_or_default();
         let record = Chain::resume(head).append(
-            Origin::Node,
+            origin,
             event,
             Timestamp {
                 mono,
@@ -674,6 +708,45 @@ mod tests {
             verify(&dir, binding()),
             Err(EvidenceError::ForeignLog)
         ));
+    }
+
+    #[test]
+    fn an_adapters_claims_are_the_only_records_of_agent_origin() {
+        let claim = || WardEvent::AgentClaim {
+            kind: ward_events::ClaimKind::Note,
+            payload: ward_events::PayloadText::new("SessionStart"),
+        };
+        let (_dir, root) = private_root();
+        let evidence = AttemptEvidence::new(&root, binding());
+        evidence.append(paused(1)).unwrap();
+        evidence.append_claim(claim()).unwrap();
+        assert!(matches!(
+            evidence.append_claim(paused(2)),
+            Err(EvidenceError::ForeignLog)
+        ));
+        let log = verify(&evidence_dir(&root, binding()), binding()).unwrap();
+        let origins: Vec<Origin> = log.records().iter().map(|record| record.origin).collect();
+        assert_eq!(origins, [Origin::Node, Origin::Agent]);
+        assert!(!log.records()[1].is_enforcement_fact());
+
+        let (_other, root) = private_root();
+        let dir = evidence_dir(&root, binding());
+        DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&dir)
+            .unwrap();
+        let mut chain = Chain::genesis(session(binding()), genesis(binding()));
+        let mut writer =
+            LogWriter::create(dir.join(EVIDENCE_LOG), chain.head(), FsyncPolicy::Never).unwrap();
+        let record = chain
+            .append(Origin::Agent, paused(1), Timestamp::default())
+            .unwrap();
+        writer.append(&record).unwrap();
+        assert!(
+            matches!(verify(&dir, binding()), Err(EvidenceError::ForeignLog)),
+            "an agent-origin record that is not a claim is foreign"
+        );
     }
 
     #[test]

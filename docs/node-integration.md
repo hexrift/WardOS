@@ -9,8 +9,10 @@ additive within 1.3; and the action channel of
 and credentials as node capabilities of
 [ADR-0034](decisions/ADR-0034-node-brokered-credentials.md), the first node slice of #267,
 additive within 1.3 too, and approvals as a hold the node enforces of
-[ADR-0035](decisions/ADR-0035-node-approval-hold.md), #415, additive within 1.3 as well),
-and the client and process adapter that drive it
+[ADR-0035](decisions/ADR-0035-node-approval-hold.md), #415, additive within 1.3 as well,
+and agent adapters hosted on admitted workloads of
+[ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md), #279, additive within 1.3
+too), and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
 documents (ADR-0030 step 11, #332 slice 10): the walk from an empty host to a verified
@@ -61,6 +63,13 @@ admission example is a working test vector (§7.4).
   service until the control plane approves the request the node opens for it on the
   workload's first use (§6.9, §7.5);
   any other grant is refused `unsupported_grant` at `admit`, never run with less silently.
+- Which agent runtime a workload is, is the workload's to say and the operator's to host:
+  a workload may name an agent adapter of `ward-agent-adapter`'s contract beside its argv
+  (`workload.adapter`, §7.3), and a node started with `--agent-adapter <id>` launches it
+  through that contract — the adapter's environment and settings files and, for Claude
+  Code, a hook socket whose lines are recorded as agent-origin claims — under exactly the
+  authority the manifest grants, which is the same for every adapter (§6.10); any other
+  node refuses such a workload `unsupported_grant`.
 - How much the node runs at once is the operator's choice: a node started with
   `--max-running` executes at most that many attempts at once and refuses a `start` past
   it, or below a memory or disk headroom floor, `capacity_exhausted` with the task still
@@ -76,7 +85,9 @@ admission example is a working test vector (§7.4).
   than by proxy injection, or for anything but HTTP to one configured host (#267), a hold
   on anything but an allowlisted host or a brokered credential (an approval the workload
   asks for itself through the action channel is a recorded statement it acts on, §6.7; one
-  the node opens for a held capability is enforced, §6.9), an event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
+  the node opens for a held capability is enforced, §6.9), the `ward-agent` shim and a
+  loopback relay for a hosted agent adapter, so a real runtime's command hooks and model
+  route work (§6.10), an event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
   `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and any
   remote transport or mTLS. The only transport is a
   local Unix socket; remote transport and key bootstrap are #262. The full list, with what each gap means for a control plane, is
@@ -94,7 +105,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist [--credentials <file>]] \
   [--output-return] [--action-channel [--approval-hold]] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
-  [--client-uid <uid>]… [--client-group <group>]
+  [--agent-adapter <id>]… [--client-uid <uid>]… [--client-group <group>]
 ```
 
 | Flag | Required | Meaning |
@@ -112,6 +123,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--cgroup-root` | no | A cgroup v2 directory delegated to the node: writable by the node's uid and holding no process of its own (for systemd, a unit with `Delegate=yes` whose main process sits in a sub-cgroup, `DelegateSubgroup=`). The node refuses to start if it is not on a cgroup v2 filesystem, if one of the `cpu`, `memory` and `pids` controllers it offers cannot be enabled in its `cgroup.subtree_control`, or if no cgroup can be created under it. Every attempt then runs in a cgroup of its own, `<dir>/<attempt>`, created before the spawn and removed once the workload is reaped; a manifest's `resources` limits are written there (§7.5, §9); what the attempt used is read from the kernel's counters and recorded (§6.5); and the node reports `resources` with the controllers it enabled (§5). At start the node also kills and removes every attempt cgroup (`exec_…`) a previous run left under it. Needs `--task-root`. Without it every manifest with `resources` is refused `unsupported_grant` and nothing is measured. |
 | `--max-running` | no | At most this many attempts (1 to 1 024) execute at once: from the spawn until the reaper has reaped the workload, paused attempts and attempts whose kill is pending included. A `start` past it is refused `capacity_exhausted` with the task still `ready` and nothing materialised (§8.2); the node reports the bound, the running count and its headroom in `scheduling` (§5). Needs `--task-root`. Without it the node bounds nothing, as before. |
 | `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
+| `--agent-adapter` | no | Host this agent adapter (`claude-code`, `codex` or `process`; repeatable) on workloads that name it (§6.10, §7.3): the node launches the workload's argv through `ward-agent-adapter`'s contract, adding the adapter's environment and settings files and, for one with hooks, a hook socket whose lines are recorded as agent-origin claims, under exactly the authority the manifest grants; the capability document carries `adapters` (§5). An unknown id stops the node. Needs `--task-root`. Without it every workload naming an adapter is refused `unsupported_grant`. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 
@@ -392,10 +404,12 @@ well, `network.proxy_allowlist` reads `true`):
 | `actions.approval`, `actions.decision`, `actions.max_pending`, `actions.max_total`, `actions.max_wait_secs` | Present, as `"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}` after `verifier` (and after `output`, `resources` and `scheduling` when those are present), exactly when `lifecycle.start` is and the node was started with `--action-channel` (§2.1): a manifest's `actions` grant (§7.5) is then honoured within those ceilings, and `actions` and `answer` are served (§6.7). Otherwise the section is absent, which means no channel, and such a manifest is refused `unsupported_grant` at `admit`. Like `output`, the section is new in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--action-channel` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 | `actions.hold` | Present, and `true`, as the last field of `actions` (`…,"max_wait_secs":3600,"hold":true}`), exactly when the section is and the node was started with `--approval-hold` (§2.1): a manifest's `hold` (§7.5) is then honoured (§6.9). Absent means `false`, and such a manifest is refused `unsupported_grant` at `admit`. New in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--approval-hold` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
+| `adapters.contract`, `adapters.hosted` | Present, as `"adapters":{"contract":"1.0","hosted":["claude-code","codex","process"]}` after `actions` (or where `actions` would be), exactly when `lifecycle.start` is and the node was started with `--agent-adapter` (§2.1): `contract` is the `ward-agent-adapter` contract the node hosts adapters under, `hosted` the adapters its operator named, in that order, none twice. A workload naming one of them is honoured (§6.10); any other adapter is refused `unsupported_grant`. Otherwise the section is absent. New in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--agent-adapter` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
+
 Everything else (`isolation.backends`, `snapshots.diff`, `snapshots.read`, `verifier`) is
 `false`: the node offers none of it yet. 1.1 and 1.2
 documents keep their earlier content: they never carry `admit`, `start`, `output`,
-`resources`, `scheduling` or `actions`,
+`resources`, `scheduling`, `actions` or `adapters`,
 report `stop`, `pause` and `revoke` as `false`, and report the execution flags
 above as `false`, because a 1.1 or 1.2 connection cannot run anything.
 
@@ -690,6 +704,7 @@ evidence log per attempt it admits:
 <task-root>/<task>/<attempt>.output/result.json     the stored result of an output grant (§6.6; mode 0600)
 <task-root>/<task>/<attempt>.actions/actions.sock   the action channel's socket while the attempt runs (§6.7)
 <task-root>/<task>/<attempt>.credentials/leases.json the revocation handles of the attempt's live leases (§6.8)
+<task-root>/<task>/<attempt>.adapter/               a hosted adapter's settings files and hook socket while the attempt runs (§6.10)
 ```
 
 The directories (mode 0700, like `<task-root>/<task>/`) sit beside the attempt's
@@ -699,7 +714,9 @@ them.
 
 The log uses the `ward-events` session-log format unchanged (`event-model.md` §5):
 length-prefixed frames, each record hash-chained to the one before. Every record has
-origin `node`. The chain is bound to the attempt: its session id carries the execution
+origin `node`, except the claims of a hosted agent adapter (§6.10): `AgentClaim` records,
+and only those, with origin `agent`, the one origin no reader takes for an enforcement
+fact. The chain is bound to the attempt: its session id carries the execution
 attempt id's 128-bit value (`sess_` + the attempt's 26-character body), and its genesis
 hash is BLAKE3 over the bytes `ward-node attempt evidence v1` and a NUL, followed by the
 task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
@@ -711,6 +728,8 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `NodeAttemptIntervened` | A `pause` or `resume` took effect. | `pause` or `resume`, and the operation id. |
 | `NetworkRequested`, `NetworkDenied` | The attempt's egress proxy (§9: a `network.custom` manifest on a node with `--network-allowlist`) allowed or refused a destination. The node records the proxy's verdicts itself while the attempt runs, in the order they were made, at most 512 per attempt. | The destination host or literal and port; for an allow, the pinned addresses as the rule and the workload's host pid; for a denial, the reason (not allowlisted, private range, or a hold's `PolicyDeny` with the rule `hold:<state>:<n>`, §6.9). Never a request body. |
 | `ObservationsDropped` | Verdicts of the attempt's proxy could not be recorded: past the 512 bound, refused by the log's own bound, or still undecided when the attempt ended. One marker, before `NodeAttemptEnded`. | `source` `network`, the count and the bound. |
+| `AgentClaim` (origin `agent`) | The workload names an agent adapter the node hosts (§6.10): once right after `NodeAttemptLaunched`, the binding (`Note`, payload `{"agent_adapter":{…}}`); and for an adapter with hooks, one per line its hook socket accepted, appended while the attempt runs, at most 256 per attempt. A launch whose binding cannot be appended is killed and recorded as an ambiguous launch. | The binding: the contract, adapter, declared runtime, hooks, events, provider and requested model, all metadata. A hook line: `ToolUse` `<hook> <tool> <summary> → allow` (`PostToolUse` without the answer) or `Note` `SessionStart` / `Stop`. Claims, never facts. |
+| `ObservationsDropped` (source `hook`) | Hook lines past the 256 bound, refused by the log, or arriving at more than 8 connections at once. One marker, before `NodeAttemptEnded`. | `source` `hook`, the count and the bound. |
 | `NodeAttemptResourceUsage` | The attempt ran on a node started with `--cgroup-root` (§2.1), its workload ended and was reaped, and the node read its cgroup's counters. One record, before `NodeAttemptOutputCollected` (if any) and `NodeAttemptEnded`; not written for an attempt whose end was recorded before its reap (a `revoke` whose reap was not confirmed) or that never spawned. | The limits enforced (`cpu_millis_limit`, `memory_limit_bytes`, `pids_limit`, absent when not asked for) and what the tree used: `cpu_usage_usec` (`cpu.stat`), `memory_peak_bytes` (`memory.peak`), `pids_peak` (`pids.peak`), `memory_oom_kills` (`memory.events` `oom_kill`) and `pids_max_events` (forks refused at the limit, `pids.events` `max`); a counter the host's kernel or controllers do not provide is absent. |
 | `NodeAttemptOutputCollected` | The attempt was admitted with an `output` grant on a node started with `--output-return` (§6.6, §7.5), its workload ended and was reaped, and the node collected the output and stored it. One record, right before `NodeAttemptEnded`; never written for a workload the node lost track of. | For stdout and for stderr, the bytes returned and the bytes dropped past them; for every declared file, in declaration order, its workspace path, size, `BLAKE3-256` digest and status (`returned`, `digest_only`, `missing`, `not_a_regular_file`, `too_large`). Never the bytes. `result` returns exactly what this record digests. |
 | `NodeActionRequested` | The workload asked through the attempt's action channel (§6.7: an `actions` grant on a node started with `--action-channel`) and the node accepted the request, or the node opened a request itself for a held capability on its first use (§6.9: a `hold` on a node started with `--approval-hold`; summary `network <pattern>` or `credential <service>`). Appended before the control plane can list or answer it. | The node's request number (from 1), the kind (`approval`, `decision`), and the size and `BLAKE3-256` digest of the summary and of the detail. Never the text. |
@@ -761,7 +780,8 @@ ward replay --verify <task-root>/<task>/<attempt>.evidence/events.log
 
 or, in Rust, `ward_events::LogReader::open(path)?.verify_all()?` compared with
 `ward_events::log::parse_head` of `HEAD`, or `ward_node::evidence::verify(dir, binding)`,
-which also checks the genesis, the session id and that every record has origin `node`.
+which also checks the genesis, the session id and that every record has origin `node`,
+or is an `AgentClaim` with origin `agent`.
 `ward replay --json` prints one summary per record. The protocol does not carry the log
 or its head: `inspect` and receipts are unchanged. To answer who delegated the authority
 the attempt ran under, and to check that the log's `NodeAttemptAdmitted` record agrees
@@ -1091,13 +1111,88 @@ node runs no attempt (§6.4): it answers `cancelled` every request the log shows
 before `NodeAttemptRecovered`, an approval recorded before the crash stays the log's
 account of what was released, and a retry is a new attempt whose holds start held.
 
+### 6.10 Hosted agent adapters
+
+A node started with `--agent-adapter <id>` (§2.1) runs a workload whose envelope names
+that adapter (`workload.adapter`, §7.3) through `ward-agent-adapter`'s contract 1.0
+(agent-integration.md §10, [ADR-0036](decisions/ADR-0036-node-hosted-agent-adapters.md)).
+The adapters a node can host are `claude-code` (Claude Code, hooks `full`), `codex` (the
+Codex CLI, hooks `none`) and `process` (any program, hooks `none`).
+
+**The launch.** At `start` the node builds the launch with the contract's shared builder
+(`ward_agent_adapter::catalogue::launch`, which `ward claude` and `ward codex` use too):
+`argv[0]` is the program the adapter runs (a name on the sandbox `PATH` or an absolute
+path), followed by the adapter's fixed arguments (none for the shipped adapters) and the
+rest of the argv. The adapter adds its non-secret environment (Claude Code:
+`CLAUDE_CONFIG_DIR=/home/agent/.claude` and its telemetry switches; Codex:
+`CODEX_HOME=/home/agent/.codex`) and its settings files (Claude Code:
+`/home/agent/.claude/settings.json`, wiring its hooks), written mode 0600 into
+`<task-root>/<task>/<attempt>.adapter/` and bound read-only at their path. Nothing an
+adapter declares can name a mount, a network rule, a credential, a working directory or a
+variable the node owns (`HOME`, `PATH`, `TERM`, `WARD_*`, proxy settings): the workspace,
+the network namespace, the proxy and its allowlist, the leased credentials, the holds,
+the action channel, the cgroup and the empty environment are the manifest's, exactly as
+for a workload naming no adapter. The capability manifest is not involved in naming the
+adapter, so one manifest serves every adapter.
+
+**The provider.** Claude Code's provider is `anthropic`, Codex's `openai`; the node
+records it and does nothing else with it. It reads no model key from its own environment
+and sets no base URL or placeholder key. A runtime reaches its model API only through a
+manifest `credentials` grant (§6.8) for a service the operator configured — by
+convention named after the provider, for example `[service.anthropic]` with
+`upstream = "api.anthropic.com:443"`, `header = "x-api-key"` and `value_prefix = ""` — at
+`/<service>/…` on `WARD_PROXY_SOCKET`, the lease injected by the attempt's proxy and held
+when the manifest holds it (§6.9). The grant is the manifest's, so it is the same for
+every adapter.
+
+**Hooks.** For an adapter whose capability document declares semantic events (Claude
+Code), the node listens on `<task-root>/<task>/<attempt>.adapter/hooks.sock`, binds it at
+`/run/ward/hooks.sock` and sets `WARD_SOCKET=/run/ward/hooks.sock`. One request per
+connection, the contract's line (agent-integration.md §10.1):
+
+```json
+{"hook":"PreToolUse","tool":"Bash","summary":"make test"}
+```
+
+read within 4 KiB and 5 seconds, at most 8 connections at once; the answer is one line,
+
+```json
+{"decision":"allow","reason":"recorded by ward-node as a claim"}
+```
+
+and the line is recorded as an `AgentClaim` with origin `agent` (§6.5). A line outside the
+contract (not one such object, an unknown hook, a tool on `SessionStart`, a field the
+contract does not have, past 4 KiB or 5 seconds) gets zero bytes and is recorded nowhere.
+The answer is steering: nothing the node enforces reads a claim, and an approval claimed
+or answered here releases nothing; the approval the node enforces is a hold (§6.9). A
+hookless adapter gets no socket and no `WARD_SOCKET`. The socket closes and the adapter's
+directory is removed when the attempt ends.
+
+**Evidence.** Right after `NodeAttemptLaunched` the node records the binding, `AgentClaim
+{ Note }` with origin `agent` and payload
+
+```json
+{"agent_adapter":{"contract":"1.0","adapter":"codex","runtime":{"product":"OpenAI Codex CLI","version":"0.153.4"},"hooks":"none","events":[],"provider":"openai","model":"o4-mini"}}
+```
+
+where `runtime` is what the adapter declares (for `process`, the program's file name and
+no version), `model` what `--model`/`-m` requested (first-party adapters only), `provider`
+the adapter's. None of it is verified, and none of it is identity or authority.
+
+**Not yet.** A real Claude Code runs its hooks as the command `/run/ward/ward-agent hook`,
+and the node binds no `ward-agent` shim: until it does, only a runtime that writes the
+contract's lines itself reaches the hook socket. A runtime that needs an HTTP base URL for
+its provider cannot use the proxy socket's route until the node has a loopback relay
+(§1). Hook approvals are not bridged onto the action channel.
+
 ## 7. The admission envelope
 
 ### 7.1 Shape
 
 The envelope is a JSON object. Shown pretty-printed; whitespace and key order are free
 (§7.4). Every field is required except the lease's `parent_lease_id` and `delegated_by`,
-which read as `null` when absent (send them explicitly); unknown or duplicate fields are
+which read as `null` when absent (send them explicitly), and `workload.adapter`, which is
+absent for a workload naming no agent adapter (§7.3); unknown or duplicate fields are
 refused at every level.
 
 ```json
@@ -1180,6 +1275,7 @@ refused at every level.
 | `workload.capability_manifest` | `{"hash","bytes"}`: `bytes` is the hex of 1–8 192 manifest bytes and `hash` is `BLAKE3-256` of those decoded bytes. The decoded bytes must be one manifest in the grammar of §7.5: a manifest outside it fails envelope decoding (`authority_denied`), and one that asks for a grant this node does not honour is refused `unsupported_grant`. |
 | `workload.snapshot` | 64 lower-case hex digits: exactly the line `ward-node snapshot import` printed (§2.4). Must be in the node's store at `start`. |
 | `workload.wall_clock_budget_ms` | Integer ≥ 1. Mandatory; the workload is killed when it is reached, measured from spawn. |
+| `workload.adapter` | Optional (new in this revision of 1.3; a node of an earlier revision fails to decode an envelope that carries it). `{"id": "<adapter>"}`: run the argv as that agent adapter (§6.10). `id` is 1–64 bytes of `a-z 0-9 . _ -`, starting with a letter or digit, and the only field; with it, `argv[0]` must be a name on the sandbox `PATH` or an absolute path. Outside this grammar the envelope fails decoding (`authority_denied`); an id the node does not host is refused `unsupported_grant`. Absent, it is not sent: never `null`. |
 | `issued_at_unix_ms`, `expires_at_unix_ms` | Envelope validity at the node clock, checked at `admit` and again at `start`. It does not bound a running workload; the budget does. |
 | `version` | Integer ≥ 1, strictly greater than the last version the node durably accepted for this **task** (not attempt), across restarts. |
 
@@ -1450,7 +1546,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9); and a `workload.adapter` only when the node lists it in `adapters.hosted` and can build its launch from the argv (§6.10) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1551,7 +1647,8 @@ The workload runs in bubblewrap with the workspace bound writable at `/work` (it
 directory), a private `/tmp` and `/home/agent`, read-only system directories, a network
 namespace holding only loopback, and only `HOME`, `PATH`, `TERM` and `PWD` set (`PWD` is
 bubblewrap's, set to `/work` when it enters the working directory; nothing of the node's
-own environment is passed on). Output is drained; without an `output` grant none of it
+own environment is passed on), plus, for a workload naming an agent adapter, that
+adapter's own variables and, for one with hooks, `WARD_SOCKET` (§6.10). Output is drained; without an `output` grant none of it
 is kept, and with one (on a node started with `--output-return`) the first `stdio_bytes`
 of each stream are kept and returned by `result` with the declared files (§6.6).
 

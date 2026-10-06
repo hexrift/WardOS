@@ -165,11 +165,10 @@ implementation, while keeping the existing contract crate and event catalogue in
 
 ## 8. What remains
 
-* Hosting adapters on `ward-node`: a node task manifest is runtime-neutral already, but
-  the node runs an `argv`, not an adapter; the action channel (#404) is the future
-  semantic channel there. The acceptance "two runtimes execute the same Ward task
-  manifest with equivalent node-enforced authority" is proven here for the session path
-  only.
+* Hosting adapters on `ward-node`: decided by [ADR-0036](ADR-0036-node-hosted-agent-adapters.md)
+  (the workload names an adapter, the node launches it through this contract and records
+  its hook lines as claims), which proves the acceptance "two runtimes execute the same
+  Ward task manifest with equivalent node-enforced authority" for the node as well.
 * Serving capability requests, cooperative cancellation and structured task results.
 * Loading a custom adapter's document and launch spec from a file
   (`ward agent --adapter <file>`), and first-party documents for Copilot, `OpenCode` and

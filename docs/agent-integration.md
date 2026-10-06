@@ -372,7 +372,8 @@ name the `npm install -g` command.
 
 Every agent runs through one versioned contract, `ward-agent-adapter` 1.0, and one
 launch path. An adapter changes what the session *sees*; nothing in it can change what
-the session *allows*.
+the session *allows*. The same holds on `ward-node`, where an admitted workload names its
+adapter (§10.9, ADR-0036).
 
 ### 10.1 What an adapter is
 
@@ -518,12 +519,42 @@ test build has no shim in the sandbox — and the Codex fake checks the environm
 
 ### 10.8 Not yet
 
-* `ward-node` runs an `argv`, not an adapter: a node task's manifest is already the same
-  for any runtime, and the action channel (#404) is the semantic channel to come; the
-  equivalence above is proven for local sessions.
+* On `ward-node` (§10.9) a real Claude Code finds no `ward-agent` shim for its command
+  hooks and no loopback relay for its provider route; hook approvals are not bridged onto
+  the node's action channel.
 * Capability requests, cooperative cancellation and structured task results have
   contract shapes and no host path (`coverage` reports them as unserved for an adapter
   that claims them).
 * A custom adapter's document and launch spec cannot be loaded from a file yet; it runs
   as the generic process adapter.
 * The verifier's and `ward prepare`'s launches still inherit the host environment.
+
+### 10.9 On `ward-node` (ADR-0036)
+
+A control plane runs an agent on a node by naming its adapter beside the argv in the
+signed envelope's workload, `"adapter":{"id":"claude-code"}` (node-integration.md §7.3).
+The capability manifest is not involved: the same manifest bytes serve every adapter, so
+"the same task manifest" is literal. A node hosts the adapters its operator names
+(`ward-node --agent-adapter claude-code --agent-adapter codex`), advertises them in its
+capability document (`"adapters":{"contract":"1.0","hosted":[…]}`) and refuses any other
+`unsupported_grant` at `admit`.
+
+| | On a node |
+| --- | --- |
+| Launch | `ward_agent_adapter::catalogue::launch(id, argv)`, the builder sessions take their first-party launches from: `argv[0]` is the program, the adapter adds its fixed arguments, its environment and its settings files (bound read-only under `/home/agent`), nothing else |
+| Authority | The manifest's, exactly as for a plain workload: the workspace, no network but the attempt's proxy and its allowlist, leased credentials, holds, the action channel, cgroup limits, an empty environment |
+| Provider | Metadata. The node reads no model key from its environment and sets no base URL; a runtime reaches its model API only through a manifest `credentials` grant for a service the operator configured (named after the provider by convention), at `/<service>/…` on `WARD_PROXY_SOCKET` |
+| Hooks | For an adapter with semantic events (Claude Code), a hook socket at `/run/ward/hooks.sock` (`WARD_SOCKET`) speaking §10.1's lines: each is answered `allow` and recorded as an `AgentClaim` with origin `agent`, at most 256 per attempt. A hookless adapter gets no socket |
+| Binding | §10.4's `agent_adapter` claim, right after the node's `NodeAttemptLaunched` |
+
+`crates/ward-node/tests/node_adapter_conformance.rs` is §10.7's suite against the real
+`ward-node` binary: the same signed manifest through Claude Code (hooks `full`), Codex and
+the generic adapter, the same hostile probe (a host secret, the node's state, the
+attempt's own evidence log and leases, writes outside the workspace and into `/usr`, an
+unlisted host, a provider's API and a private address through the proxy, direct egress,
+DNS) refused identically, identical enforcement records, none of the node's model keys
+in the sandbox, the upstream seeing only the node's leased credential on the two routes
+the manifest grants, and the semantic events each document declares; a forged approval,
+answered `allow` on Claude Code's hook socket or sent by Codex to a socket it does not
+have, is refused by the proxy and recorded the same; an adapter the node does not host is
+refused before the version is consumed.

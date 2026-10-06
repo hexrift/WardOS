@@ -36,6 +36,7 @@ use ward_events::{AgentId, Blake3Hash, NodeId, SessionId, SnapshotId};
 
 use crate::TaskBinding;
 use crate::actions::{ActionError, ActionGrant, ActionGrantWire};
+use crate::adapter::WorkloadAdapter;
 use crate::credentials::{
     CredentialError, CredentialGrantWire, CredentialGrants, grants_from_wire,
 };
@@ -98,6 +99,9 @@ pub enum TaskAdmissionError {
     /// The `hold` is outside its grammar (nothing held, too much, a repeat, a host or
     /// service the manifest does not grant, or no `actions` grant naming `approval`).
     MalformedHold(HoldError),
+    /// The workload names an adapter but its program (`argv[0]`) is not a launch program:
+    /// a name on the sandbox `PATH` or an absolute path.
+    AdapterProgram,
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -136,6 +140,9 @@ impl Display for TaskAdmissionError {
             Self::MalformedActionGrant(_) => "capability manifest actions grant is invalid",
             Self::MalformedCredentialGrant(_) => "capability manifest credentials grant is invalid",
             Self::MalformedHold(_) => "capability manifest hold is invalid",
+            Self::AdapterProgram => {
+                "a workload naming an adapter runs a program on the sandbox PATH or at an absolute path"
+            }
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -667,6 +674,8 @@ pub struct TaskWorkload {
     capability_manifest: CapabilityManifestBytes,
     snapshot: SnapshotId,
     wall_clock_budget_ms: NonZeroU64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter: Option<WorkloadAdapter>,
 }
 
 impl TaskWorkload {
@@ -688,7 +697,23 @@ impl TaskWorkload {
             capability_manifest,
             snapshot,
             wall_clock_budget_ms,
+            adapter: None,
         })
+    }
+
+    /// The same workload run as the agent adapter `adapter` (ADR-0036): its argv is the
+    /// adapter's command line, `argv[0]` the program the adapter launches.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TaskAdmissionError::AdapterProgram`] when `argv[0]` is a relative path
+    /// with a `/`, which no adapter launches.
+    pub fn with_adapter(mut self, adapter: WorkloadAdapter) -> Result<Self, TaskAdmissionError> {
+        let program = self.argv.args().first().map_or("", String::as_str);
+        ward_agent_adapter::LaunchSpec::new(program, Vec::new(), Vec::new(), Vec::new(), None)
+            .map_err(|_| TaskAdmissionError::AdapterProgram)?;
+        self.adapter = Some(adapter);
+        Ok(self)
     }
 
     /// The workload argv.
@@ -714,6 +739,12 @@ impl TaskWorkload {
     pub const fn wall_clock_budget_ms(&self) -> u64 {
         self.wall_clock_budget_ms.get()
     }
+
+    /// The agent adapter the argv runs as; `None` for a plain workload.
+    #[must_use]
+    pub const fn adapter(&self) -> Option<&WorkloadAdapter> {
+        self.adapter.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -724,6 +755,15 @@ struct TaskWorkloadWire {
     #[serde(deserialize_with = "deserialize_lower_hex_snapshot")]
     snapshot: SnapshotId,
     wall_clock_budget_ms: u64,
+    #[serde(default, deserialize_with = "deserialize_present_adapter")]
+    adapter: Option<WorkloadAdapter>,
+}
+
+fn deserialize_present_adapter<'de, D>(deserializer: D) -> Result<Option<WorkloadAdapter>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    WorkloadAdapter::deserialize(deserializer).map(Some)
 }
 
 impl<'de> Deserialize<'de> for TaskWorkload {
@@ -732,13 +772,17 @@ impl<'de> Deserialize<'de> for TaskWorkload {
         D: Deserializer<'de>,
     {
         let wire = TaskWorkloadWire::deserialize(deserializer)?;
-        Self::new(
+        let workload = Self::new(
             wire.argv,
             wire.capability_manifest,
             wire.snapshot,
             wire.wall_clock_budget_ms,
         )
-        .map_err(D::Error::custom)
+        .map_err(D::Error::custom)?;
+        match wire.adapter {
+            Some(adapter) => workload.with_adapter(adapter).map_err(D::Error::custom),
+            None => Ok(workload),
+        }
     }
 }
 
@@ -1191,8 +1235,9 @@ mod tests {
         AdmissionEnvelopeJson, AdmissionVersion, CapabilityManifest, CapabilityManifestBytes,
         HostAllowlist, IssuerProof, IssuerSignature, MAX_ADMISSION_ENVELOPE_BYTES,
         MAX_ADMISSION_LINEAGE, NetworkGrant, TaskAdmissionAuthority, TaskAdmissionEnvelope,
-        TaskAdmissionError, TaskWorkload, WorkloadArgv,
+        TaskAdmissionError, TaskWorkload, WorkloadAdapter, WorkloadArgv,
     };
+    use ward_agent_adapter::AdapterId;
 
     fn decode(json: &str) -> Result<TaskAdmissionEnvelope, TaskAdmissionError> {
         TaskAdmissionEnvelope::decode_json(json.as_bytes())
@@ -1406,6 +1451,68 @@ mod tests {
             .unwrap()
             .remove("wall_clock_budget_ms");
         assert!(decode(&missing.to_string()).is_err());
+    }
+
+    #[test]
+    fn a_workload_may_name_the_adapter_its_argv_runs_as_outside_the_manifest() {
+        let adapter = |id: &str| WorkloadAdapter::new(AdapterId::new(id).unwrap());
+        let plain = workload();
+        assert_eq!(plain.adapter(), None);
+        assert!(
+            !serde_json::to_string(&plain).unwrap().contains("adapter"),
+            "a workload naming no adapter is spelled as before"
+        );
+        let named = plain.clone().with_adapter(adapter("claude-code")).unwrap();
+        assert_eq!(named.adapter(), Some(&adapter("claude-code")));
+        assert_eq!(named.capability_manifest(), plain.capability_manifest());
+        let json = serde_json::to_string(&named).unwrap();
+        assert!(
+            json.ends_with(r#","wall_clock_budget_ms":600000,"adapter":{"id":"claude-code"}}"#),
+            "{json}"
+        );
+
+        let mut value = envelope_value();
+        value["workload"]["adapter"] = serde_json::json!({"id": "codex"});
+        let decoded = decode(&value.to_string()).unwrap();
+        assert_eq!(decoded.workload().adapter(), Some(&adapter("codex")));
+        value["workload"]["adapter"] = serde_json::json!({"id": "gemini-cli"});
+        assert!(
+            decode(&value.to_string()).is_ok(),
+            "the node decides what it hosts"
+        );
+        for bad in [
+            serde_json::json!(null),
+            serde_json::json!("codex"),
+            serde_json::json!({"id": "Codex"}),
+            serde_json::json!({"id": "codex", "mounts": ["/"]}),
+            serde_json::json!({}),
+        ] {
+            let mut value = envelope_value();
+            value["workload"]["adapter"] = bad.clone();
+            assert!(decode(&value.to_string()).is_err(), "{bad}");
+        }
+
+        let relative = TaskWorkload::new(
+            WorkloadArgv::new(vec!["bin/claude".to_owned()]).unwrap(),
+            manifest(),
+            snapshot(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            relative.clone().with_adapter(adapter("claude-code")),
+            Err(TaskAdmissionError::AdapterProgram)
+        );
+        assert!(
+            relative.adapter().is_none(),
+            "without an adapter any argv[0] runs as before"
+        );
+        let mut value = envelope_value();
+        value["workload"]["argv"] = serde_json::json!(["./claude"]);
+        value["workload"]["adapter"] = serde_json::json!({"id": "claude-code"});
+        assert!(decode(&value.to_string()).is_err());
+        value["workload"]["argv"] = serde_json::json!(["/opt/claude/bin/claude", "-p"]);
+        assert!(decode(&value.to_string()).is_ok());
     }
 
     #[test]

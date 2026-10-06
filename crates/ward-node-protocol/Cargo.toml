@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "WardOS: versioned ward-node/control-plane protocol types"
 
 [dependencies]
+ward-agent-adapter = { path = "../ward-agent-adapter", version = "0.18.0" }
 ward-authority = { path = "../ward-authority", version = "0.18.0" }
 ward-events = { path = "../ward-events", version = "0.18.0" }
 serde = { workspace = true }
