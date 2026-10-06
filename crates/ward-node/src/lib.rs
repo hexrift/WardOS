@@ -102,6 +102,7 @@ pub mod adapters;
 pub mod admission;
 pub mod admit;
 pub mod audit;
+pub mod capsule;
 pub mod cgroup;
 pub mod credentials;
 pub mod egress;
@@ -138,6 +139,7 @@ use ward_node_protocol::{
 };
 
 use crate::admit::NodeAdmission;
+use crate::capsule::CapsulePlacement;
 use crate::execution::NodeExecution;
 use crate::peer::{ClientGroup, ClientUids, PeerGate};
 use crate::records::TaskRecordError;
@@ -231,6 +233,7 @@ pub struct NodeService {
     approval_hold: bool,
     credentials: bool,
     agent_adapters: Option<AdapterCapabilities>,
+    placement: Option<CapsulePlacement>,
     tasks: Arc<Mutex<TaskRegistry>>,
 }
 
@@ -255,6 +258,7 @@ impl NodeService {
             approval_hold: false,
             credentials: false,
             agent_adapters: None,
+            placement: None,
             tasks: Arc::new(Mutex::new(TaskRegistry::default())),
         })
     }
@@ -284,6 +288,7 @@ impl NodeService {
             approval_hold: false,
             credentials: false,
             agent_adapters: None,
+            placement: None,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_admission(
                 MAX_NODE_TASKS,
                 admission,
@@ -313,6 +318,7 @@ impl NodeService {
         let approval_hold = execution.honours_approval_hold();
         let credentials = execution.honours_credentials();
         let agent_adapters = execution.agent_adapters();
+        let placement = Some(execution.placement());
         Ok(Self {
             capabilities,
             supported: WARD_NODE_PROTOCOL,
@@ -324,6 +330,7 @@ impl NodeService {
             approval_hold,
             credentials,
             agent_adapters,
+            placement,
             tasks: Arc::new(Mutex::new(TaskRegistry::with_execution(
                 MAX_NODE_TASKS,
                 admission,
@@ -415,9 +422,12 @@ impl NodeService {
         let mut adapters = None;
         let lifecycle = if supports_task_admission(protocol) {
             isolation.namespaces = NamespaceCapabilities {
-                sandbox: self.executes,
+                sandbox: false,
                 user_namespace: self.executes,
             };
+            if let Some(placement) = &self.placement {
+                isolation = placement.isolation(isolation);
+            }
             network.offline = self.executes;
             network.proxy_allowlist = self.executes && self.network_allowlist;
             credentials = CredentialCapabilities {

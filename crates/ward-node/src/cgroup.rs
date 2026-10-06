@@ -381,6 +381,12 @@ impl CgroupLauncher {
     }
 }
 
+impl crate::capsule::CapsuleBackend for CgroupLauncher {
+    fn descriptor(&self) -> crate::capsule::CapsuleBackendDescriptor {
+        crate::capsule::CapsuleBackendDescriptor::BUBBLEWRAP
+    }
+}
+
 impl TaskLauncher for CgroupLauncher {
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
         let cgroup = self
