@@ -389,18 +389,36 @@ pub fn service_name(service: &str) -> String {
 /// [`Approvals::grants`] (for a still-live credential) and its expiry sweep
 /// (for one just retired into [`Approvals::grant_history`]), so the two never
 /// disagree about what a credential's grant looks like.
-fn credential_grant(c: &Credential, unknown_launches: &BTreeSet<u64>) -> Grant {
+fn credential_grant(
+    c: &Credential,
+    unknown_launches: &BTreeSet<u64>,
+    lease_notes: &BTreeMap<u64, String>,
+) -> Grant {
+    let scope = format!("{} · {}", c.permissions.join(", "), c.hosts.join(", "));
     Grant {
         id: c.id,
         kind: GrantKind::Credential,
         label: service_name(&c.service),
-        scope: format!("{} · {}", c.permissions.join(", "), c.hosts.join(", ")),
+        scope: with_lease_note(&scope, lease_notes.get(&c.id).map(String::as_str)),
         lifetime: match c.launch_key {
             Some(key) if unknown_launches.contains(&key) => Lifetime::LaunchUnknown,
             _ => Lifetime::Launch,
         },
         granted_at_unix_ms: c.granted_at_unix_ms,
         revoke_state: c.revoke_state,
+    }
+}
+
+/// What separates a credential grant's scope from its provider lease note
+/// (#267): every note starts with `provider `.
+const LEASE_NOTE_MARK: &str = " · provider ";
+
+/// `scope`, with any earlier lease note replaced by `note` (or removed).
+fn with_lease_note(scope: &str, note: Option<&str>) -> String {
+    let base = scope.split(LEASE_NOTE_MARK).next().unwrap_or(scope);
+    match note.and_then(|n| n.strip_prefix("provider ")) {
+        Some(rest) => format!("{base}{LEASE_NOTE_MARK}{rest}"),
+        None => base.to_owned(),
     }
 }
 
@@ -1200,6 +1218,9 @@ struct State {
     /// marked [`RevokeState::Unconfirmed`] does *not* enter here — it is not
     /// retired at all, and keeps showing in [`Approvals::grants`] instead.
     grant_history: VecDeque<Grant>,
+    /// The latest provider lease outcome per credential grant id (#267,
+    /// [`Approvals::note_lease`]), shown at the end of the grant's scope.
+    lease_notes: BTreeMap<u64, String>,
 }
 
 /// A revoke wait's shared outcome: `None` while the leader's wait is still
@@ -1272,7 +1293,7 @@ impl State {
         };
         for mut c in expired {
             c.revoke_state = RevokeState::Expired;
-            let grant = credential_grant(&c, &self.unknown_launches);
+            let grant = credential_grant(&c, &self.unknown_launches, &self.lease_notes);
             self.record_grant_history(grant);
         }
     }
@@ -1380,6 +1401,52 @@ impl Approvals {
         id
     }
 
+    /// Record a provider-backed credential's lease outcome (#267): the text
+    /// joins the grant's scope line, live or in the history; a renewal's new
+    /// expiry replaces the credential's own; and `retire` moves a grant that
+    /// is still `Active` or `Suspended` into the history in that state — a
+    /// lease withdrawn by a pause, its launch's end or its expiry is no
+    /// longer authority. A grant `ward session revoke` is already revoking is
+    /// left to that revoke to conclude (and to record `CredentialRevoked`),
+    /// only noted. A note for an id nothing knows is kept for nothing and
+    /// dropped.
+    pub fn note_lease(&self, note: &crate::control::LeaseNote) {
+        let mut state = self.lock();
+        let known = state.credentials.iter().any(|c| c.id == note.id)
+            || state.grant_history.iter().any(|g| g.id == note.id);
+        if !known {
+            return;
+        }
+        state.lease_notes.insert(note.id, note.text.clone());
+        if let Some(pos) = state.credentials.iter().position(|c| c.id == note.id) {
+            if let Some(ms) = note.expires_at_unix_ms {
+                state.credentials[pos].expires_at_unix_ms = Some(ms);
+            }
+            let retirable = matches!(
+                state.credentials[pos].revoke_state,
+                RevokeState::Active | RevokeState::Suspended
+            );
+            if let Some(retire) = note.retire.filter(|_| retirable) {
+                let mut c = state.credentials.remove(pos);
+                c.revoke_state = match retire {
+                    crate::control::LeaseRetire::Revoked => RevokeState::Revoked,
+                    crate::control::LeaseRetire::Expired => RevokeState::Expired,
+                };
+                let grant = credential_grant(&c, &state.unknown_launches, &state.lease_notes);
+                state.record_grant_history(grant);
+            }
+            return;
+        }
+        if let Some(g) = state
+            .grant_history
+            .iter_mut()
+            .rev()
+            .find(|g| g.id == note.id && g.kind == GrantKind::Credential)
+        {
+            g.scope = with_lease_note(&g.scope, Some(&note.text));
+        }
+    }
+
     /// Retire every credential granted for launch `key` (the same opaque id
     /// [`record_credential`](Self::record_credential) was called with):
     /// called once that launch's route is closed (its terminal record —
@@ -1457,7 +1524,7 @@ impl Approvals {
         let mut grants: Vec<Grant> = state
             .credentials
             .iter()
-            .map(|c| credential_grant(c, &state.unknown_launches))
+            .map(|c| credential_grant(c, &state.unknown_launches, &state.lease_notes))
             .chain(state.remembered.values().cloned())
             .collect();
         // Order by when the grant was made; on a tie (the same millisecond, common
@@ -1597,7 +1664,7 @@ impl Approvals {
                 // Retained, not dropped (#140: "history remains inspectable"):
                 // the same terminal treatment `begin_revoke_wait` already gives
                 // an `allow-session` answer, which has no wait to conclude here.
-                let grant = credential_grant(&c, &state.unknown_launches);
+                let grant = credential_grant(&c, &state.unknown_launches, &state.lease_notes);
                 state.record_grant_history(grant);
                 true
             }
@@ -2085,7 +2152,7 @@ impl Approvals {
         });
         for mut c in newly_expired {
             c.revoke_state = RevokeState::Expired;
-            let grant = credential_grant(&c, &state.unknown_launches);
+            let grant = credential_grant(&c, &state.unknown_launches, &state.lease_notes);
             state.record_grant_history(grant);
         }
         for g in state.remembered.values_mut() {
@@ -3765,6 +3832,127 @@ mod tests {
         assert_eq!(
             history.last().unwrap().granted_at_unix_ms,
             GRANT_HISTORY_CAP as u64 + 2
+        );
+    }
+}
+
+#[cfg(test)]
+mod lease_note_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use crate::control::{LeaseNote, LeaseRetire};
+
+    fn note(id: u64, text: &str, retire: Option<LeaseRetire>) -> LeaseNote {
+        LeaseNote {
+            id,
+            text: text.to_owned(),
+            retire,
+            expires_at_unix_ms: None,
+        }
+    }
+
+    #[test]
+    fn a_lease_note_joins_the_live_grant_and_a_renewal_moves_its_expiry() {
+        let approvals = Approvals::new();
+        let id = approvals.record_credential_with_expiry(
+            "artifacts",
+            "artifacts.example",
+            vec!["read".into()],
+            Some(1),
+            1_000,
+            Some(61_000),
+        );
+        approvals.note_lease(&LeaseNote {
+            expires_at_unix_ms: Some(91_000),
+            ..note(id, "provider bao: renewed", None)
+        });
+        let grants = approvals.grants_at(70_000);
+        assert_eq!(grants.len(), 1, "renewed past its first expiry: still live");
+        assert_eq!(
+            grants[0].scope,
+            "read · artifacts.example · provider bao: renewed"
+        );
+        // A later note replaces the earlier one rather than piling up.
+        approvals.note_lease(&note(
+            id,
+            "provider bao: renewal refused (max ttl reached)",
+            None,
+        ));
+        assert_eq!(
+            approvals.grants_at(70_000)[0].scope,
+            "read · artifacts.example · provider bao: renewal refused (max ttl reached)"
+        );
+        assert!(
+            approvals.grants_at(91_000).is_empty(),
+            "expired at the renewed time"
+        );
+    }
+
+    #[test]
+    fn a_withdrawn_lease_retires_its_grant_into_the_history_with_the_outcome() {
+        let approvals = Approvals::new();
+        let a = approvals.record_credential("artifacts", "a.example", vec![], Some(1), 1_000);
+        let b = approvals.record_credential("registry", "r.example", vec![], Some(2), 1_000);
+        approvals.note_lease(&note(
+            a,
+            "provider bao: revoke unconfirmed (unreachable) (session paused)",
+            Some(LeaseRetire::Revoked),
+        ));
+        approvals.note_lease(&note(
+            b,
+            "provider bao: revoked at the provider (lease expired)",
+            Some(LeaseRetire::Expired),
+        ));
+        assert!(approvals.grants().is_empty());
+        let history = approvals.grant_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].revoke_state, RevokeState::Revoked);
+        assert!(
+            history[0]
+                .line()
+                .contains("revoke unconfirmed (unreachable)"),
+            "{}",
+            history[0].line()
+        );
+        assert_eq!(history[1].revoke_state, RevokeState::Expired);
+        // A note arriving after retirement still reaches the history line.
+        approvals.note_lease(&note(
+            a,
+            "provider bao: revoked at the provider (launch ended)",
+            None,
+        ));
+        assert!(
+            approvals.grant_history()[0]
+                .scope
+                .ends_with("revoked at the provider (launch ended)")
+        );
+        // An unknown id is dropped.
+        approvals.note_lease(&note(99, "provider bao: renewed", None));
+        assert_eq!(approvals.grant_history().len(), 2);
+    }
+
+    #[test]
+    fn a_grant_being_revoked_is_only_noted_its_revoke_concludes_it() {
+        let approvals = Approvals::new();
+        let id = approvals.record_credential("artifacts", "a.example", vec![], Some(1), 1_000);
+        assert!(approvals.begin_revoke_wait(id).is_some());
+        approvals.note_lease(&note(
+            id,
+            "provider bao: revoked at the provider (grant revoked)",
+            Some(LeaseRetire::Revoked),
+        ));
+        let grants = approvals.grants();
+        assert_eq!(grants.len(), 1, "still the revoke's to conclude");
+        assert_eq!(grants[0].revoke_state, RevokeState::Revoking);
+        assert!(
+            approvals.finish_revoke(id, &RevokeOutcome::Withdrawn),
+            "and it does"
+        );
+        let history = approvals.grant_history();
+        assert!(
+            history[0].scope.ends_with("(grant revoked)"),
+            "{}",
+            history[0].scope
         );
     }
 }

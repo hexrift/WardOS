@@ -2,9 +2,12 @@
 
 Status: living document; the project's phase is in docs/status.toml and the README.
 Implemented: the model-API gateways (Anthropic, OpenAI; see
-[agent-integration.md](agent-integration.md) §3) and the GitHub adapter in gateway
-mode (§4). Registry and SSH adapters, minted tokens and the encrypted vault are ahead. Decision record:
-[ADR-0008](decisions/ADR-0008-credential-broker.md).
+[agent-integration.md](agent-integration.md) §3), the GitHub adapter in gateway
+mode (§4), and the credential-provider interface with a Vault/OpenBao backend for
+short-lived, proxy-injected leases (§5, #267). Registry and SSH adapters, cloud STS
+backends, minted tokens and the encrypted vault are ahead. Decision records:
+[ADR-0008](decisions/ADR-0008-credential-broker.md),
+[ADR-0032](decisions/ADR-0032-credential-provider-interface.md).
 
 ## 1. Problem
 
@@ -80,12 +83,105 @@ every path. A read-only route passes `GET`, `HEAD`, `OPTIONS` and a `POST` to
 is never sent for a request the grant did not cover. The check is a pure function of the
 route and the request line; the upstream's own authorisation still applies on top.
 
-## 5. Backend
+## 5. Backend: credential providers
 
-Phase 2 backend: an encrypted file vault under `/var/lib/ward/vault/`, sealed with
-`systemd-creds` (TPM-backed where available, Phase 7) and unlocked at `wardd` start by
-the user's login session. The backend is a trait (`CredentialBackend { lease(...) }`) so
-that 1Password/Bitwarden/Vault/enterprise brokers are drop-ins later.
+Every brokered credential comes from a **credential provider**
+(`ward-daemon::credentials::CredentialProvider`, ADR-0032): `issue(request) -> lease`,
+`renew`, `revoke` and `health`. A request names the session (the task), the service, the
+scope (resource paths at the upstream, a permission set, whether writes are allowed), a
+TTL, a maximum TTL and an audience (the upstream host). Two providers exist:
+
+| Provider | Source | Lease | Revocation at the source |
+| --- | --- | --- | --- |
+| `local-vault` | the host variable named by the route, else `$WARD_STATE_DIR/vault/<NAME>` (`ward vault set`) — what the model-API and GitHub gateways always read | static value, client-side lease (the route's validity) | none: withdrawing the route is the revocation (`not revocable at the source`) |
+| Vault / OpenBao (`kind = "vault"` or `"openbao"`), engine `token` | `POST /v1/auth/token/create/<role>` with `ttl`, `explicit_max_ttl`, the granted permissions as `policies`, `no_default_policy`, and `meta` naming session, service and audience | the provider's token TTL, renewed with `auth/token/renew` | `auth/token/revoke-accessor` (an already-gone token, `invalid accessor`, counts as revoked) |
+| Vault / OpenBao, engine `kv` | `GET /v1/<mount>/data/<path>`, one field (KV v2) | static value, client-side lease | none, as for the local vault |
+
+The encrypted vault sealed with `systemd-creds` (Phase 7 target) and cloud STS backends
+are not implemented yet.
+
+### 5.1 Configuration (host only)
+
+Providers and the services they back are configured in
+`$WARD_STATE_DIR/credentials.toml` (`~/.local/state/ward/credentials.toml`), never in a
+repository:
+
+```toml
+[provider.bao]
+kind = "openbao"
+address = "https://bao.internal:8200"     # TLS required
+token_file = "/home/me/.config/ward/bao.token"   # 0600; the broker's own token
+ca_bundle = "/etc/ward/bao-ca.pem"        # optional; the host trust store otherwise
+timeout_ms = 2000                         # every call; at most 10 s
+max_ttl_secs = 3600                       # the longest lease this provider may issue
+
+[service.artifacts]
+provider = "bao"
+engine = "token"                          # or "kv" with mount, path, field
+role = "ward-artifacts"
+rule = "ask"                              # or "allow"
+permissions = ["artifacts-read"]          # "write" opens non-read methods on the route
+ttl_secs = 600
+max_ttl_secs = 900                        # no renewal reaches past this from issue
+renew = true
+upstream = "artifacts.example.com:443"
+prefix = "/artifacts"                     # the route on the sandbox's relay
+header = "authorization"
+value_prefix = "Bearer "
+paths = ["/v1/repos/acme"]                # the resources the route may reach
+base_url_env = "ARTIFACTS_URL"            # the sandbox gets http://127.0.0.1:3128/artifacts
+```
+
+* The file holds no secret. `token_file` must be the user's own regular file with no
+  group or other access (a symlink is refused); `credentials.toml` itself must be the
+  user's and writable by no one else, since it decides where that token is sent.
+* Plain `http://` is refused unless `insecure_loopback = true` and the address is a
+  loopback IP literal — a test mode, not a deployment.
+* The host's `rule` and `permissions` enter the policy merge as the **system layer**: a
+  project's `.ward/policy.yaml` can narrow them (`credentials: {artifacts: deny}`, a
+  smaller permission set) but can never introduce a provider-backed service or widen
+  one. `ask` needs `ward claude --grant artifacts`.
+* A service may not reuse a built-in service, a default deny class (`cloud-*`) or a
+  built-in route prefix; the audience is always the upstream host.
+
+### 5.2 Lease rules
+
+Enforced by the broker for every provider, whatever the provider answers:
+
+* **TTL**: the shortest of the service's `ttl_secs` and the provider's `max_ttl_secs`;
+  the maximum the shortest of the service's `max_ttl_secs` and the provider's. A
+  provider that grants longer is clamped.
+* **Scope and binding**: the lease must name the session, service and audience asked
+  for, and its scope must be covered by the requested one; a provider that attaches
+  more policies or another binding is refused, and the token it issued is revoked at
+  once.
+* **Renewal** (`renew = true`): once a third of the current period is left, for up to
+  the original period again, never past the original maximum and never with a wider
+  scope; at the maximum it is refused without asking the provider. A renewal that
+  fails leaves the lease to run out on time.
+* **Injection**: the proxy route carries the lease's deadline; past it the route
+  answers `403 credential lease expired` before resolving, connecting or injecting.
+  Requests outside `paths`, or writing without `write`, are refused as for GitHub (§4).
+
+### 5.3 Revocation
+
+The launching process holds the launch's leases and pushes revocation to the provider
+when the grant is revoked (`ward session revoke`: the proxy withdraws the route and
+acknowledges first), when the session pauses (credentials are suspended: the route is
+withdrawn at once and the lease revoked, not held across the pause — the next launch
+gets a fresh one), when the lease expires, and when the launch ends, which `ward stop`
+causes. A lease issued for a launch that never starts is revoked too. The outcome is
+shown on the grant's line, `ward session grants [--history]`:
+
+```text
+4   artifacts   artifacts-read · artifacts.example.com · provider bao: revoked at the provider (grant revoked)   launch   revoked
+```
+
+`revoked at the provider`, `revoke unconfirmed (<state>)`, `static secret, not
+revocable at the source; route withdrawn`, `renewed`, `renewal refused (max ttl
+reached)` and `renewal failed (<state>)` are the outcomes. A withdrawn grant moves to
+the history. If the launching process is killed outright, nothing revokes early: the
+provider's own TTL, which is the lease's, ends it.
 
 ## 6. What the agent sees
 
@@ -104,6 +200,17 @@ No token values are ever printed, by type construction (`Secret<T>` has no `Disp
 ## 7. Failure behaviour
 
 * Broker unavailable → requests fail closed; the agent gets a clear error; event logged.
+* Provider degraded → no lease, no route, no fallback to another credential. The state
+  is named — `unreachable`, `timed-out`, `tls-failed`, `auth-rejected`, `sealed`,
+  `misconfigured`, `bad-response` — in the launch's note (`artifacts: provider bao
+  unreachable; no credential granted (fail closed)`), in the log as `CredentialDenied`
+  with the rule `credential-provider:<provider>:<state>`, and by `ward doctor`
+  (`credential providers: bao degraded (unreachable) …`). Every provider call is bounded
+  by the provider's `timeout_ms`. A failed renewal or revocation is recorded on the
+  grant's line with the same name.
+* A value a provider returns that could not be a header (a control byte) is refused,
+  never injected. Leased values and the broker's provider token never appear in the
+  log, the grant history, `ward doctor`, an error or the sandbox.
 * Approval times out (default 120 s) → `Deny(timeout)`; the agent can retry.
 * Proxy injection for a host that also appears unauthenticated in the same session: the
   proxy injects only on `(host, path-prefix, method)` tuples of an active grant.

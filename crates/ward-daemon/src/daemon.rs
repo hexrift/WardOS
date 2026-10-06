@@ -770,6 +770,13 @@ impl Served {
         }
     }
 
+    /// A launch reporting what its provider did with a lease (#267): kept in
+    /// the grant's line, retiring the grant when the lease is gone.
+    fn lease_note(&mut self, note: &control::LeaseNote) -> (Response, bool) {
+        self.approvals.note_lease(note);
+        (Response::Ok, false)
+    }
+
     /// A connection id used for requests that do not come from a real client
     /// connection dispatched by [`serve`] (`Self::append`, and the daemon's
     /// own tests): see [`Self::handle_conn`]'s doc comment.
@@ -859,6 +866,7 @@ impl Served {
             // Per-connection, decided in `serve_stream`; a caller with no
             // connection has nothing to report to.
             Request::ReportProgress => (Response::Ok, false),
+            Request::LeaseNote(note) => self.lease_note(&note),
             Request::HoldForCapture {
                 reason,
                 pid,

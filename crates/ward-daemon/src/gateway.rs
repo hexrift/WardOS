@@ -3,15 +3,23 @@
 //! sandbox sees a base URL on the relay and a placeholder token, never the key.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ward_events::{CredentialDelivery, NameText, Scope, ServiceId, ShortText, WardEvent};
 use ward_proxy::{GatewayRoute, Secret};
 
+use crate::credentials::config::ServiceConfig;
+use crate::credentials::keeper::HeldLease;
+use crate::credentials::{CredentialProvider as _, LeaseRequest, LeaseScope, local::LocalVault};
 use crate::error::{Error, Result};
 use crate::sandbox::RELAY_ADDR;
 
 /// Placeholder the agent presents; the proxy strips it before injection.
 pub const PLACEHOLDER: &str = "ward-gateway";
+
+/// The lease a host-vault key is issued under: the validity a gateway grant
+/// is recorded with (`session::GATEWAY_TTL`); the route ends with the launch.
+const NOMINAL_TTL: core::time::Duration = core::time::Duration::from_secs(24 * 60 * 60);
 
 /// The vault under `state`: one file per key, named by the host variable, written
 /// by `ward vault set` and read by [`Gateway::resolve`]. Both go through here so the
@@ -87,19 +95,90 @@ pub struct Gateway {
     /// Permissions recorded in the grant.
     pub permissions: Vec<String>,
     subject: String,
+    /// The provider lease the route injects (#267), when it is one.
+    lease: Option<Arc<HeldLease>>,
 }
 
 impl Gateway {
     /// Resolve `spec` with a key from the host environment (`key_env`), else from
     /// `vault/<key_env>` under `state`. `None` when neither holds a key.
+    ///
+    /// The key is issued by the host vault through the credential-provider
+    /// interface (#267, [`LocalVault`]), with a nominal lease as long as the
+    /// grant's recorded validity; the route itself lives as long as the launch.
     pub fn resolve(spec: &GatewaySpec, state: &Path) -> Result<Option<Self>> {
-        let vault = vault_file(state, spec.key_env);
-        let key = std::env::var(spec.key_env)
-            .ok()
-            .or_else(|| std::fs::read_to_string(vault).ok())
-            .map(|k| k.trim().to_owned())
-            .filter(|k| !k.is_empty());
-        key.map(|key| Self::from_key(spec, &key)).transpose()
+        let request = LeaseRequest {
+            session: String::new(),
+            service: spec.service.to_owned(),
+            scope: LeaseScope::default(),
+            ttl: NOMINAL_TTL,
+            max_ttl: NOMINAL_TTL,
+            audience: spec.upstream.0.to_owned(),
+        };
+        match LocalVault::new(state, spec.key_env).issue(&request) {
+            Ok(lease) => {
+                let key = std::str::from_utf8(lease.secret().expose())
+                    .map_err(|_| Error::Sandbox(format!("{}: key is not text", spec.key_env)))?;
+                Self::from_key(spec, key).map(Some)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// The gateway of a provider-backed service (#267): `held`'s lease
+    /// injected as `config.header: config.value_prefix<value>` on the route
+    /// `config.prefix` to `config.upstream`, restricted to `config.paths`,
+    /// read-only unless the lease's scope writes, and bound to the lease's
+    /// deadline so the proxy stops injecting it when the lease ends. The
+    /// sandbox sees only the relay URL in `config.base_url_env`. A value the
+    /// provider returned that could not be a header (a control byte) is
+    /// refused rather than injected.
+    pub fn leased(
+        service: &str,
+        config: &ServiceConfig,
+        held: Arc<HeldLease>,
+        permissions: Vec<String>,
+    ) -> Result<Self> {
+        let refuse = |m: &str| Error::Sandbox(format!("credential {service}: {m}"));
+        let lease = held.lease().ok_or_else(|| refuse("the lease is gone"))?;
+        let secret = lease.secret().expose();
+        if secret.is_empty() || secret.iter().any(|b| *b < b' ' || *b == 0x7f) {
+            return Err(refuse("the provider's value cannot be sent as a header"));
+        }
+        let mut value = Vec::with_capacity(config.value_prefix.len() + secret.len());
+        value.extend_from_slice(config.value_prefix.as_bytes());
+        value.extend_from_slice(secret);
+        let (host, port) = config.upstream().map_err(|e| refuse(&e.0))?;
+        let route = GatewayRoute::new(
+            config.prefix.as_str(),
+            &host,
+            port,
+            config.header.as_str(),
+            Secret::new(value),
+        )
+        .map_err(|e| refuse(&e.to_string()))?
+        .strip_headers([config.header.as_str()])
+        .scope(config.paths.iter().cloned(), lease.scope.write)
+        .until(held.deadline());
+        let env = config
+            .base_url_env
+            .iter()
+            .map(|var| (var.clone(), format!("http://{RELAY_ADDR}{}", config.prefix)))
+            .collect();
+        Ok(Self {
+            service: service.to_owned(),
+            route,
+            env,
+            permissions,
+            subject: format!("{host}:{port}"),
+            lease: Some(held),
+        })
+    }
+
+    /// The provider lease this gateway injects, when it is one (#267).
+    #[must_use]
+    pub fn lease(&self) -> Option<&Arc<HeldLease>> {
+        self.lease.as_ref()
     }
 
     /// Build the gateway for `spec` around `key`.
@@ -134,6 +213,7 @@ impl Gateway {
             env,
             permissions: vec!["proxy-injected".to_owned()],
             subject: format!("{}:{}", spec.upstream.0, spec.upstream.1),
+            lease: None,
         }
     }
 

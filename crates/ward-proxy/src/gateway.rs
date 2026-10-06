@@ -16,12 +16,19 @@
 //! enforced: a request outside it is refused with `403` before the upstream
 //! is contacted, so the secret is never sent on the agent's behalf for
 //! anything the grant did not cover.
+//!
+//! A route may also be bound to a credential **lease** ([`GatewayRoute::until`],
+//! #267): once the lease's [`LeaseDeadline`] has passed, the route is refused
+//! the same way, so a short-lived credential stops being injected the moment
+//! its lease ends even if nothing else withdrew it. The deadline is shared, so
+//! the broker that renews the lease moves it for the running route.
 
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
@@ -52,8 +59,56 @@ pub struct GatewayRoute {
     /// nothing to revoke leaves this `None`. [`Handle::revoke_credential`]
     /// (`crate::proxy`) only ever matches a route that carries one.
     credential_id: Option<u64>,
+    /// The lease this route's credential is bound to (#267), when it has
+    /// one: past its deadline the route is refused.
+    lease: Option<LeaseDeadline>,
     #[cfg(feature = "test-loopback")]
     plain_upstream: bool,
+}
+
+/// The wall-clock instant a credential lease runs out (#267), shared between
+/// the gateway route that injects the credential and the broker that issued
+/// it: a renewal [`set`](Self::set)s a later instant, a revocation or the end
+/// of the lease an earlier one, and every clone sees the change at once.
+/// Kept as milliseconds since the Unix epoch.
+#[derive(Clone)]
+pub struct LeaseDeadline(Arc<AtomicU64>);
+
+impl LeaseDeadline {
+    /// A deadline at `at`.
+    #[must_use]
+    pub fn at(at: SystemTime) -> Self {
+        Self(Arc::new(AtomicU64::new(unix_ms(at))))
+    }
+
+    /// Move the deadline to `at`, earlier or later.
+    pub fn set(&self, at: SystemTime) {
+        self.0.store(unix_ms(at), Ordering::SeqCst);
+    }
+
+    /// The deadline, to the millisecond.
+    #[must_use]
+    pub fn get(&self) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(self.0.load(Ordering::SeqCst))
+    }
+
+    /// Has the lease run out at `now`? The deadline itself counts as run out.
+    #[must_use]
+    pub fn expired_at(&self, now: SystemTime) -> bool {
+        unix_ms(now) >= self.0.load(Ordering::SeqCst)
+    }
+}
+
+impl fmt::Debug for LeaseDeadline {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LeaseDeadline({}ms)", self.0.load(Ordering::SeqCst))
+    }
+}
+
+/// Milliseconds since the Unix epoch, saturating; a time before the epoch is 0.
+fn unix_ms(at: SystemTime) -> u64 {
+    at.duration_since(UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Why a request was refused by a route's [`scope`](GatewayRoute::scope).
@@ -129,6 +184,7 @@ impl GatewayRoute {
             paths: Vec::new(),
             write: true,
             credential_id: None,
+            lease: None,
             #[cfg(feature = "test-loopback")]
             plain_upstream: false,
         })
@@ -148,6 +204,23 @@ impl GatewayRoute {
     /// The grant id [`Self::revocable`] tagged this route with, if any.
     pub(crate) fn credential_id(&self) -> Option<u64> {
         self.credential_id
+    }
+
+    /// Bind this route to a credential lease (#267): from `deadline` on, every
+    /// request on the route is refused with `403` before anything is resolved,
+    /// connected to or injected. Calling this again replaces the deadline.
+    #[must_use]
+    pub fn until(mut self, deadline: LeaseDeadline) -> Self {
+        self.lease = Some(deadline);
+        self
+    }
+
+    /// Has the lease this route is bound to run out? Never, for a route
+    /// without one.
+    pub(crate) fn lease_expired(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|d| d.expired_at(SystemTime::now()))
     }
 
     /// Restrict what the injected credential may be used for.
@@ -389,6 +462,7 @@ impl fmt::Debug for GatewayRoute {
             .field("paths", &self.paths)
             .field("write", &self.write)
             .field("credential_id", &self.credential_id)
+            .field("lease", &self.lease)
             .finish_non_exhaustive()
     }
 }

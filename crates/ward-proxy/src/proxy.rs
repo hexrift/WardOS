@@ -748,7 +748,8 @@ fn accept_loop<L: Acceptor>(listener: &L, shared: &Arc<Shared>) {
 /// or has its credential read — the observer's reason, and the body text —
 /// or `None` when it may proceed: a revoked credential (#245) is checked
 /// first, since there is no authority left for anything to be in or out of
-/// scope of; a request outside the route's scope is checked next, exactly as
+/// scope of; a credential whose lease has run out (#267) next, for the same
+/// reason; a request outside the route's scope is checked last, exactly as
 /// it always was.
 fn gateway_refusal(
     route: &GatewayRoute,
@@ -761,6 +762,12 @@ fn gateway_refusal(
         return Some((
             format!("gateway {}: credential revoked", route.prefix()),
             "credential revoked",
+        ));
+    }
+    if route.lease_expired() {
+        return Some((
+            format!("gateway {}: credential lease expired", route.prefix()),
+            "credential lease expired",
         ));
     }
     if let Method::Forward { verb, path } = &req.method
@@ -930,6 +937,9 @@ fn serve_gateway<C: Conn>(
         && shared.credential_revoked(id)
     {
         return respond(&mut client, 403, "Forbidden", "credential revoked");
+    }
+    if route.lease_expired() {
+        return respond(&mut client, 403, "Forbidden", "credential lease expired");
     }
     let head = match route.rewrite_head(parsed, framing) {
         Ok(head) => head,

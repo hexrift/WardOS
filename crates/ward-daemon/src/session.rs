@@ -27,6 +27,7 @@ use crate::attempt::{
     AttemptGuard, CancelToken, finalize_interrupted, lock_session_verification, next_attempt_id,
 };
 use crate::control::{LocalLog, RemoteSink, SOCKET_NAME, Sink, unix_ms};
+use crate::credentials::keeper::{LeaseKeeper, Withdrawal};
 use crate::describe::SessionDescription;
 use crate::egress::Egress;
 use crate::error::{Error, Result};
@@ -308,10 +309,17 @@ impl Session {
         let session_str = session.to_string();
 
         let project_policy = load_project_policy(&worktree)?;
+        // The host's provider-backed services (#267) enter as the system layer:
+        // only the host can introduce a service, the project can only narrow
+        // it. An unusable configuration introduces none (and every launch
+        // says why), so the session itself still starts.
+        let system_policy = crate::credentials::config::Registry::load(state)
+            .map(|r| r.policy())
+            .unwrap_or_default();
         // `ward-policy` and `ward-events` keep independent id newtypes so each crate
         // builds alone; bridge the same identity into the policy-crate types here.
         let manifest = merge(
-            &Policy::default(),
+            &system_policy,
             &Policy::default(),
             &project_policy,
             ward_policy::SessionId(session_str.clone()),
@@ -769,6 +777,10 @@ impl Session {
             github::Grant::Offline if requested => notes.push("github: session is offline".to_owned()),
             _ => {}
         }
+        let provided = self.provider_gateways(grants)?;
+        gateways.extend(provided.gateways);
+        refusals.extend(provided.refusals);
+        notes.extend(provided.notes);
         for g in &gateways {
             env.extend(g.env.iter().cloned());
         }
@@ -785,6 +797,25 @@ impl Session {
                 notes,
             },
         ))
+    }
+
+    /// The provider-backed credentials (#267) a launch of this session gets:
+    /// every service the host configured in `credentials.toml` that the
+    /// session's policy allows (`ask` ones only when named in `requested`,
+    /// the `--grant` list), each a lease issued now through the binding rules
+    /// and injected by the proxy. Refusals and provider outages are recorded
+    /// as `CredentialDenied` (pass them in [`LaunchOpts::refusals`]) and never
+    /// fall back to another credential.
+    pub fn provider_gateways(
+        &self,
+        requested: &[String],
+    ) -> Result<crate::credentials::grant::ProviderGrants> {
+        crate::credentials::grant::provider_grants(
+            &self.manifest,
+            &self.state,
+            &self.session_str,
+            requested,
+        )
     }
 
     /// Whether the session is paused by the host (ADR-0019 §3): its daemon has
@@ -813,6 +844,15 @@ impl Session {
     /// that failure is folded into the returned error rather than discarded, so the
     /// caller learns the log may still end at `CommandStarted`.
     pub fn launch(&mut self, argv: &[String], opts: &LaunchOpts) -> Result<RunReport> {
+        // Custody of the launch's provider leases (#267) from the first line:
+        // whichever way this returns, a lease is revoked at the provider
+        // (`LeaseKeeper`'s drop), never left alive for a launch that is over.
+        let keeper = LeaseKeeper::new(
+            opts.gateways
+                .iter()
+                .filter_map(|g| g.lease().cloned())
+                .collect(),
+        );
         self.refuse_while_paused()?;
         self.emit(
             Origin::Wardd,
@@ -844,13 +884,20 @@ impl Session {
         // exact route once the launch is running.
         let mut grant_ids: Vec<Option<u64>> = Vec::with_capacity(opts.gateways.len());
         for g in &opts.gateways {
-            grant_ids.push(self.emit_credential(Origin::Wardd, g.granted(GATEWAY_TTL)?)?);
+            // A provider lease is recorded with what it has left, not the
+            // nominal bound a host-vault key gets.
+            let expires = g.lease().map_or(GATEWAY_TTL, |l| l.remaining());
+            let id = self.emit_credential(Origin::Wardd, g.granted(expires)?)?;
+            if let Some(held) = g.lease() {
+                keeper.bind(held, id);
+            }
+            grant_ids.push(id);
         }
 
         // From here on `CommandStarted` (and any grant just above) is already on the
         // log, so the `match` below never lets an error skip past leaving a terminal
         // record for it.
-        let result = self.run_launch(pid, argv, opts, &grant_ids);
+        let result = self.run_launch(pid, argv, opts, &grant_ids, &keeper);
         let outcome = match result {
             Ok(report) => Ok(report),
             Err(e) => {
@@ -910,6 +957,7 @@ impl Session {
         argv: &[String],
         opts: &LaunchOpts,
         grant_ids: &[Option<u64>],
+        keeper: &LeaseKeeper,
     ) -> Result<RunReport> {
         let watch_reads = matches!(
             self.manifest.observer,
@@ -937,8 +985,20 @@ impl Session {
             })
             .collect();
         let mut egress = Egress::start(&run_dir, &self.manifest.network, routes)?;
-        egress.watch_marker(pause::marker_path(&self.state, &self.session_str))?;
-        egress.watch_revocations(crate::revoke::dir_path(&self.state, &self.session_str));
+        // A revoke or a pause reaches the launch's provider leases (#267);
+        // their outcomes go to the daemon's grant history.
+        let leases = (!keeper.is_empty()).then(|| {
+            keeper.start(lease_notifier(&self.state, &self.session_str));
+            keeper.watch()
+        });
+        egress.watch_marker_with(
+            pause::marker_path(&self.state, &self.session_str),
+            leases.clone(),
+        )?;
+        egress.watch_revocations_with(
+            crate::revoke::dir_path(&self.state, &self.session_str),
+            leases,
+        );
         observers.set_egress(egress);
         observers.set_hooks(Hooks::start_with(
             &run_dir,
@@ -993,6 +1053,11 @@ impl Session {
         let mut tail = file_batch(&captured, &by, watch_dropped, finished.capacity);
         tail.extend(finished.tail);
         let flushed = self.ingest(tail, &mut changed_paths);
+
+        // The launch is over (its command finished, failed, or was stopped):
+        // its provider leases are revoked at the provider before its terminal
+        // record retires their grants (#267).
+        keeper.finish(Withdrawal::LaunchEnded);
 
         // A failed run still flushed what was observed before it failed; only now
         // does the failure win.
@@ -1995,6 +2060,18 @@ fn exit_status(code: Option<i32>) -> ExitStatus {
             core_dumped: false,
         },
     }
+}
+
+/// Where a launch's lease keeper reports outcomes (#267): the session's
+/// daemon, over a connection of its own per note, when one serves the
+/// session; nowhere otherwise (a daemonless session has no grant history).
+fn lease_notifier(state: &Path, session: &str) -> crate::credentials::keeper::Notify {
+    let socket = session_dir(state, session).join(SOCKET_NAME);
+    Arc::new(move |note| {
+        if let Some(mut sink) = RemoteSink::connect(&socket) {
+            let _ = sink.call(&crate::control::Request::LeaseNote(note));
+        }
+    })
 }
 
 fn load_project_policy(worktree: &Path) -> Result<Policy> {

@@ -98,6 +98,7 @@ pub fn run() -> Vec<Check> {
         node(probe("node", &["--version"]).as_deref()),
         agents(&agent_versions()),
         keys(&key_sources(&state), &state),
+        credential_providers(&state),
         firewall(firewalld_active(), firewalld_zone().as_deref()),
     ]
 }
@@ -683,6 +684,49 @@ pub fn keys(found: &[(&str, Option<KeySource>)], state: &Path) -> Check {
             ),
         )
     }
+}
+
+/// The credential providers the host configured (#267,
+/// `$WARD_STATE_DIR/credentials.toml`), each asked for its health within its
+/// own timeout: a degraded provider is named with its state, since every
+/// service it backs gets no credential until it recovers (fail closed). Never
+/// a token or a secret: only names, addresses and states.
+#[must_use]
+pub fn credential_providers(state: &Path) -> Check {
+    use crate::credentials::Health;
+    let registry = match crate::credentials::config::Registry::load(state) {
+        Ok(registry) => registry,
+        Err(e) => {
+            return Check::new(
+                "credential providers",
+                Status::Warn,
+                format!("{e}; no provider-backed credential is granted until it is fixed"),
+            );
+        }
+    };
+    if registry.is_empty() {
+        return Check::new(
+            "credential providers",
+            Status::Ok,
+            "none configured; keys come from the host vault (`ward vault`)",
+        );
+    }
+    let mut degraded = false;
+    let rows: Vec<String> = registry
+        .providers()
+        .map(|(name, p)| match registry.health(name) {
+            Health::Healthy => format!("{name} healthy ({})", p.address),
+            Health::Degraded(state) => {
+                degraded = true;
+                format!(
+                    "{name} degraded ({state}) at {}: its services get no credential (fail closed)",
+                    p.address
+                )
+            }
+        })
+        .collect();
+    let status = if degraded { Status::Warn } else { Status::Ok };
+    Check::new("credential providers", status, rows.join(" · "))
 }
 
 /// firewalld: `active` is `None` when it is not installed; `zone` its default zone.
