@@ -24,9 +24,10 @@
 //! ADR-0036) runs the adapter's command line with its environment and read-only settings
 //! files, and its hook socket when it has hooks ([`LaunchRequest::with_adapter`]); none of
 //! it changes the workspace, the network namespace, the proxy or anything above. On a node
-//! with a `ward-agent` shim ([`crate::shim`], ADR-0037) the adapter runs under it, bound
-//! read-only, and, behind an egress proxy, with its loopback relay and the environment that
-//! names it ([`LaunchRequest::with_agent_shim`]).
+//! with a `ward-agent` shim ([`crate::shim`], ADR-0037) the adapter, and any workload behind
+//! an egress proxy, runs under it, bound read-only, and, behind an egress proxy, with its
+//! loopback relay and the environment that names it ([`LaunchRequest::with_agent_shim`]);
+//! an offline workload naming no adapter runs without it.
 //!
 //! `pause` and `resume` act on the running workload through its [`WorkloadFreezer`], which
 //! the reaper hands back with the spawned pid. The sandbox freezer first pauses the
@@ -109,11 +110,12 @@ pub struct LaunchRequest {
     credential_routes: Vec<GatewayRoute>,
     hold: Option<Arc<dyn Hold>>,
     adapter: Option<AdapterParts>,
+    agent_shim: Option<AgentShim>,
 }
 
 /// What a hosted agent adapter adds to a launch: its environment, its settings files (each
-/// host file and the sandbox path it is bound at, read-only), its hook socket, its provider
-/// and the node's `ward-agent` shim it runs under.
+/// host file and the sandbox path it is bound at, read-only), its hook socket and its
+/// provider.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AdapterParts {
     /// The adapter's non-secret environment.
@@ -124,8 +126,6 @@ pub struct AdapterParts {
     pub hooks: Option<PathBuf>,
     /// The adapter's provider, if it names one.
     pub provider: Option<String>,
-    /// The shim the adapter runs under, on a node that has one.
-    pub shim: Option<AgentShim>,
 }
 
 impl LaunchRequest {
@@ -143,6 +143,7 @@ impl LaunchRequest {
             credential_routes: Vec::new(),
             hold: None,
             adapter: None,
+            agent_shim: None,
         }
     }
 
@@ -157,21 +158,28 @@ impl LaunchRequest {
             seeds: adapter.seeds().to_vec(),
             hooks: adapter.hook_socket().map(Path::to_path_buf),
             provider: adapter.provider().map(str::to_owned),
-            shim: None,
         });
         self
     }
 
     /// The same launch run under the `ward-agent` shim `shim` (ADR-0037), bound read-only
     /// at [`ward_launch::AGENT_SHIM`] and, behind an egress proxy, relaying
-    /// [`ward_launch::RELAY_ADDR`] to it. Only a hosted adapter's launch runs under it; any
-    /// other launch is unchanged.
+    /// [`ward_launch::RELAY_ADDR`] to it, wherever the shim has something to run
+    /// ([`Self::agent_shim`]); an offline launch naming no adapter is unchanged.
     #[must_use]
     pub fn with_agent_shim(mut self, shim: &AgentShim) -> Self {
-        if let Some(adapter) = &mut self.adapter {
-            adapter.shim = Some(shim.clone());
-        }
+        self.agent_shim = Some(shim.clone());
         self
+    }
+
+    /// The shim the launch runs under: a hosted adapter's launch, for its command hooks,
+    /// and a launch behind an egress proxy, for the relay. `None` without a shim, and for an
+    /// offline launch naming no adapter.
+    #[must_use]
+    pub fn agent_shim(&self) -> Option<&AgentShim> {
+        self.agent_shim
+            .as_ref()
+            .filter(|_| self.adapter.is_some() || self.allowlist.is_some())
     }
 
     /// What a hosted adapter adds to the launch; `None` for a plain workload.
@@ -539,12 +547,11 @@ fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launc
         None => launch,
     };
     let launch = match request.adapter() {
-        Some(adapter) => with_adapter(
-            launch,
-            adapter,
-            proxy_socket.is_some(),
-            request.credential_routes(),
-        ),
+        Some(adapter) => with_adapter(launch, adapter),
+        None => launch,
+    };
+    let launch = match request.agent_shim() {
+        Some(shim) => under_shim(launch, shim, request, proxy_socket.is_some()),
         None => launch,
     };
     match proxy_socket {
@@ -553,12 +560,7 @@ fn sandbox_launch(request: &LaunchRequest, proxy_socket: Option<&Path>) -> Launc
     }
 }
 
-fn with_adapter(
-    launch: Launch,
-    adapter: &AdapterParts,
-    relayed: bool,
-    routes: &[GatewayRoute],
-) -> Launch {
+fn with_adapter(launch: Launch, adapter: &AdapterParts) -> Launch {
     let launch = adapter
         .env
         .iter()
@@ -567,18 +569,21 @@ fn with_adapter(
         .seeds
         .iter()
         .fold(launch, |launch, (file, path)| launch.seed(file, path));
-    let launch = match &adapter.hooks {
+    match &adapter.hooks {
         Some(socket) => launch.hooks(socket),
         None => launch,
-    };
-    let Some(shim) = &adapter.shim else {
-        return launch;
-    };
+    }
+}
+
+fn under_shim(launch: Launch, shim: &AgentShim, request: &LaunchRequest, relayed: bool) -> Launch {
     let launch = launch.shim(shim.path());
     if !relayed {
         return launch;
     }
-    relay_env(adapter.provider.as_deref(), routes)
+    let provider = request
+        .adapter()
+        .and_then(|adapter| adapter.provider.as_deref());
+    relay_env(provider, request.credential_routes())
         .into_iter()
         .fold(launch, |launch, (name, value)| launch.env(name, value))
 }
@@ -777,18 +782,20 @@ impl NodeExecution {
         self.agent_adapters
     }
 
-    /// Run every hosted adapter's attempt under the verified `ward-agent` shim `shim`
-    /// ([`crate::shim`], `--agent-shim`, ADR-0037): its command hooks reach the attempt's
-    /// hook socket, and an attempt with an egress proxy gets the shim's loopback relay and,
-    /// for the provider the manifest grants a credential for, its base URL. `None`, the
-    /// default, binds no shim and runs no relay.
+    /// Run every hosted adapter's attempt and every attempt with an egress proxy under the
+    /// verified `ward-agent` shim `shim` ([`crate::shim`], `--agent-shim`, ADR-0037): an
+    /// adapter's command hooks reach the attempt's hook socket, and an attempt with an
+    /// egress proxy gets the shim's loopback relay, the proxy variables naming it and, for a
+    /// hosted adapter whose provider the manifest grants a credential for, its base URL. An
+    /// offline attempt naming no adapter runs without it. `None`, the default, binds no shim
+    /// and runs no relay.
     #[must_use]
     pub fn with_agent_shim(mut self, shim: Option<AgentShim>) -> Self {
         self.agent_shim = shim;
         self
     }
 
-    /// The shim hosted adapters run under, if any.
+    /// The shim hosted adapters and attempts behind an egress proxy run under, if any.
     #[must_use]
     pub const fn agent_shim(&self) -> Option<&AgentShim> {
         self.agent_shim.as_ref()
@@ -1187,11 +1194,76 @@ mod tests {
         assert!(!joined.contains("--relay"), "{joined}");
         assert!(!joined.contains("PROXY"), "{joined}");
         assert!(!joined.contains("ANTHROPIC_"), "{joined}");
+    }
 
+    #[test]
+    fn under_the_shim_a_plain_workload_behind_a_proxy_relays_to_it_and_an_offline_one_is_unchanged()
+    {
+        let s = |parts: &[&str]| parts.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let shim = AgentShim::assumed(PathBuf::from("/host/ward-agent"));
+        let proxy = Some(Path::new("/host/x.egress/proxy.sock"));
+        let route = GatewayRoute::new(
+            "/git",
+            "git.example.com",
+            443,
+            "authorization",
+            ward_proxy::Secret::new(b"Bearer lease".to_vec()),
+        )
+        .unwrap();
+        let request = LaunchRequest::new(
+            PathBuf::from("/tmp"),
+            s(&["git", "clone", "http://127.0.0.1:3128/git/acme/widgets.git"]),
+            Duration::from_secs(1),
+        )
+        .with_allowlist(HostAllowlist::new(vec!["git.example.com".to_owned()]).unwrap())
+        .with_credential_routes(vec![route]);
+        let shimmed = request.clone().with_agent_shim(&shim);
+        assert_eq!(shimmed.agent_shim(), Some(&shim));
+        let plain = sandbox_launch(&request, proxy).args(Path::new("/tmp"));
+        let args = sandbox_launch(&shimmed, proxy).args(Path::new("/tmp"));
+        let run = args.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(args[run + 1], "/run/ward/ward-agent");
+        let relay = args.iter().position(|arg| arg == "--relay").unwrap();
+        assert_eq!(args[relay + 1], "127.0.0.1:3128=/run/ward/proxy.sock");
         assert_eq!(
-            sandbox_launch(&request.clone().with_agent_shim(&shim), proxy).args(Path::new("/tmp")),
-            sandbox_launch(&request, proxy).args(Path::new("/tmp")),
-            "a workload naming no adapter never runs under the shim"
+            args[relay + 2..],
+            s(&[
+                "--",
+                "git",
+                "clone",
+                "http://127.0.0.1:3128/git/acme/widgets.git"
+            ])
+        );
+        let mut added: Vec<Vec<String>> = relay_env(None, request.credential_routes())
+            .iter()
+            .map(|(name, value)| s(&["--setenv", name, value]))
+            .collect();
+        added.push(s(&[
+            "--ro-bind",
+            "/host/ward-agent",
+            "/run/ward/ward-agent",
+        ]));
+        let joined = args.join(" ");
+        assert!(!joined.contains("lease"), "{joined}");
+        assert!(!joined.contains("BASE_URL"), "{joined}");
+        assert!(!joined.contains("API_KEY"), "{joined}");
+        let outside: Vec<String> = without(args[..run].to_vec(), &added);
+        assert_eq!(
+            outside,
+            plain[..plain.iter().position(|arg| arg == "--").unwrap()],
+            "the sandbox is the same but for the shim and the proxy variables"
+        );
+
+        let offline = LaunchRequest::new(
+            PathBuf::from("/tmp"),
+            s(&["git", "status"]),
+            Duration::from_secs(1),
+        );
+        assert_eq!(offline.clone().with_agent_shim(&shim).agent_shim(), None);
+        assert_eq!(
+            sandbox_launch(&offline.clone().with_agent_shim(&shim), None).args(Path::new("/tmp")),
+            sandbox_launch(&offline, None).args(Path::new("/tmp")),
+            "an offline workload naming no adapter never runs under the shim"
         );
     }
 

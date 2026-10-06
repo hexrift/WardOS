@@ -1,19 +1,22 @@
-//! The `ward-agent` shim and the in-sandbox relay of hosted agent adapters (#424, ADR-0037).
+//! The `ward-agent` shim and the in-sandbox relay of hosted agent adapters and of workloads
+//! behind an egress proxy (#424, #267, ADR-0037).
 //!
 //! A node started with `--agent-shim <file>` ([`crate::execution::NodeExecution::with_agent_shim`])
-//! runs every attempt of a hosted adapter ([`crate::adapters`]) under that shim, bound
-//! read-only at [`ward_launch::AGENT_SHIM`] and run ahead of the adapter's command line. The
-//! shim applies its Landlock ruleset (read-only on [`ward_launch::SHIM_READ_ONLY`], the shim
-//! itself included, so the adapter's command hooks can run it as `ward-agent hook` against the
-//! attempt's hook socket), its seccomp filter and `no_new_privs`; for an attempt with an egress proxy it
-//! then starts its relay, a TCP listener on [`ward_launch::RELAY_ADDR`] inside the attempt's
-//! network namespace that forwards every connection to the attempt's proxy socket. The
-//! relay is a pipe: whatever passes it is decided by the proxy behind the socket the
-//! workload could already reach, so it adds nothing beyond the manifest's allowlist, its
-//! brokered credentials and its holds.
+//! runs every attempt of a hosted adapter ([`crate::adapters`]), and every attempt with an
+//! egress proxy, under that shim, bound read-only at [`ward_launch::AGENT_SHIM`] and run
+//! ahead of the workload's command line. The shim applies its Landlock ruleset (read-only on
+//! [`ward_launch::SHIM_READ_ONLY`], the shim itself included, so an adapter's command hooks
+//! can run it as `ward-agent hook` against the attempt's hook socket), its seccomp filter and
+//! `no_new_privs`; for an attempt with an egress proxy it then starts its relay, a TCP
+//! listener on [`ward_launch::RELAY_ADDR`] inside the attempt's network namespace that
+//! forwards every connection to the attempt's proxy socket. The relay is a pipe: whatever
+//! passes it is decided by the proxy behind the socket the workload could already reach, so
+//! it adds nothing beyond the manifest's allowlist, its brokered credentials and its holds.
 //!
-//! With the relay running the adapter also gets [`relay_env`]: the proxy variables naming
-//! the relay and, only when the attempt has the credential route of the service named
+//! With the relay running the workload also gets [`relay_env`]: the proxy variables naming
+//! the relay, so a stock HTTP client (`git`, `curl`, a package manager) reaches the
+//! allowlist through it and a credential route as `http://127.0.0.1:3128/<service>/…`, and,
+//! for a hosted adapter only when the attempt has the credential route of the service named
 //! after the adapter's provider (the manifest grants it, ADR-0036 §4), the provider's base
 //! URL on that route and [`PLACEHOLDER_KEY`], which the proxy replaces on the way out.
 //!
@@ -169,9 +172,9 @@ fn quiet(command: &mut Command) -> &mut Command {
         .stderr(Stdio::null())
 }
 
-/// What an adapter running behind the relay is told: the proxy variables naming it and,
-/// when `routes` holds the route of the service named after its `provider`, the provider's
-/// base URL on that route and the placeholder key.
+/// What a workload running behind the relay is told: the proxy variables naming it and, for
+/// a hosted adapter of `provider` when `routes` holds the route of the service named after
+/// it, the provider's base URL on that route and the placeholder key.
 #[must_use]
 pub fn relay_env(provider: Option<&str>, routes: &[GatewayRoute]) -> Vec<(String, String)> {
     let relay = format!("http://{RELAY_ADDR}");
