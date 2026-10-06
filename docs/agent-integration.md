@@ -1,4 +1,4 @@
-# Agent Integration (`ward claude`, `ward codex`)
+# Agent Integration (`ward claude`, `ward codex`, `ward agent`)
 
 Status: living document; the project's phase is in docs/status.toml and the README.
 Builds on the runtime of ADR-0013, `ward-agent`
@@ -25,7 +25,9 @@ ward claude [dir] [-- <claude args>]
    and the observer streaming live.
 
 Nothing above requires the user to know about namespaces or proxies; `ward claude`
-is one command.
+is one command. `ward codex` and `ward agent -- <program>` (any other agent) are the same
+command for another adapter: every agent runs through the one launch path of §10, under
+the same sandbox, allowlist and credential rules.
 
 ## 2. Two sandboxes, one trust boundary
 
@@ -291,8 +293,11 @@ avoided in WardOS sessions because it skips hooks.
 
 ## 6. Codex, Gemini CLI, Aider
 
-Same shape: per-agent module in `ward-cli` supplying (a) required hosts, (b) config-dir
-and env conventions, (c) hook/adapter mapping if the agent has one, (d) headless flags.
+Same shape, now as an adapter (§10): a capability document and a launch spec supplying
+(a) the provider whose gateway it uses, (b) config-dir and env conventions, (c) the hooks
+it wires, if any, (d) the model flag it takes. Agents without a first-party adapter
+(Gemini CLI, Aider, Copilot, `OpenCode`) run through the generic process adapter,
+`ward agent [--provider anthropic|openai] -- <program> …`, with no hooks.
 Codex gets the same gateway treatment as Claude Code: `OPENAI_API_KEY` stays on the host,
 the sandbox sees `OPENAI_BASE_URL=http://127.0.0.1:3128/openai/v1` and a placeholder key,
 and the proxy injects `Authorization: Bearer …` on the way to `api.openai.com` (client
@@ -332,7 +337,9 @@ run (E-07, `experiments.md` §5): Claude Code 2.1.263 started headless inside th
 sandbox from the read-only `/opt` bind, reached `api.anthropic.com` only through the
 gateway (the API's `401` for a deliberately invalid host key proves the path), and its
 `SessionStart` hook was logged as a claim. Not yet: a full task with a valid key, the
-GitHub adapter, nested containers.
+GitHub adapter, nested containers. Since #279 every launch goes through the adapter
+contract of §10 (`ward agent` for any other program), records its adapter binding, and
+starts from an empty environment.
 
 ## 9. Shipped in the image (ADR-0017)
 
@@ -360,3 +367,163 @@ whether `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are on the host, in the environme
 `$WARD_STATE_DIR/vault/` (`keys`; presence only, never a value, with `ward vault set
 ANTHROPIC_API_KEY` as the fix). On a host that is not the image, the rows say so and
 name the `npm install -g` command.
+
+## 10. The adapter contract (ADR-0033)
+
+Every agent runs through one versioned contract, `ward-agent-adapter` 1.0, and one
+launch path. An adapter changes what the session *sees*; nothing in it can change what
+the session *allows*.
+
+### 10.1 What an adapter is
+
+| Part | Type | What it holds |
+| --- | --- | --- |
+| Contract version | `ContractVersion` | `"1.0"`. A reader accepts its own major and a minor no newer than its own; anything else fails closed. |
+| Capability document | `CapabilityDocument` | The descriptor (id, runtime metadata, semantic visibility, features), `hooks` (`full`, `partial`, `none`) and the semantic events it emits. |
+| Launch | `LaunchSpec` | Program, fixed arguments, non-secret environment, settings files under `/home/agent`, provider. The working directory is always `/work`. |
+| Semantic events | `SemanticEventLine` | One line on `$WARD_SOCKET`: `{"hook":"PreToolUse","tool":"Write","summary":"/work/src/lib.rs"}`. |
+| Approvals | `ApprovalAnswer` | The one line back: `{"decision":"ask","reason":…}`, the decision one of `allow`, `deny`, `ask` (§4, §4.1). |
+| Capability requests | `CapabilityRequest` | `{"capability":{"network":{"host":…}},"reason":…}`, or `{"credential":{"service":…}}` as the capability. Shape only: no host serves it yet. |
+| Cancellation | `CancelRequest` | `{"reason":"user"}` (or `deadline`, `revoked`), carried out by the host: freeze, kill, confirm gone (`ward stop`). Cooperative cancellation is not served yet. |
+| Task result | `TaskResult` | `{"outcome":"completed","exit_code":0}` (or `failed`, `unknown`), the host's, from the exit status. |
+| Binding | `AdapterBinding` | Which adapter a launch ran, recorded as evidence (§10.4). |
+
+A capability document is self-consistent or refused: `hooks` matches the events
+(`none` ⇔ no events, `full` ⇔ all five), `semantic_tool_events` matches a tool event
+(`PreToolUse`, `PostToolUse`), `approval_requests` needs a decision point (`PreToolUse`,
+`PermissionRequest`), and `launch` is required, because an agent the host does not
+launch is an agent it does not contain. It has no field for a network rule, a
+credential, a mount or a policy; one in the JSON fails decoding. A launch spec cannot
+set a variable the host owns (proxy settings in any case, `HOME`, `PATH`, `TERM`,
+`WARD_*`) or seed a file outside `/home/agent`.
+
+`ward adapters [--json]` prints every document with what this host serves of it
+(`coverage`: `served` and `unserved` features).
+
+### 10.2 The adapters WardOS ships
+
+| Adapter | Command | Runtime (declared) | Hooks | Events | Approvals | Capability requests | Provider |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `claude-code` | `ward claude` | Claude Code 2.1.263 | `full` | `SessionStart`, `PreToolUse`, `PostToolUse`, `PermissionRequest`, `Stop` | yes, on `PreToolUse` and `PermissionRequest` | no | `anthropic` |
+| `codex` | `ward codex` | OpenAI Codex CLI 0.153.4 | `none` | none | no | no | `openai` |
+| `process` | `ward agent -- <program>` | `--product` / `--product-version`, else the program's name | `none` | none | no | no | `--provider`, else none |
+
+The declared versions are the image's pins (`image/agents/package.json`; a test keeps
+them equal). They are metadata: nothing checks that the installed binary is that
+version.
+
+Unsupported hooks, honestly:
+
+* **Claude Code** wires every event of the contract through `ward-agent hook` (§4).
+  Hooks Claude Code has beyond the five (`Notification`, `UserPromptSubmit`,
+  `SubagentStop`, `PreCompact`, …) are not wired. `PostToolUse` is recorded, never
+  answered. A `Bash` command is summarised, never parsed, so the protected-tests deny of
+  §4 cannot see a shell write. It declares no capability requests, cooperative
+  cancellation or structured result: `claude -p --output-format json` is not read.
+* **Codex** has no hook wired: no tool intent, no approvals, no permission prompts held
+  by the daemon. Its activity is what the host observes (exec, files, network).
+* **The generic process adapter** knows nothing of its program: no hooks, no model (its
+  flags are unknown), no settings file. A program that speaks the hook socket anyway is
+  recorded (§10.6), but its document still says `none`.
+* **Copilot, `OpenCode`, Gemini CLI, Aider** have no first-party adapter: the project
+  does not test them. They run as the generic process adapter, with `--provider` when
+  they talk to Anthropic's or OpenAI's API through the gateway.
+
+### 10.3 One launch path, the same authority
+
+`ward claude`, `ward codex` and `ward agent` all call `Session::adapter_launch` and then
+`Session::launch`. What the adapter contributes is its command line, its environment and
+settings files, and its provider's gateway route (the key stays on the host and the
+proxy injects it, §3). Everything else comes from the session's capability manifest and
+the user's own `--grant` and `--pass-env`, identically for every adapter:
+
+* the sandbox (worktree at `/work`, tmpfs home, no host home or secrets, `ward-agent`
+  hardening when the shim is present);
+* the egress proxy and its allowlist; a provider route reaches that provider's API only
+  and does not add its host to the allowlist;
+* every credential decision (`CredentialGranted` / `CredentialDenied`);
+* the environment, which starts empty: no variable of the launching process reaches the
+  sandbox, nor the environment of bubblewrap's own init (PID 1 inside, readable by every
+  process there), except `LANG`, `LC_ALL`, `USER` and `SHELL` when set
+  (`session::FORWARDED_ENV`). Until #279 the whole environment of `ward` was inherited:
+  tokens in the user's shell were readable in the sandbox, directly without the shim and
+  through `/proc/<pid>/environ` with it.
+
+### 10.4 What evidence records
+
+Right after a launch's `CommandStarted`, the session records one `AgentClaim { Note }`
+with origin `agent` whose payload is the binding:
+
+```json
+{"agent_adapter":{"contract":"1.0","adapter":"claude-code","runtime":{"product":"Claude Code","version":"2.1.263"},"hooks":"full","events":["SessionStart","PreToolUse","PostToolUse","PermissionRequest","Stop"],"provider":"anthropic","model":"claude-sonnet-4-5"}}
+```
+
+`runtime` is what the adapter declares; `model` is what the command line requested
+(`--model`/`-m` for Claude Code and Codex, `null` when the runtime picks its default or
+the adapter cannot know); `provider` is the adapter's gateway, whether or not a key was
+there to grant (the grant itself is the `CredentialGranted` record). None of it is
+verified, and none of it is identity, authority or policy: it is recorded as an
+agent-origin claim precisely so that nothing can read it as an enforcement fact
+(event-model §2). The observer shows it as a `NOTE`.
+
+### 10.5 When a hook is missing
+
+| Missing | What the session loses | What still holds |
+| --- | --- | --- |
+| `PreToolUse` | Step-through holds, approvals, the protected-tests deny before a write, tool intent in the observer | The write lands only in `/work`; the verifier restores protected tests from the entry snapshot |
+| `PermissionRequest` | The daemon cannot refuse the agent's own permission prompt | The prompt grants nothing the sandbox or proxy refuses |
+| `PostToolUse` | The `TOOL` rows of what ran | `RUN`, file and `NET`/`DENY` rows from the host |
+| `SessionStart` / `Stop` | The bookends in the observer | `CommandStarted` / `CommandFinished` |
+| All (`hooks: none`) | Every claim | Every refusal: the conformance suite (§10.7) proves them identical |
+
+Hooks are steering: an adapter that ignores a `deny` has gained nothing the sandbox, the
+proxy or the broker refuse.
+
+### 10.6 Integrating a custom agent
+
+1. Run it: `ward agent --product "Acme Agent" --product-version 7.4 -- acme --task …`.
+   It gets the session's sandbox, allowlist and credentials, and its launches are
+   recorded with the binding of §10.4.
+2. If it talks to Anthropic's or OpenAI's API, add `--provider anthropic` (or `openai`):
+   it sees `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`) on the relay and a placeholder
+   key, never the key.
+3. For semantic visibility, have it write one `SemanticEventLine` per event to the Unix
+   socket named by `$WARD_SOCKET` and read one `ApprovalAnswer` back (one connection per
+   line), honouring `deny` and `ask` before a tool runs. Every line is recorded as a
+   claim. Describe what it emits in a `CapabilityDocument` of its own (`hooks: partial`
+   with `PostToolUse` only, for an agent that reports after the fact); WardOS does not
+   load such a document from a file yet (§10.8).
+
+### 10.7 Conformance
+
+`crates/ward-daemon/tests/adapter_conformance.rs` runs one hostile probe through every
+shipped adapter — Claude Code, Codex and the generic process adapter — under the same
+project policy, through `Session::adapter_launch` and `Session::launch`. The probe reads
+a host secret, the host vault and the host home, writes outside the workspace and into
+`/usr`, asks the proxy for an unlisted host, another provider's API and a private
+address, connects directly and resolves a name, and reports its environment and that of
+the sandbox's PID 1. The suite requires the same refusals line for line, the same
+enforcement records, the same manifest, no host variable and no key in the sandbox, the
+adapter's own provider as the only credential, one binding per launch, and exactly the
+semantic events each document declares. A second test has a hookless agent forge an
+approved `PreToolUse` and then try the request: the claim is recorded and the proxy
+refuses.
+
+The runtimes are fakes. No real Claude Code or Codex can run a task without a model API,
+so the Claude Code fake does what Claude Code does with the settings `ward claude`
+seeds — reads `$CLAUDE_CONFIG_DIR/settings.json` and runs each wired hook command with
+Claude Code's hook payload on stdin, or writes the line `ward-agent hook` would when the
+test build has no shim in the sandbox — and the Codex fake checks the environment
+`ward codex` sets.
+
+### 10.8 Not yet
+
+* `ward-node` runs an `argv`, not an adapter: a node task's manifest is already the same
+  for any runtime, and the action channel (#404) is the semantic channel to come; the
+  equivalence above is proven for local sessions.
+* Capability requests, cooperative cancellation and structured task results have
+  contract shapes and no host path (`coverage` reports them as unserved for an adapter
+  that claims them).
+* A custom adapter's document and launch spec cannot be loaded from a file yet; it runs
+  as the generic process adapter.
+* The verifier's and `ward prepare`'s launches still inherit the host environment.

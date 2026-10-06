@@ -23,6 +23,7 @@ ward-sandbox = { path = "../ward-sandbox", version = "0.18.0" }
 ward-launch = { path = "../ward-launch", version = "0.18.0" }
 ward-proxy = { path = "../ward-proxy", version = "0.18.0" }
 ward-agent = { path = "../ward-agent", version = "0.18.0" }
+ward-agent-adapter = { path = "../ward-agent-adapter", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
 blake3 = { workspace = true }
 clap = { workspace = true }

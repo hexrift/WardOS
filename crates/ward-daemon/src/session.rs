@@ -281,7 +281,30 @@ pub struct LaunchOpts {
     pub refusals: Vec<WardEvent>,
     /// Lines for the user about credential decisions.
     pub notes: Vec<String>,
+    /// The adapter the launch runs (contract 1.0, ADR-0033), recorded right after
+    /// `CommandStarted` as an agent-origin claim: metadata, never authority.
+    pub adapter: Option<ward_agent_adapter::AdapterBinding>,
 }
+
+/// The evidence record of an adapter binding (ADR-0033 §5): `AgentClaim { Note }`
+/// whose payload is the binding's JSON, `{"agent_adapter":{…}}`.
+fn binding_claim(binding: &ward_agent_adapter::AdapterBinding) -> Result<WardEvent> {
+    let claim = ward_agent_adapter::BindingClaim {
+        agent_adapter: binding.clone(),
+    };
+    let json = serde_json::to_string(&claim).map_err(|e| Error::Events(e.to_string()))?;
+    Ok(WardEvent::AgentClaim {
+        kind: ward_events::ClaimKind::Note,
+        payload: ward_events::PayloadText::new(&json),
+    })
+}
+
+/// Host variables a session launch forwards into the sandbox when they are set:
+/// locale and login identity, never a credential (#279). Everything else of the
+/// launching process's environment is left out: the sandbox, and bubblewrap's own
+/// init inside it, start from an empty one ([`Launch::clear_env`]). `TMPDIR` is not
+/// forwarded: it names a host path, and the sandbox's `/tmp` is its own.
+pub const FORWARDED_ENV: &[&str] = &["LANG", "LC_ALL", "USER", "SHELL"];
 
 /// Nominal validity of a gateway grant. The route itself lives exactly as long
 /// as the launch; this is the bound recorded in the log.
@@ -694,11 +717,8 @@ impl Session {
         self.launch(&command, &opts)
     }
 
-    /// What [`run_agent`](Self::run_agent) would launch: the profile's command and
-    /// env, explicitly passed-through host variables, and the model-API gateway
-    /// when the host holds the key. Passing the key variable through with
-    /// `pass_env` hands the agent the real key instead, and no gateway is set up.
-    /// Nothing is granted when the session is offline.
+    /// What [`run_agent`](Self::run_agent) would launch: the first-party adapter
+    /// `name` (`claude`, `codex`) through [`adapter_launch`](Self::adapter_launch).
     pub fn agent_launch(
         &self,
         name: &str,
@@ -706,12 +726,35 @@ impl Session {
         pass_env: &[String],
         grants: &[String],
     ) -> Result<(Vec<String>, LaunchOpts)> {
-        let profile = crate::agents::profile(name)
+        let adapter = crate::adapters::Adapter::first_party(name)
             .ok_or_else(|| Error::Project(format!("unknown agent `{name}`")))?;
-        let mut env: Vec<(String, String)> = profile
-            .env
+        self.adapter_launch(&adapter, args, pass_env, grants)
+    }
+
+    /// What launching `adapter` with `args` means for this session (contract 1.0,
+    /// ADR-0033): the adapter's command, environment and settings files,
+    /// explicitly passed-through host variables, the model-API gateway of its
+    /// provider when the host holds the key, and the credentials the session's
+    /// policy grants. Passing the key variable through with `pass_env` hands the
+    /// agent the real key instead, and no gateway is set up. Nothing is granted
+    /// when the session is offline.
+    ///
+    /// The same for every adapter: the sandbox, the network allowlist and every
+    /// credential decision come from the session's manifest and `grants`, never
+    /// from the adapter, so Claude Code, Codex and the generic process adapter run
+    /// with the same authority and differ only in what they report.
+    pub fn adapter_launch(
+        &self,
+        adapter: &crate::adapters::Adapter,
+        args: &[String],
+        pass_env: &[String],
+        grants: &[String],
+    ) -> Result<(Vec<String>, LaunchOpts)> {
+        let spec = adapter.launch_spec();
+        let mut env: Vec<(String, String)> = spec
+            .env()
             .iter()
-            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .map(|v| (v.name.clone(), v.value.clone()))
             .collect();
         for key in pass_env {
             if let Ok(v) = std::env::var(key) {
@@ -719,18 +762,18 @@ impl Session {
             }
         }
         let online = !matches!(self.manifest.network, NetworkCapability::Offline);
-        let mut gateways = profile
-            .gateway
+        let mut gateways = adapter
+            .gateway()
             .filter(|g| online && !pass_env.iter().any(|k| k == g.key_env))
             .map(|spec| Gateway::resolve(&spec, &self.state))
             .transpose()?
             .flatten()
             .into_iter()
             .collect::<Vec<_>>();
-        let mut seeds: Vec<(String, String)> = profile
-            .settings
-            .map(|s| (s.path.to_owned(), (s.content)()))
-            .into_iter()
+        let mut seeds: Vec<(String, String)> = spec
+            .settings()
+            .iter()
+            .map(|s| (s.path.clone(), s.content.clone()))
             .collect();
         let mut refusals = Vec::new();
         let mut notes = Vec::new();
@@ -784,10 +827,8 @@ impl Session {
         for g in &gateways {
             env.extend(g.env.iter().cloned());
         }
-        let mut command = vec![profile.binary.to_string()];
-        command.extend(args.iter().cloned());
         Ok((
-            command,
+            spec.argv(args),
             LaunchOpts {
                 env,
                 interactive: true,
@@ -795,6 +836,7 @@ impl Session {
                 seeds,
                 refusals,
                 notes,
+                adapter: Some(adapter.binding(args)?),
             },
         ))
     }
@@ -874,6 +916,12 @@ impl Session {
             },
         )?;
 
+        // Which adapter this launch runs, right behind its `CommandStarted`: an
+        // agent-origin claim, so nothing can read it as an enforcement fact
+        // (ADR-0033 §5). Its content is declared, not verified.
+        if let Some(binding) = &opts.adapter {
+            self.emit(Origin::Agent, binding_claim(binding)?)?;
+        }
         for refusal in &opts.refusals {
             self.emit(Origin::Wardd, refusal.clone())?;
         }
@@ -1100,7 +1148,16 @@ impl Session {
         run_dir: &Path,
         observers: &Observers,
     ) -> Result<Launch> {
-        let mut launch = Launch::new(&self.worktree, argv.to_vec());
+        // From an empty environment (#279): the host's variables — tokens and keys
+        // among them — never reach the sandbox, whichever adapter runs and whether
+        // or not the shim is there to filter them; a few non-secret ones are
+        // forwarded by name.
+        let mut launch = Launch::new(&self.worktree, argv.to_vec()).clear_env();
+        for name in FORWARDED_ENV {
+            if let Ok(value) = std::env::var(name) {
+                launch = launch.env(*name, value);
+            }
+        }
         if let Some(socket) = observers.egress_socket() {
             launch = launch.egress(socket);
         }

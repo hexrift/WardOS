@@ -2,10 +2,32 @@
 //!
 //! Adapter metadata describes integration affordances only. It is never identity,
 //! authority, policy or an OS-enforcement fact.
+//!
+//! The versioned contract (`docs/agent-integration.md` §10, ADR-0033) is spread over
+//! four modules: [`contract`] (version, hook coverage, semantic events and the
+//! capability-discovery document), [`launch`] (what an adapter may ask of a launch),
+//! [`wire`] (the hook-socket lines, approvals, capability requests, cancellation, task
+//! result and the evidence binding) and [`catalogue`] (the documents `WardOS` ships).
 
 #![forbid(unsafe_code)]
 
+pub mod catalogue;
+pub mod contract;
+pub mod launch;
+pub mod wire;
+
 use std::fmt::{Display, Formatter};
+
+pub use contract::{
+    CapabilityDocument, CapabilityDocumentError, ContractVersion, ContractVersionError, Coverage,
+    HookSupport, SERVED_FEATURES, SemanticEvent, SemanticEvents, SemanticEventsError,
+};
+pub use launch::{EnvVar, LaunchSpec, LaunchSpecError, ProviderId, ProviderIdError, SettingsFile};
+pub use wire::{
+    AdapterBinding, AdapterBindingError, ApprovalAnswer, ApprovalDecision, BindingClaim,
+    CancelReason, CancelRequest, CapabilityRequest, CapabilityRequestError, RequestedCapability,
+    SemanticEventLine, SemanticEventLineError, TaskOutcome, TaskResult,
+};
 
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};

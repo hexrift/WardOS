@@ -99,7 +99,9 @@ pub enum WardEvent {
     VerificationInterrupted    { attempt: AttemptId, candidate: Option<SnapshotId>, reason: BoundedText },
     VerificationTimedOut       { attempt: AttemptId, candidate: SnapshotId, summary: VerifySummary, result_hash: Blake3Hash, budget_secs: u64 },   // killed at the budget, not a test failure
 
-    // agent claims (origin: Agent) — never enforcement facts
+    // agent claims (origin: Agent) — never enforcement facts. A launch's adapter
+    // binding is a Note whose payload is {"agent_adapter":{…}} (ADR-0033,
+    // agent-integration §10.4): runtime and model as metadata, never authority.
     AgentClaim { kind: ToolUse | Note | Plan, payload: BoundedText },
 
     // integrity
@@ -250,7 +252,7 @@ and needs a version bump and an explicit migration, not a silent field change.
 | File modify | `fanotify` (`FAN_CLOSE_WRITE`, `FAN_CREATE`, `FAN_DELETE`, `FAN_MOVED_*`, `FAN_ATTRIB`) on the `/work` mount from Zone 0 | negligible | Reads via `FAN_OPEN` optional in Live; `FAN_ACCESS` never (too hot) |
 | Network | Proxy decision log; nftables `log` group via nflog for drops | negligible | Every CONNECT is one event |
 | Syscall-level | seccomp user-notification on a *small* set (`connect` to non-proxy, `ptrace`) — deny + event | measured in E-05 | Fallback: plain seccomp kill + audit |
-| Semantic | Agent hooks (Claude Code `PreToolUse`/`PostToolUse`/`PermissionRequest`, Codex equivalents) via `ward-request` | none | origin=Agent |
+| Semantic | Agent hooks over the session's hook socket: Claude Code `PreToolUse`/`PostToolUse`/`PermissionRequest` via `ward-agent hook`, or any adapter writing contract-1.0 lines (agent-integration §10); Codex wires none | none | origin=Agent |
 | Verifier | Runner stdout protocol over a pipe to `wardd` | — | Verifier never writes the log |
 
 ## 5. Storage and integrity

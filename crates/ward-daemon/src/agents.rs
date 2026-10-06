@@ -75,6 +75,17 @@ const OPENAI: GatewaySpec = GatewaySpec {
     placeholder_env: "OPENAI_API_KEY",
 };
 
+/// The providers the host has a model-API gateway for.
+pub const PROVIDERS: [&str; 2] = [ANTHROPIC.service, OPENAI.service];
+
+/// The gateway for a provider (`anthropic`, `openai`), if the host has one.
+#[must_use]
+pub fn gateway(provider: &str) -> Option<GatewaySpec> {
+    [ANTHROPIC, OPENAI]
+        .into_iter()
+        .find(|spec| spec.service == provider)
+}
+
 /// Profile for a known agent name, if any.
 pub fn profile(name: &str) -> Option<AgentProfile> {
     match name {
@@ -127,6 +138,16 @@ mod tests {
             Some("openai")
         );
         assert!(profile("nope").is_none());
+    }
+
+    #[test]
+    fn providers_name_their_gateways() {
+        assert_eq!(PROVIDERS, ["anthropic", "openai"]);
+        for provider in PROVIDERS {
+            assert_eq!(gateway(provider).map(|g| g.service), Some(provider));
+        }
+        assert!(gateway("github").is_none());
+        assert!(gateway("").is_none());
     }
 
     #[test]
