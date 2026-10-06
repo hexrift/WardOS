@@ -143,6 +143,15 @@ pub fn network_manifest() -> CapabilityManifestBytes {
     .unwrap()
 }
 
+/// An offline manifest requiring at least `level` of isolation.
+pub fn isolation_manifest(level: ward_node_protocol::IsolationLevel) -> CapabilityManifestBytes {
+    CapabilityManifestBytes::encode(
+        &CapabilityManifest::new(NetworkGrant::Offline)
+            .with_isolation(ward_node_protocol::IsolationGrant::new(level).unwrap()),
+    )
+    .unwrap()
+}
+
 /// An offline manifest also asking for `output`: the first `stdio_bytes` of each stream
 /// and the declared `files` up to `files_bytes` of content.
 pub fn output_manifest(
@@ -574,6 +583,12 @@ impl FakeLauncher {
     /// What the fake workload's reaper reports it used, as a cgroup launcher measures it.
     pub fn set_usage(&self, usage: Option<ward_events::NodeResourceUsage>) {
         self.state().usage = usage;
+    }
+}
+
+impl crate::capsule::CapsuleBackend for FakeLauncher {
+    fn descriptor(&self) -> crate::capsule::CapsuleBackendDescriptor {
+        crate::capsule::CapsuleBackendDescriptor::BUBBLEWRAP
     }
 }
 

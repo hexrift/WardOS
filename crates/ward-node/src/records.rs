@@ -12,7 +12,9 @@
 //! applied to the attempt; the `admit` that took effect (its operation id, the BLAKE3
 //! digest of the exact envelope bytes, the issuer proof and the envelope's session); the
 //! receipt outcome once the attempt ended; the workspace; and, while its end is not
-//! confirmed by the reaper, the host process the workload was spawned as. The state
+//! confirmed by the reaper, the host process the workload was spawned as; and, from the
+//! launch intent on, the Capsule backend the attempt was placed on and its isolation level
+//! ([`CapsuleRecord`], ADR-0039). The state
 //! `launching` is a launch intent, recorded before a spawn and replaced once the spawn is
 //! confirmed.
 //!
@@ -48,6 +50,7 @@ use ward_node_protocol::{
 };
 
 use crate::admit::VerifiedAdmission;
+use crate::capsule::CapsuleRecord;
 use crate::execution::WorkloadProcess;
 use crate::state::{
     MAX_STATE_FILE_BYTES, NodeStateError, StoredFile, open_private_dir, read_bounded, write_atomic,
@@ -281,6 +284,10 @@ pub(crate) struct TaskRecord {
     /// was not measured, so a record without it is byte for byte what it was.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) usage: Option<NodeResourceUsage>,
+    /// The backend the attempt was placed on, from its launch intent on (#263); absent
+    /// before a `start` and in a record written before it was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) capsule: Option<CapsuleRecord>,
 }
 
 impl TaskRecord {
@@ -295,6 +302,10 @@ impl TaskRecord {
                 .as_ref()
                 .and_then(|admitted| admitted.authority.as_ref())
                 .is_none_or(AuthorityRecord::is_well_formed)
+            && self
+                .capsule
+                .as_ref()
+                .is_none_or(CapsuleRecord::is_well_formed)
     }
 }
 
@@ -442,6 +453,7 @@ mod tests {
             workspace: Some(PathBuf::from("/tasks/t/a")),
             process: Some(WorkloadProcess::new(4242, 77, "boot".to_owned())),
             usage: None,
+            capsule: None,
         }
     }
 

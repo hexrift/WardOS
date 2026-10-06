@@ -31,6 +31,8 @@ import {
   deriveId,
   holdGrant,
   holdGrantOf,
+  isolationFloor,
+  isolationFloorOf,
   manifest,
   isId,
   loadIssuerKey,
@@ -44,6 +46,7 @@ import {
   requireAgentAdapter,
   requireApprovalHold,
   requireCredentialBroker,
+  requireIsolation,
   requireResourceEnforcement,
   resourcesGrant,
   resourcesGrantOf,
@@ -74,7 +77,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
                [--hold host=<pattern> | --hold service=<name>]... [--agent-adapter <id>]
                [--cpu-millis <n>] [--memory-bytes <n>] [--pids <n>] [--capacity-wait-secs <n>]
-               [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
+               [--isolation container|microvm|vm] [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
                and --files-bytes puts an output grant in the manifest (the others default to 0
@@ -128,6 +131,12 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                that does not report resources with each named limit true, or whose capacity
                is below a limit, is refused here (unsupported_grant) before anything is
                signed. The outcome lists the grant in resources.
+               --isolation puts an isolation floor in the manifest: the node runs the
+               attempt only on a Capsule backend at least that strong, never weaker
+               (ADR-0039). Without it the floor is sandbox, as every node offers. The node's
+               capability document is read first: a node that does not offer a backend at
+               that level (isolation.backends.<level>) is refused here (unsupported_grant)
+               before anything is signed. The outcome lists the floor in isolation.
                --capacity-wait-secs (default 30; 0 disables) bounds how long run waits when
                the node refuses start capacity_exhausted (a node started with --max-running
                at its bound or below a headroom floor): the attempt stays admitted and
@@ -143,7 +152,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
                A policy answers its action channel as run's does, replaying recorded answers;
-               a recorded credentials grant, hold, resources grant and agent adapter are
+               a recorded credentials grant, hold, resources grant, isolation floor and agent adapter are
                listed in the outcome as run's are. A replay sends the run once: a start
                refused capacity_exhausted is its outcome, never waited out.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
@@ -213,6 +222,7 @@ const OPTIONS = {
   "memory-bytes": { type: "string" },
   pids: { type: "string" },
   "capacity-wait-secs": { type: "string" },
+  isolation: { type: "string" },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -313,7 +323,7 @@ function credentialsOf(values, budgetMs) {
  * given, a resources grant when any of --cpu-millis, --memory-bytes and --pids is, and an
  * actions grant when --actions is; with --credential, the credentials grant
  * and a network.custom of exactly its hosts; with --hold, the hold, which needs --actions
- * naming approval and may name only those hosts and services.
+ * naming approval and may name only those hosts and services; with --isolation, the floor.
  */
 function manifestOf(values, budgetMs) {
   const object = { network: "offline" };
@@ -354,6 +364,7 @@ function manifestOf(values, budgetMs) {
     // Held to the rest of the manifest here, before the node is asked anything.
     manifest(object);
   }
+  if (values.isolation !== undefined) object.isolation = isolationFloor(values.isolation);
   return Object.keys(object).length === 1 ? undefined : object;
 }
 
@@ -625,20 +636,22 @@ function deriveCommand(positionals) {
 /**
  * Refuse a credentials grant unless the node's capability document offers the broker, a
  * hold unless it offers approval holds, a resources grant unless it enforces every limit
- * within its capacity, and an agent adapter unless it hosts it; the document is read once,
- * and only when needed.
+ * within its capacity, an isolation floor unless it offers a backend at that level, and an
+ * agent adapter unless it hosts it; the document is read once, and only when needed.
  */
 async function requireOffers(values, workloadManifest, agentAdapter) {
   const brokered = workloadManifest?.credentials !== undefined;
   const held = workloadManifest?.hold !== undefined;
   const limited = workloadManifest?.resources !== undefined;
-  if (!brokered && !held && !limited && agentAdapter === null) return;
+  const floored = workloadManifest?.isolation !== undefined;
+  if (!brokered && !held && !limited && !floored && agentAdapter === null) return;
   const adapter = adapterOf(values);
   try {
     const capabilities = await adapter.capabilities();
     if (brokered) requireCredentialBroker(capabilities);
     if (limited) requireResourceEnforcement(capabilities, workloadManifest.resources);
     if (held) requireApprovalHold(capabilities);
+    if (floored) requireIsolation(capabilities, workloadManifest.isolation);
     if (agentAdapter !== null) requireAgentAdapter(capabilities, agentAdapter);
   } finally {
     await adapter.close();
@@ -727,6 +740,7 @@ async function run(values, argv) {
   if (workloadManifest?.resources !== undefined) outcome.resources = workloadManifest.resources;
   if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
   if (workloadManifest?.hold !== undefined) outcome.hold = workloadManifest.hold;
+  if (workloadManifest?.isolation !== undefined) outcome.isolation = workloadManifest.isolation;
   if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
   withCapacity(outcome, report, capacityWaits, capacityWaitSecs);
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
@@ -761,6 +775,8 @@ async function replay(values) {
   if (credentials !== null) outcome.credentials = credentials;
   const hold = holdGrantOf(record.envelope_json);
   if (hold !== null) outcome.hold = hold;
+  const isolation = isolationFloorOf(record.envelope_json);
+  if (isolation !== null) outcome.isolation = isolation;
   const agentAdapter = agentAdapterOf(record.envelope_json);
   if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
   withCapacity(outcome, report, capacityWaits, 0);

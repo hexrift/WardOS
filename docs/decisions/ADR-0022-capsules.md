@@ -1,5 +1,8 @@
 # ADR-0022 — Capsules: isolation as a first-class OS primitive, proportional to risk
 
+The backend contract, the ordered isolation levels and risk-based placement on `ward-node`
+are decided in [ADR-0039](ADR-0039-capsule-backends-and-isolation-levels.md).
+
 ## Decision
 WardOS exposes one user-facing abstraction for isolated execution — the **Capsule** — and
 makes it a first-class operating-system primitive rather than a feature of any one tool. A

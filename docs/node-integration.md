@@ -456,7 +456,8 @@ well, `network.proxy_allowlist` reads `true`):
 | `lifecycle.start` | Present, and `true`, when the node executes admitted tasks (`--task-root` set, bubblewrap usable). Absent means `false`. |
 | `lifecycle.stop` | Always present. At 1.3 it equals `start`: the node never offers a way to begin execution without its own way to end it. |
 | `lifecycle.pause`, `lifecycle.revoke` | Always present. At 1.3 each is `true` exactly when `lifecycle.start` is: an executing node serves `pause` and `revoke`. The document has no flag for `resume` or `seal`; an executing node serves `resume` with `pause` and `seal` with `start`, and a node that advertises `start` `false` refuses all four `unsupported_operation`. |
-| `isolation.namespaces.sandbox`, `isolation.namespaces.user_namespace` | `true` exactly when `lifecycle.start` is: every workload runs in a bubblewrap namespace sandbox inside its own user namespace. |
+| `isolation.namespaces.sandbox`, `isolation.namespaces.user_namespace` | `true` exactly when `lifecycle.start` is: every workload runs in a bubblewrap namespace sandbox inside its own user namespace. `namespaces.sandbox` is also the node's offer of a Capsule backend at isolation level `sandbox` ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) §3): the level of every attempt whose manifest names no `isolation` floor (§7.5). |
+| `isolation.backends.container`, `isolation.backends.microvm`, `isolation.backends.vm` | The node's offer of a Capsule backend at that isolation level (ADR-0039 §1, §3): `true` exactly when it has one, and then a manifest whose `isolation.minimum` names the level is honoured on it (§7.5). At this revision every node has only the `sandbox` backend, so all three are `false` and every `isolation` floor is refused `unsupported_grant`. The section's shape is unchanged, so a strict decoder of any 1.3 revision reads it; which mechanism serves a level is the node's, not the document's. |
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
 | `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
@@ -470,7 +471,7 @@ well, `network.proxy_allowlist` reads `true`):
 
 | `adapters.contract`, `adapters.hosted` | Present, as `"adapters":{"contract":"1.0","hosted":["claude-code","codex","process"]}` after `actions` (or where `actions` would be), exactly when `lifecycle.start` is and the node was started with `--agent-adapter` (§2.1): `contract` is the `ward-agent-adapter` contract the node hosts adapters under, `hosted` the adapters its operator named, in that order, none twice. A workload naming one of them is honoured (§6.10); any other adapter is refused `unsupported_grant`. Otherwise the section is absent. New in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--agent-adapter` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
-Everything else (`isolation.backends`, `snapshots.diff`, `snapshots.read`, `verifier`) is
+Everything else (`snapshots.diff`, `snapshots.read`, `verifier`) is
 `false`: the node offers none of it yet. 1.1 and 1.2
 documents keep their earlier content: they never carry `admit`, `start`, `output`,
 `resources`, `scheduling`, `actions` or `adapters`,
@@ -721,7 +722,11 @@ an admitted attempt also keeps the authority chain its `admit` verified, which
 `ward-node audit` reads (§2.6). On a node started with `--cgroup-root`, the record of
 an ended attempt also keeps what it used (`usage`: the limits enforced and the kernel's
 counters, as in `NodeAttemptResourceUsage`, §6.5), and keeps it across a restart; a record
-without a measurement carries no `usage` field and reads exactly as before. `start`
+without a measurement carries no `usage` field and reads exactly as before. From the
+launch intent of a `start` on, the record also names the Capsule backend the attempt was
+placed on and its isolation level (`"capsule":{"backend":"bubblewrap","isolation":"sandbox"}`,
+ADR-0039 §6), and keeps it across a restart; a record of an attempt never started carries
+no `capsule` field. `start`
 records that it is about to spawn before it spawns, and the spawned process once the
 spawn is confirmed; if that second write fails, the node kills the workload and answers
 `accepted` with `exited` (`unknown`), as for an ambiguous launch.
@@ -1554,6 +1559,8 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | `hold` | Optional (new in this revision of 1.3, like `output`). `{"hosts": [patterns], "services": [names]}`, each list optional but non-empty when present, at least one present: the capabilities the node holds until the control plane approves the request it opens for each (§6.9). The manifest must carry an `actions` grant naming `approval`. |
 | `hold.hosts` | Patterns of the manifest's own `network.custom`, each exactly as written there (a name a `*.` pattern covers is not one), no repeats. |
 | `hold.services` | Services of the manifest's own `credentials`, no repeats. Together with `hosts`, at most 8 entries. |
+| `isolation` | Optional (new in this revision of 1.3, like `output`). `{"minimum": L}`, `minimum` the only field: the weakest isolation level the attempt may run at ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) §1). Absent, the floor is `sandbox`, the level of every attempt before this revision. |
+| `isolation.minimum` | One of `container`, `microvm` and `vm`, in the order of what they guarantee (`sandbox` < `container` < `microvm` < `vm`). `sandbox` is spelled by leaving `isolation` out and fails decoding, so a floor has one spelling. The node places the attempt only on a backend at exactly that level (a stronger one only by its operator's explicit policy, which no node offers at this revision), never on a weaker one. |
 | `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
@@ -1568,7 +1575,9 @@ which a node started with `--action-channel` reports, and only within its ceilin
 `credentials` only when `credentials.proxy_injection` is `true`, which a node started with
 `--credentials` reports, and only for a service its operator configured, for that service's
 host and within its ceiling, and `hold` only when `actions.hold` is `true`, which a node
-started with `--approval-hold` reports; the
+started with `--approval-hold` reports, and `isolation` only when the node offers a
+backend at exactly that level, which its `isolation` section says (§5), and at this
+revision no node does; the
 workload then runs behind the attempt's own egress proxy allowing exactly the listed
 patterns (§9), its output is kept and returned as §6.6 says, its process tree is held to
 the limits as §9 says, its channel is served as §6.7 says, its credentials are leased
@@ -1635,6 +1644,14 @@ Decodes; honoured on a node started with `--network-allowlist`, `--action-channe
 `--approval-hold`, refused `unsupported_grant` on any other.
 
 ```json
+{"network":"offline","isolation":{"minimum":"microvm"}}
+```
+
+Decodes; honoured only on a node whose capability document reports
+`isolation.backends.microvm` `true`, refused `unsupported_grant` on any other, which at
+this revision is every node: it never runs the attempt in a weaker boundary.
+
+```json
 {"network":"development"}
 ```
 
@@ -1648,8 +1665,10 @@ an `actions` grant with no kind, a zero bound or `max_pending` above `max_total`
 secret, an empty `credentials` list, a zero `ttl_secs` or a wildcard host, a `hold` naming
 a host that is not one of the manifest's `network.custom` patterns or a service that is not
 one of its `credentials`, a `hold` without an `actions` grant naming `approval`, an empty
-`hold` or hold list, and any manifest with a field other than `network`, `output`,
-`resources`, `actions`, `credentials` and `hold`.
+`hold` or hold list, `{"network":"offline","isolation":{"minimum":"sandbox"}}`, an
+`isolation` naming an unknown level, `null`, an array or a field other than `minimum`, and
+any manifest with a field other than `network`, `output`, `resources`, `actions`,
+`credentials`, `hold` and `isolation`.
 
 ## 8. Verification order and rejection reasons
 
@@ -1675,7 +1694,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9); and a `workload.adapter` only when the node lists it in `adapters.hosted` and can build its launch from the argv (§6.10) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9), an `isolation` floor only when the node reports a backend at that level in `isolation` (§5, ADR-0039); and a `workload.adapter` only when the node lists it in `adapters.hosted` and can build its launch from the argv (§6.10) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1687,7 +1706,10 @@ Each of the six execution verbs is `unsupported_operation` without `--task-root`
 
 `start`: checks 1–2; replay; not
 `ready` → `invalid_state`; envelope `issued_at` in the future → `authority_denied`;
-envelope or lease expired → `lease_expired`; revoked → `lease_revoked`; on a node started
+envelope or lease expired → `lease_expired`; revoked → `lease_revoked`; no Capsule
+backend for the manifest's isolation floor → `unsupported_grant` with the task still
+`ready` and nothing materialised (`admit` already refused such a manifest; `start` places
+the attempt again so it never runs weaker); on a node started
 with `--max-running`, as many attempts executing as the bound, or available memory or
 disk below its floor → `capacity_exhausted`, a floor that cannot be measured →
 `resource_unavailable`, both with the task still `ready` and nothing materialised;

@@ -89,9 +89,10 @@ use clap::{ArgGroup, Parser, Subcommand};
 use nix::sys::signal::SigSet;
 use ward_events::{ExecutionAttemptId, NodeId, TaskId};
 use ward_node::admit::{NodeAdmission, SystemClock};
+use ward_node::capsule::CapsuleBackend;
 use ward_node::cgroup::{CgroupLauncher, CgroupRoot, ResourceEnforcement};
 use ward_node::credentials::NodeCredentials;
-use ward_node::execution::{NodeExecution, SandboxLauncher, TaskLauncher};
+use ward_node::execution::{NodeExecution, SandboxLauncher};
 use ward_node::issuer::{IssuerKeyParseError, IssuerPublicKey, TrustedIssuers};
 use ward_node::peer::{ClientGroup, ClientUids};
 use ward_node::scheduling::SchedulingLimits;
@@ -398,7 +399,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let capabilities = conservative_host_capabilities()?;
     let service = match task_root {
         Some(task_root) => {
-            let launcher: Arc<dyn TaskLauncher> = match &cgroups {
+            let backend: Arc<dyn CapsuleBackend> = match &cgroups {
                 Some(root) => Arc::new(CgroupLauncher::new(Arc::clone(root))),
                 None => Arc::new(SandboxLauncher),
             };
@@ -408,7 +409,7 @@ fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             NodeService::with_execution(
                 capabilities,
                 admission,
-                NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, launcher)
+                NodeExecution::new(task_root, open_snapshot_store(&state_dir)?, backend)
                     .with_network_allowlist(cli.network_allowlist)
                     .with_output_return(cli.output_return)
                     .with_action_channel(cli.action_channel)

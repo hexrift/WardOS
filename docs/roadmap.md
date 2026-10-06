@@ -363,7 +363,11 @@ interactive references in [`design/storyboard/`](design/storyboard/):
   primitive: one `Ward Capsule API` and a policy engine that picks the lightest boundary
   (sandbox → container → microVM → VM) proportional to risk, with controlled promotion and
   no copy-back. Unifies the existing sandbox/verifier/network mechanisms; KVM/QEMU is the
-  microVM/VM foundation.
+  microVM/VM foundation. On `ward-node` the backend contract, the ordered isolation levels
+  and the manifest's isolation floor are [ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md)
+  (proposed; #263): the bubblewrap launch is its first backend at `sandbox`, and a floor no
+  backend meets is refused, never run weaker. A container backend with cross-backend
+  conformance, then a microVM backend, are next.
 * **Ward Studio + the Ward Agent Runtime** ([ADR-0023](decisions/ADR-0023-ward-studio-and-agent-runtime.md),
   *proposed/roadmap*) — a first-party agentic IDE whose unit of work is *work*, over a
   provider-agnostic agent runtime (Claude/Codex/Gemini/local as replaceable brains). WardOS

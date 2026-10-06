@@ -37,11 +37,14 @@
 //!   refuses `admit` as unsupported.
 //! * `start` (protocol 1.3, a registry built [`TaskRegistry::with_execution`]) moves a
 //!   `Ready` task to [`TaskLifecycleState::Running`] (ADR-0030 §3). It rechecks at the
-//!   node clock that the admitted envelope and lease are unexpired and unrevoked, allocates
-//!   and materialises the attempt's workspace ([`crate::workspace`]), and spawns the
-//!   envelope's argv through the node's [`crate::execution::TaskLauncher`] on a node-owned
-//!   reaper thread. `Running` is reported only once the launcher confirmed a spawn and its
-//!   host pid is recorded. On a node whose execution bounds how many attempts run at once
+//!   node clock that the admitted envelope and lease are unexpired and unrevoked, places the
+//!   attempt on the Capsule backend its manifest's isolation floor allows
+//!   ([`crate::capsule`], ADR-0039; none is `unsupported_grant`, which `admit` already
+//!   refused), allocates and materialises the attempt's workspace ([`crate::workspace`]),
+//!   and spawns the envelope's argv through that backend on a node-owned reaper thread. The
+//!   backend and its level are written into the launch intent and kept in the task's
+//!   record ([`TaskRegistry::capsule`]). `Running` is reported only once the launcher
+//!   confirmed a spawn and its host pid is recorded. On a node whose execution bounds how many attempts run at once
 //!   ([`crate::scheduling`]), a `start` past the bound or below a headroom floor is refused
 //!   [`TaskLifecycleRejectionReason::CapacityExhausted`] after the admission is revalidated
 //!   and before anything is materialised, with no state change. A clean pre-spawn failure
@@ -214,6 +217,7 @@ use crate::actions::{AttemptActions, actions_dir_beside};
 use crate::adapters::{AttemptAdapter, adapter_dir, adapter_dir_beside, workload_launch};
 use crate::admission::TrustedTaskAdmission;
 use crate::admit::{NodeAdmission, VerifiedAdmission};
+use crate::capsule::CapsuleRecord;
 use crate::credentials::{
     AttemptCredentials, NodeCredentials, Renewal, Revoked, credentials_dir, credentials_dir_beside,
 };
@@ -273,6 +277,7 @@ struct NodeTask {
     sealed: Option<SealRecord>,
     receipt: Option<TaskExecutionReceipt>,
     usage: Option<NodeResourceUsage>,
+    capsule: Option<CapsuleRecord>,
 }
 
 /// A spawned (or ambiguously spawned) attempt and the handles its reaper shares.
@@ -532,6 +537,7 @@ impl TaskRegistry {
                     .is_some_and(NodeExecution::honours_approval_hold),
             )
             .with_agent_adapters(execution.as_ref().and_then(NodeExecution::agent_adapters))
+            .with_capsule_placement(execution.as_ref().map(NodeExecution::placement))
             .with_credentials(
                 execution
                     .as_ref()
@@ -660,6 +666,13 @@ impl TaskRegistry {
     #[must_use]
     pub fn usage(&self, binding: TaskBinding) -> Option<NodeResourceUsage> {
         self.task(binding).and_then(|task| task.usage)
+    }
+
+    /// The Capsule backend the attempt `binding` names was placed on, once a `start`
+    /// recorded its launch intent; `None` before.
+    #[must_use]
+    pub fn capsule(&self, binding: TaskBinding) -> Option<CapsuleRecord> {
+        self.task(binding).and_then(|task| task.capsule.clone())
     }
 
     /// How many attempts execute now: spawned (or ambiguously spawned) and not yet reaped,
@@ -1254,11 +1267,16 @@ impl TaskRegistry {
             return Err(Reason::InvalidState);
         };
         admission.revalidate(&admitted.verified)?;
+        let workload = admitted.envelope().workload();
+        let manifest = workload.capability_manifest().manifest();
+        let capsule = execution
+            .placement()
+            .place(manifest.minimum_isolation())
+            .ok_or(Reason::UnsupportedGrant)?;
         if let Some(limits) = execution.scheduling() {
             limits.admit(self.executing(), execution.task_root().dir())?;
         }
 
-        let workload = admitted.envelope().workload();
         let workspace = execution
             .task_root()
             .materialise(binding, execution.snapshots(), workload.snapshot())
@@ -1272,7 +1290,6 @@ impl TaskRegistry {
             workload.argv().args().to_vec(),
             Duration::from_millis(workload.wall_clock_budget_ms()),
         );
-        let manifest = workload.capability_manifest().manifest();
         let request = match manifest.network() {
             NetworkGrant::Offline => request,
             NetworkGrant::Custom(allowlist) => request.with_allowlist(allowlist.clone()),
@@ -1321,6 +1338,7 @@ impl TaskRegistry {
                 actions,
                 credentials,
                 adapter,
+                capsule: CapsuleRecord::from(capsule),
             }),
         ))
     }
@@ -1342,6 +1360,7 @@ impl TaskRegistry {
             actions,
             credentials,
             adapter,
+            capsule,
         }: Started,
     ) -> Result<TaskLifecycleState, Reason> {
         let journal = Journal(self.store.as_ref());
@@ -1351,7 +1370,7 @@ impl TaskRegistry {
             discard(&workspace);
             return Err(Reason::TaskNotFound);
         };
-        if let Err(reason) = journal.write(&task.launching(operation_id, &workspace)) {
+        if let Err(reason) = journal.write(&task.launching(operation_id, &workspace, &capsule)) {
             discard(&workspace);
             return Err(reason);
         }
@@ -1422,6 +1441,7 @@ impl TaskRegistry {
             });
         task.started_by = Some(operation_id);
         task.workspace = Some(workspace);
+        task.capsule = Some(capsule);
         task.attempt = Some(Attempt {
             pid,
             process,
@@ -1875,12 +1895,13 @@ enum Prepared {
 }
 
 /// What a `start` prepared beside the launch: the attempt's action channel and its leased
-/// credentials, if its manifest grants them, and its hosted adapter, if its workload names
-/// one.
+/// credentials, if its manifest grants them, its hosted adapter, if its workload names
+/// one, and the Capsule backend it is placed on.
 struct Started {
     actions: Option<Arc<AttemptActions>>,
     credentials: Option<Arc<AttemptCredentials>>,
     adapter: Option<Arc<AttemptAdapter>>,
+    capsule: CapsuleRecord,
 }
 
 /// What the reaper observed once the workload ended, beside how it ended: the proxy's last
@@ -2187,6 +2208,7 @@ impl NodeTask {
             sealed: None,
             receipt: None,
             usage: None,
+            capsule: None,
         }
     }
 
@@ -2216,6 +2238,7 @@ impl NodeTask {
             sealed: record.sealed,
             receipt: None,
             usage: record.usage,
+            capsule: record.capsule,
         };
         let mut changed = record.process.is_some();
         match record.state {
@@ -2257,16 +2280,23 @@ impl NodeTask {
                 .as_ref()
                 .and_then(|attempt| attempt.process.clone()),
             usage: self.usage,
+            capsule: self.capsule.clone(),
         }
     }
 
     /// The record of this `ready` task's launch intent: `operation_id` is starting it over
-    /// `workspace`, and nothing is confirmed spawned yet.
-    fn launching(&self, operation_id: OperationId, workspace: &Path) -> TaskRecord {
+    /// `workspace` on `capsule`, and nothing is confirmed spawned yet.
+    fn launching(
+        &self,
+        operation_id: OperationId,
+        workspace: &Path,
+        capsule: &CapsuleRecord,
+    ) -> TaskRecord {
         TaskRecord {
             state: RecordedState::Launching,
             started_by: Some(operation_id),
             workspace: Some(workspace.to_path_buf()),
+            capsule: Some(capsule.clone()),
             ..self.record()
         }
     }
@@ -3797,20 +3827,21 @@ mod tests {
             NodeIntervention, SessionId, SnapshotId, WardEvent,
         };
         use ward_node_protocol::{
-            OperationId, ProtocolVersion, TaskAdmissionEnvelope, TaskBinding,
+            IsolationLevel, OperationId, ProtocolVersion, TaskAdmissionEnvelope, TaskBinding,
             TaskExecutionOutcome as Outcome, TaskLifecycleContext,
             TaskLifecycleRejectionReason as Reason, TaskLifecycleRequest, TaskLifecycleResponse,
             TaskLifecycleState as State, TaskReceiptContext, WorkloadArgv,
         };
 
+        use crate::capsule::{CapsuleBackendDescriptor, CapsuleRecord};
         use crate::execution::{NodeExecution, WorkloadExit};
         use crate::task::{
             MAX_ATTEMPT_NETWORK_RECORDS, MAX_ATTEMPT_PAUSES, MAX_NODE_TASKS, TaskRegistry,
         };
         use crate::test_support::{
             FAKE_PID, FakeFreeze, FakeLauncher, FakeSpawn, FakeStop, FixedClock, NOW,
-            envelope_input, eventually, fake_process, fill_revocations, lifecycle_binding,
-            network_manifest, node_admission, output_manifest, signed_admit,
+            envelope_input, eventually, fake_process, fill_revocations, isolation_manifest,
+            lifecycle_binding, network_manifest, node_admission, output_manifest, signed_admit,
         };
         use crate::workspace::{TaskRoot, import_snapshot, open_snapshot_store};
 
@@ -6274,6 +6305,78 @@ mod tests {
                 assert!(node.launcher.survivors().is_empty());
                 assert!(node.launcher.launches().is_empty());
             }
+        }
+
+        #[test]
+        fn a_floor_above_the_nodes_backends_is_refused_with_nothing_materialised() {
+            let node = Node::new();
+            let binding = lifecycle_binding();
+            assert_eq!(
+                node.serve(ctx().create(op(10), binding)),
+                ctx().accepted(op(10), binding, State::Created)
+            );
+            for level in [
+                IsolationLevel::Container,
+                IsolationLevel::Microvm,
+                IsolationLevel::Vm,
+            ] {
+                let floored = node.envelope_with(isolation_manifest(level));
+                assert_eq!(
+                    node.serve(signed_admit(ctx(), op(20), binding, &floored)),
+                    ctx().rejected(Some(op(20)), binding, Reason::UnsupportedGrant),
+                    "{level}"
+                );
+                assert_eq!(node.state(), State::Created, "{level}");
+            }
+            assert!(node.launcher.launches().is_empty());
+            assert!(!node.root.join(binding.task().to_string()).exists());
+            assert_eq!(node.evidence(), Vec::new());
+            assert!(node.tasks.lock().unwrap().admitted(binding).is_none());
+
+            node.ready();
+            assert_eq!(node.evidence(), vec![node.admitted_event(20, 1)]);
+        }
+
+        #[test]
+        fn a_started_attempt_records_the_backend_that_runs_it_and_keeps_it_across_a_restart() {
+            let binding = lifecycle_binding();
+            let node = Node::new();
+            node.ready();
+            let stored = |node: &Node| {
+                crate::records::TaskStore::open(&node.state_dir())
+                    .unwrap()
+                    .load(MAX_NODE_TASKS)
+                    .unwrap()
+                    .remove(0)
+                    .capsule
+            };
+            assert_eq!(node.tasks.lock().unwrap().capsule(binding), None);
+            assert_eq!(stored(&node), None);
+
+            node.launcher.set_spawn(FakeSpawn::Refuse);
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().rejected(Some(op(30)), binding, Reason::ResourceUnavailable)
+            );
+            assert_eq!(
+                stored(&node),
+                None,
+                "a withdrawn launch intent names no backend"
+            );
+
+            node.launcher.set_spawn(FakeSpawn::Spawn);
+            assert_eq!(
+                node.serve(ctx().start(op(30), binding)),
+                ctx().accepted(op(30), binding, State::Running)
+            );
+            let bubblewrap = Some(CapsuleRecord::from(CapsuleBackendDescriptor::BUBBLEWRAP));
+            assert_eq!(node.tasks.lock().unwrap().capsule(binding), bubblewrap);
+            assert_eq!(stored(&node), bubblewrap);
+
+            let node = node.restart();
+            node.assert_finished(State::Exited, Outcome::Unknown);
+            assert_eq!(node.tasks.lock().unwrap().capsule(binding), bubblewrap);
+            assert_eq!(stored(&node), bubblewrap);
         }
 
         #[test]

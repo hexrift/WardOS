@@ -34,7 +34,9 @@
 //!     ([`NodeAdmission::with_credentials`]), and a `hold` only on a node that holds
 //!     capabilities until approved ([`NodeAdmission::with_approval_hold`]), and a workload
 //!     naming an agent adapter only on a node that hosts it and can build its launch from
-//!     the argv ([`NodeAdmission::with_agent_adapters`], ADR-0036); any other
+//!     the argv ([`NodeAdmission::with_agent_adapters`], ADR-0036), and an `isolation`
+//!     floor only on a node with a Capsule backend its placement allows for it, never a
+//!     weaker one ([`NodeAdmission::with_capsule_placement`], ADR-0039); any other
 //!     grant is refused
 //!     `unsupported_grant`, after authority is proven and before the version is committed,
 //!     so a refused grant consumes nothing.
@@ -59,6 +61,7 @@ use ward_node_protocol::{
 };
 
 use crate::admission::{TaskAdmissionIdentity, TaskAuthorityError, TrustedTaskAdmission};
+use crate::capsule::CapsulePlacement;
 use crate::cgroup::ResourceEnforcement;
 use crate::credentials::NodeCredentials;
 use crate::issuer::TrustedIssuers;
@@ -136,6 +139,7 @@ pub struct NodeAdmission {
     approval_hold: bool,
     credentials: Option<Arc<NodeCredentials>>,
     agent_adapters: Option<AdapterCapabilities>,
+    capsules: Option<CapsulePlacement>,
 }
 
 impl std::fmt::Debug for NodeAdmission {
@@ -151,6 +155,7 @@ impl std::fmt::Debug for NodeAdmission {
             .field("approval_hold", &self.approval_hold)
             .field("credentials", &self.credentials)
             .field("agent_adapters", &self.agent_adapters)
+            .field("capsules", &self.capsules)
             .finish_non_exhaustive()
     }
 }
@@ -170,7 +175,18 @@ impl NodeAdmission {
             approval_hold: false,
             credentials: None,
             agent_adapters: None,
+            capsules: None,
         }
+    }
+
+    /// Which Capsule backends an attempt may be placed on (check 10, ADR-0039). The task
+    /// registry sets this from its execution, so what `admit` accepts is exactly what
+    /// `start` places. `None`, a node that executes nothing, refuses every `isolation`
+    /// floor.
+    #[must_use]
+    pub fn with_capsule_placement(mut self, capsules: Option<CapsulePlacement>) -> Self {
+        self.capsules = capsules;
+        self
     }
 
     /// Which agent adapters a workload may name (check 10, ADR-0036). The task registry
@@ -391,6 +407,13 @@ impl NodeAdmission {
             return Err(Reason::UnsupportedGrant);
         }
         if !crate::adapters::honours(self.agent_adapters, envelope.workload()) {
+            return Err(Reason::UnsupportedGrant);
+        }
+        let placed = match &self.capsules {
+            Some(capsules) => capsules.place(manifest.minimum_isolation()).is_some(),
+            None => manifest.isolation().is_none(),
+        };
+        if !placed {
             return Err(Reason::UnsupportedGrant);
         }
 

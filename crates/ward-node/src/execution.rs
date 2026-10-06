@@ -69,6 +69,9 @@ use ward_snapshot::SnapshotStore;
 
 use crate::actions::ACTION_SOCKET_ENV;
 use crate::adapters::AttemptAdapter;
+use crate::capsule::{
+    CapsuleBackend, CapsuleBackendDescriptor, CapsulePlacement, StrongerPlacement,
+};
 use crate::cgroup::ResourceEnforcement;
 use crate::credentials::NodeCredentials;
 use crate::egress::{AttemptEgress, PROXY_SOCKET_ENV, egress_dir_beside};
@@ -509,6 +512,12 @@ impl SandboxLauncher {
     }
 }
 
+impl CapsuleBackend for SandboxLauncher {
+    fn descriptor(&self) -> CapsuleBackendDescriptor {
+        CapsuleBackendDescriptor::BUBBLEWRAP
+    }
+}
+
 impl TaskLauncher for SandboxLauncher {
     fn launch(&self, request: &LaunchRequest) -> Result<Box<dyn RunningWorkload>, SpawnError> {
         Self::launch_in(request, None)
@@ -697,16 +706,17 @@ impl WorkloadFreezer for SandboxFreezer {
     }
 }
 
-/// What a node needs to execute admitted tasks: its task root, its snapshot store and a
-/// launcher. A node built with it advertises `start`, `stop`, `pause` and `revoke` together
-/// at protocol 1.3, `network.proxy_allowlist` only when built
+/// What a node needs to execute admitted tasks: its task root, its snapshot store and the
+/// Capsule backend it runs attempts on ([`crate::capsule`]). A node built with it
+/// advertises `start`, `stop`, `pause` and `revoke` together at protocol 1.3,
+/// `network.proxy_allowlist` only when built
 /// [`Self::with_network_allowlist`], and `output` only when built
 /// [`Self::with_output_return`].
 #[allow(clippy::struct_excessive_bools)] // one flag per operator-enabled capability
 pub struct NodeExecution {
     task_root: TaskRoot,
     snapshots: SnapshotStore,
-    launcher: Arc<dyn TaskLauncher>,
+    backend: Arc<dyn CapsuleBackend>,
     stop_timeout: Duration,
     spawn_timeout: Duration,
     network_allowlist: bool,
@@ -741,18 +751,18 @@ impl std::fmt::Debug for NodeExecution {
 }
 
 impl NodeExecution {
-    /// Execute under `task_root`, materialising from `snapshots`, spawning through
-    /// `launcher`.
+    /// Execute under `task_root`, materialising from `snapshots`, running every attempt on
+    /// `backend`.
     #[must_use]
     pub fn new(
         task_root: TaskRoot,
         snapshots: SnapshotStore,
-        launcher: Arc<dyn TaskLauncher>,
+        backend: Arc<dyn CapsuleBackend>,
     ) -> Self {
         Self {
             task_root,
             snapshots,
-            launcher,
+            backend,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
             spawn_timeout: DEFAULT_SPAWN_TIMEOUT,
             network_allowlist: false,
@@ -945,10 +955,17 @@ impl NodeExecution {
         &self.snapshots
     }
 
-    /// The launcher workloads are spawned through.
+    /// The launcher workloads are spawned through: the backend's.
     #[must_use]
     pub fn launcher(&self) -> Arc<dyn TaskLauncher> {
-        Arc::clone(&self.launcher)
+        Arc::clone(&self.backend) as Arc<dyn TaskLauncher>
+    }
+
+    /// Where attempts run: the node's one backend, at exactly the level an attempt's
+    /// manifest requires (ADR-0039 §5).
+    #[must_use]
+    pub fn placement(&self) -> CapsulePlacement {
+        CapsulePlacement::new(vec![self.backend.descriptor()], StrongerPlacement::Refused)
     }
 
     /// How long `stop` waits for the reaper to confirm the kill and reap.
