@@ -22,6 +22,7 @@
 // `capabilities` reports a `scheduling` section with `running` at `max_running` while a
 // refusal is still to come, and 0 after. A `run` of an attempt this process revoked
 // replays `create` and `admit` as `revoked`, sends no `start`, and seals.
+// FAKE_ADAPTER_REVOKE_REJECT=<reason> refuses every `revoke` command with it.
 //
 // FAKE_ADAPTER_ACTIONS names a JSON file that scripts the attempt's action channel (§6.7)
 // and holds the node's side of it, so that several adapter processes in turn (a run and an
@@ -59,6 +60,7 @@ const holding = process.env.FAKE_ADAPTER_APPROVAL_HOLD === "1";
 const agentAdapters = (process.env.FAKE_ADAPTER_AGENT_ADAPTERS ?? "").split(",").filter(Boolean);
 const resourceFlags = (process.env.FAKE_ADAPTER_RESOURCES ?? "").split(",").filter(Boolean);
 const capacityFile = process.env.FAKE_ADAPTER_CAPACITY;
+const revokeReject = process.env.FAKE_ADAPTER_REVOKE_REJECT;
 const socketFlag = process.argv.indexOf("--socket");
 const socket = socketFlag >= 0 ? process.argv[socketFlag + 1] : null;
 
@@ -313,6 +315,10 @@ lines.on("line", (line) => {
       emit({ event: "inspected", state: "sealed", outcome: "completed" });
       return;
     case "revoke":
+      if (revokeReject) {
+        emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "rejected", reason: revokeReject });
+        return;
+      }
       revoked.add(command.binding?.attempt);
       emit({ event: "verb", verb: "revoke", operation_id: command.operation_id, result: "accepted", state: "revoked" });
       return;

@@ -1505,21 +1505,16 @@ export class Adapter {
   /**
    * End an attempt left `ready` by a capacity refusal when its run is cancelled: `revoke`
    * under the scheme's id, so nothing starts it later, then the same run once more, which
-   * finds it revoked, sends no `start`, reads the receipt and seals.
+   * finds it revoked, sends no `start`, reads the receipt and seals. A refused revoke is
+   * reported as it is, and the run is not sent again: it could start the attempt.
    */
   async #cancelReady(refused, command, events, onEvent) {
     const revokeId = operationIds(command.operation_ids?.start_at ?? 1).revoke;
     const revoked = await this.revoke(refused.binding, revokeId);
+    const revoke = { verb: "revoke", operation_id: revokeId, state: revoked.state ?? null, reason: revoked.reason ?? null };
+    if (revoked.result !== "accepted") return { ...refused, cancelled: true, operations: [...(refused.operations ?? []), revoke] };
     const sealed = await this.#runOnce(command, events, onEvent);
-    return {
-      ...sealed,
-      cancelled: true,
-      operations: [
-        ...(refused.operations ?? []),
-        { verb: "revoke", operation_id: revokeId, state: revoked.state ?? null, reason: revoked.reason ?? null },
-        ...(sealed.operations ?? []),
-      ],
-    };
+    return { ...sealed, cancelled: true, operations: [...(refused.operations ?? []), revoke, ...(sealed.operations ?? [])] };
   }
 
   /**

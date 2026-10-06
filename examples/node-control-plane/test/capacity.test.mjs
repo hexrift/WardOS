@@ -65,7 +65,7 @@ function signed() {
 }
 
 /** A fake adapter whose node refuses the first `refuse` starts capacity_exhausted. */
-function fakeAdapter(refuse) {
+function fakeAdapter(refuse, extraEnv = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ward-capacity-"));
   const log = join(dir, "received.jsonl");
   const capacity = join(dir, "capacity.json");
@@ -73,7 +73,7 @@ function fakeAdapter(refuse) {
   const adapter = new Adapter({
     command: [process.execPath, FAKE],
     socket: "/run/ward-node/node.sock",
-    env: { ...process.env, FAKE_ADAPTER_LOG: log, FAKE_ADAPTER_CAPACITY: capacity },
+    env: { ...process.env, FAKE_ADAPTER_LOG: log, FAKE_ADAPTER_CAPACITY: capacity, ...extraEnv },
   });
   return {
     adapter,
@@ -191,6 +191,25 @@ test("cancelling while waiting revokes the ready attempt under the scheme's id, 
     assert.notEqual(outcome.outcome, "completed");
     assert.equal(await fake.adapter.close(), 0, "the adapter was never signalled while idle");
     assert.deepEqual(fake.received().map((line) => line.cmd), ["run", "capabilities", "revoke", "run"]);
+  } finally {
+    fake.cleanup();
+  }
+});
+
+test("a cancel while waiting whose revoke the node refuses is reported, and the run is not sent again", async () => {
+  const fake = fakeAdapter(1000, { FAKE_ADAPTER_REVOKE_REJECT: "invalid_state" });
+  try {
+    const { report } = await fake.adapter.run(signed(), {
+      capacityWaitMs: 60_000,
+      capacityDelayMs: 30_000,
+      onCapacityWait: () => fake.adapter.cancel(),
+    });
+    assert.equal(report.cancelled, true);
+    assert.equal(capacityExhausted(report), true, "the refusal stands");
+    assert.equal(report.final_state, "ready");
+    assert.deepEqual(report.operations.at(-1), { verb: "revoke", operation_id: 5, state: null, reason: "invalid_state" });
+    assert.equal(await fake.adapter.close(), 0);
+    assert.deepEqual(fake.received().map((line) => line.cmd), ["run", "capabilities", "revoke"], "a run sent now could start the attempt");
   } finally {
     fake.cleanup();
   }
