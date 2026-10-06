@@ -4,7 +4,8 @@
 //! each from the source store through the CAS's own integrity checks (a blob or manifest
 //! that does not hash to its id is refused, never served) and writes it into this store,
 //! so the copy carries exactly the same id or the call fails. [`SnapshotStore::open_existing`]
-//! opens a source for reading without creating anything in it.
+//! opens a source for reading without creating anything in it, and
+//! [`SnapshotStore::verify`] checks that a stored snapshot is still whole.
 
 use crate::SnapshotStore;
 use crate::cas::Cas;
@@ -48,6 +49,16 @@ impl SnapshotStore {
             }
         }
         Ok(copied)
+    }
+
+    /// Check that snapshot `id` is whole in this store: its manifest and every blob it
+    /// names are present and hash to their ids.
+    pub fn verify(&self, id: SnapshotId) -> Result<()> {
+        let manifest = self.cas.get_manifest(id)?;
+        for digest in manifest.entries().iter().filter_map(|entry| entry.content) {
+            self.cas.get_blob(digest)?;
+        }
+        Ok(())
     }
 }
 
@@ -154,6 +165,32 @@ mod tests {
         let id = SnapshotId(crate::Digest::of(b"absent"));
         assert!(matches!(
             target.copy_from(&source, id),
+            Err(SnapshotError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn a_whole_snapshot_verifies_and_a_damaged_or_missing_one_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        project(&dir.path().join("p"));
+        let store = SnapshotStore::open(dir.path().join("a")).unwrap();
+        let id = store
+            .store_snapshot(
+                dir.path().join("p"),
+                SnapshotRole::Entry,
+                CaptureOptions::default(),
+            )
+            .unwrap();
+        store.verify(id).unwrap();
+
+        let digest = crate::Digest::of(b"fn main() {}\n").to_hex();
+        let blob = dir.path().join("a/blobs").join(&digest[..2]).join(&digest);
+        fs::remove_file(&blob).unwrap();
+        assert!(matches!(store.verify(id), Err(SnapshotError::NotFound(_))));
+        fs::write(&blob, b"fn main() { evil() }\n").unwrap();
+        assert!(matches!(store.verify(id), Err(SnapshotError::Integrity(_))));
+        assert!(matches!(
+            store.verify(SnapshotId(crate::Digest::of(b"absent"))),
             Err(SnapshotError::NotFound(_))
         ));
     }
