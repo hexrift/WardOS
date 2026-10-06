@@ -97,6 +97,7 @@ if [[ -z "${WARD_NODE_BIN:-}" ]]; then
   cargo build -p ward-node --target-dir "$shipped_target" >&2
   WARD_NODE_BIN="$shipped_target/debug/ward-node"
 fi
+[[ "$WARD_NODE_BIN" == /* ]] || WARD_NODE_BIN="$PWD/$WARD_NODE_BIN"
 [[ -x "$WARD_NODE_BIN" ]] || { echo "node: ward-node binary is not executable: $WARD_NODE_BIN" >&2; exit 1; }
 if [[ "$("$WARD_NODE_BIN" --version)" == *"(test-loopback)"* ]]; then
   echo "node: WARD_NODE_BIN is a test-loopback build of ward-node ($WARD_NODE_BIN); the acceptance proves the shipped build and needs one built without that feature" >&2
