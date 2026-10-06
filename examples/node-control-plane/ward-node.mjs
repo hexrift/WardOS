@@ -4,7 +4,8 @@
 // (§2.3, §7.4), the admission envelope (§7), the per-task version (§7.3, §10), and the
 // JSON-lines conversation with `ward-node-adapter` (§11.4), result return (§6.6), the
 // action channel (§6.7), brokered credentials (§6.8), approval holds (§6.9), resource
-// limits (§7.5, §9) and waiting out a node at capacity (§8.2). The walk
+// limits (§7.5, §9), isolation floors (§7.5, ADR-0039) and waiting out a node at capacity
+// (§8.2). The walk
 // through it for an adapter author is docs/node-integration-from-nodejs.md.
 //
 // Everything here fails closed: an id, hex value, grant or bound outside the contract is
@@ -96,6 +97,13 @@ export const HOLD_LIMITS = Object.freeze({ holds: 8 });
  */
 export const AGENT_ADAPTERS = Object.freeze(["claude-code", "codex", "process"]);
 
+/**
+ * The isolation levels of Capsule backends (§5, §7.5, ADR-0039), weakest first; each
+ * guarantees everything the levels before it do. A manifest's `isolation.minimum` names
+ * one after `sandbox`; without the field the floor is `sandbox`.
+ */
+export const ISOLATION_LEVELS = Object.freeze(["sandbox", "container", "microvm", "vm"]);
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS = Object.freeze(["approved", "denied"]);
 
@@ -107,7 +115,7 @@ const RESOURCE = /^[\x21-\x7e]{1,256}$/;
 const HOST_LABEL = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const CREDENTIAL_SERVICE = /^[a-z][a-z0-9-]{0,31}$/;
 const ADAPTER_ID = /^[a-z0-9][a-z0-9._-]{0,63}$/;
-const MANIFEST_FIELDS = Object.freeze(["network", "output", "resources", "actions", "credentials", "hold"]);
+const MANIFEST_FIELDS = Object.freeze(["network", "output", "resources", "actions", "credentials", "hold", "isolation"]);
 // The limits of a `resources` grant, in the order the node's encoder writes them.
 const RESOURCE_LIMITS = Object.freeze(["cpu_millis", "memory_bytes", "pids"]);
 const OUTPUT_PATH_COMPONENT = /^[A-Za-z0-9._-]+$/;
@@ -623,12 +631,61 @@ export function requireApprovalHold(capabilities) {
   return capabilities;
 }
 
+/**
+ * The `isolation` floor of §7.5 in wire spelling (`{"minimum": level}`), refusing anything
+ * outside ward-node-protocol's grammar: one object whose only field is `minimum`, one of
+ * `container`, `microvm` and `vm`. A floor of `sandbox` is spelled by leaving the field
+ * out, so it is refused too.
+ */
+function checkIsolation(isolation) {
+  if (isolation === null || typeof isolation !== "object" || Array.isArray(isolation)) refuse("manifest `isolation` is one object");
+  const keys = Object.keys(isolation);
+  if (keys.length !== 1 || keys[0] !== "minimum") refuse("manifest `isolation` has the field `minimum` and nothing else");
+  const { minimum } = isolation;
+  if (minimum === "sandbox") refuse("an isolation floor of sandbox is spelled by leaving isolation out");
+  if (!ISOLATION_LEVELS.includes(minimum)) refuse(`isolation minimum is one of container, microvm, vm, got ${JSON.stringify(minimum)}`);
+  return { minimum };
+}
+
+/**
+ * The §7.5 `isolation` floor in wire spelling: the weakest isolation level the attempt may
+ * run at. `sandbox` is refused: leave the field out instead.
+ */
+export function isolationFloor(minimum) {
+  return checkIsolation({ minimum });
+}
+
+/**
+ * Whether the node's capability document (§5) offers a Capsule backend at `level`:
+ * `isolation.namespaces.sandbox` for `sandbox`, `isolation.backends.<level>` for the others.
+ */
+export function offersIsolation(capabilities, level) {
+  if (!ISOLATION_LEVELS.includes(level)) return false;
+  const isolation = capabilities?.isolation;
+  const flag = level === "sandbox" ? isolation?.namespaces?.sandbox : isolation?.backends?.[level];
+  return flag === true;
+}
+
+/**
+ * The capability document, refused unless it offers a backend at exactly the floor's
+ * level: a node with none places the attempt nowhere and refuses the manifest
+ * `unsupported_grant` at `admit` (ADR-0039 §5), so the client refuses it before signing.
+ */
+export function requireIsolation(capabilities, floor) {
+  const { minimum } = checkIsolation(floor);
+  if (!offersIsolation(capabilities, minimum)) {
+    const flag = minimum === "sandbox" ? "isolation.namespaces.sandbox" : `isolation.backends.${minimum}`;
+    refuse(`the node does not advertise ${flag} true and refuses an isolation floor of ${minimum} as unsupported_grant`);
+  }
+  return capabilities;
+}
+
 /** The manifest in canonical key order, refusing anything outside the §7.5 grammar. */
 function checkManifest(object) {
   if (object === null || typeof object !== "object" || Array.isArray(object)) refuse("a manifest is one JSON object");
   const keys = Object.keys(object);
   if (!keys.includes("network") || keys.some((key) => !MANIFEST_FIELDS.includes(key))) {
-    refuse("a manifest has the field `network` and optionally `output`, `resources`, `actions`, `credentials` and `hold`, nothing else");
+    refuse("a manifest has the field `network` and optionally `output`, `resources`, `actions`, `credentials`, `hold` and `isolation`, nothing else");
   }
   const canonical = { network: checkNetwork(object.network) };
   if (keys.includes("output")) canonical.output = checkOutputGrant(object.output);
@@ -636,14 +693,15 @@ function checkManifest(object) {
   if (keys.includes("actions")) canonical.actions = checkActionsGrant(object.actions);
   if (keys.includes("credentials")) canonical.credentials = checkCredentialsGrant(object.credentials, canonical.network);
   if (keys.includes("hold")) canonical.hold = checkHold(object.hold, canonical);
+  if (keys.includes("isolation")) canonical.isolation = checkIsolation(object.isolation);
   return canonical;
 }
 
 /**
  * The manifest as the envelope carries it: hex bytes as sent and their BLAKE3-256 (§7.3).
  * The bytes are compact JSON with `network` first, then `output`, `resources`, `actions`,
- * `credentials` and `hold` when granted, whatever order the caller wrote the fields in, so one grant has
- * one signed spelling.
+ * `credentials`, `hold` and `isolation` when granted, whatever order the caller wrote the
+ * fields in, so one grant has one signed spelling.
  */
 export function manifest(object = OFFLINE_MANIFEST) {
   const bytes = Buffer.from(JSON.stringify(checkManifest(object)), "utf8");
@@ -690,6 +748,14 @@ export function credentialsGrantOf(envelopeJson) {
  */
 export function holdGrantOf(envelopeJson) {
   return manifestOf(envelopeJson).hold ?? null;
+}
+
+/**
+ * The `isolation` floor a signed envelope's manifest carries (wire spelling), or `null`
+ * without one: the weakest level a run of it may be placed on.
+ */
+export function isolationFloorOf(envelopeJson) {
+  return manifestOf(envelopeJson).isolation ?? null;
 }
 
 /** The checked manifest of a serialised envelope, read from its exact bytes. */

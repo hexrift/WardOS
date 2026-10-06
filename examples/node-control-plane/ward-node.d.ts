@@ -59,6 +59,12 @@ export const HOLD_LIMITS: Readonly<{ holds: 8 }>;
  */
 export const AGENT_ADAPTERS: ReadonlyArray<"claude-code" | "codex" | "process">;
 
+/**
+ * The isolation levels of Capsule backends (§5, §7.5, ADR-0039), weakest first; each
+ * guarantees everything the levels before it do.
+ */
+export const ISOLATION_LEVELS: ReadonlyArray<IsolationLevel>;
+
 /** The decisions a control plane may answer; `expired` and `cancelled` are the node's. */
 export const ANSWER_DECISIONS: ReadonlyArray<AnswerDecision>;
 
@@ -195,6 +201,16 @@ export interface HoldGrant {
   services?: string[];
 }
 
+export type IsolationLevel = "sandbox" | "container" | "microvm" | "vm";
+
+/**
+ * The `isolation` floor of §7.5 (ADR-0039): the weakest isolation level the attempt may be
+ * placed on. A floor of `sandbox` is spelled by leaving the field out.
+ */
+export interface IsolationFloor {
+  minimum: Exclude<IsolationLevel, "sandbox">;
+}
+
 /** A held capability, as a listing's `hold` names it. */
 export type HeldCapability = { host: string } | { service: string };
 
@@ -210,6 +226,7 @@ export type Manifest = ({ network: "offline" } | { network: { custom: string[] }
   actions?: ActionsGrant;
   credentials?: CredentialGrant[];
   hold?: HoldGrant;
+  isolation?: IsolationFloor;
 };
 
 export interface ManifestBytes {
@@ -357,6 +374,21 @@ export function offersApprovalHold(capabilities: unknown): boolean;
  * offers approval holds. Call it before signing a manifest with a `hold` for that node.
  */
 export function requireApprovalHold<C>(capabilities: C): C;
+/** The `isolation` floor a signed envelope's manifest carries, read from its exact bytes, or `null`. */
+export function isolationFloorOf(envelopeJson: string): IsolationFloor | null;
+/** The §7.5 floor from a level, refused outside the grammar (`sandbox` included: leave it out). */
+export function isolationFloor(minimum: IsolationLevel): IsolationFloor;
+/**
+ * Whether the node's capability document (§5) offers a Capsule backend at `level`:
+ * `isolation.namespaces.sandbox` for `sandbox`, `isolation.backends.<level>` for the others.
+ */
+export function offersIsolation(capabilities: unknown, level: IsolationLevel): boolean;
+/**
+ * The capability document, refused (naming the flag and `unsupported_grant`) unless it
+ * offers a backend at the floor's level: any other node refuses the manifest at `admit`, so
+ * it is refused before signing.
+ */
+export function requireIsolation<C>(capabilities: C, floor: IsolationFloor): C;
 /**
  * The workload's `adapter` in wire spelling, `{id}`, refused (an `Error`) for an id outside
  * the grammar or an `argv[0]` the adapter cannot launch.

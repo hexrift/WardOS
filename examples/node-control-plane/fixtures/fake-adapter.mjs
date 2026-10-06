@@ -13,7 +13,9 @@
 // advertises those agent adapters in `adapters` (§5), as a node started with
 // --agent-adapter for each does. FAKE_ADAPTER_RESOURCES=<flag>,… advertises a `resources`
 // section with those of `cpu`, `memory` and `pids` true (§5), as a node started with
-// --cgroup-root that enabled those controllers does.
+// --cgroup-root that enabled those controllers does. FAKE_ADAPTER_BACKENDS=<level>,… also
+// offers Capsule backends at those of `container`, `microvm` and `vm` in
+// `isolation.backends` (§5, ADR-0039).
 //
 // FAKE_ADAPTER_CAPACITY names a JSON file that scripts a node started with --max-running
 // (§2.1, §8.2), shared by every adapter process: {refuse: N, max_running, running}. The
@@ -59,6 +61,7 @@ const brokering = process.env.FAKE_ADAPTER_CREDENTIALS === "1";
 const holding = process.env.FAKE_ADAPTER_APPROVAL_HOLD === "1";
 const agentAdapters = (process.env.FAKE_ADAPTER_AGENT_ADAPTERS ?? "").split(",").filter(Boolean);
 const resourceFlags = (process.env.FAKE_ADAPTER_RESOURCES ?? "").split(",").filter(Boolean);
+const backends = (process.env.FAKE_ADAPTER_BACKENDS ?? "").split(",").filter(Boolean);
 const capacityFile = process.env.FAKE_ADAPTER_CAPACITY;
 const revokeReject = process.env.FAKE_ADAPTER_REVOKE_REJECT;
 const socketFlag = process.argv.indexOf("--socket");
@@ -72,7 +75,10 @@ const CAPABILITIES = {
   protocol: { major: 1, minor: 3 },
   architecture: "x86_64",
   capacity: { logical_cpus: 2, memory_bytes: 4294967296 },
-  isolation: { namespaces: { sandbox: true, user_namespace: true }, backends: { container: false, microvm: false, vm: false } },
+  isolation: {
+    namespaces: { sandbox: true, user_namespace: true },
+    backends: { container: backends.includes("container"), microvm: backends.includes("microvm"), vm: backends.includes("vm") },
+  },
   network: { offline: true, proxy_allowlist: brokering },
   credentials: { proxy_injection: brokering, scoped_http_gateway: brokering },
   snapshots: { content_addressed: true, diff: false, read: false },
