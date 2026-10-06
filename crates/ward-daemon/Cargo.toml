@@ -25,6 +25,7 @@ ward-proxy = { path = "../ward-proxy", version = "0.18.0" }
 ward-agent = { path = "../ward-agent", version = "0.18.0" }
 ward-agent-adapter = { path = "../ward-agent-adapter", version = "0.18.0" }
 ward-node-protocol = { path = "../ward-node-protocol", version = "0.18.0" }
+ward-credentials = { path = "../ward-credentials", version = "0.18.0" }
 blake3 = { workspace = true }
 clap = { workspace = true }
 thiserror = { workspace = true }
@@ -36,11 +37,6 @@ nix = { version = "0.30", features = ["dir", "fs", "inotify", "poll", "signal", 
 rcgen = "0.14"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 getrandom = "0.3"
-# Credential providers (#267): the provider token and every leased value in
-# zeroed-on-drop buffers, and the host trust store for a provider without a
-# configured CA bundle. Both already in the tree through ward-proxy.
-zeroize = "1"
-rustls-native-certs = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

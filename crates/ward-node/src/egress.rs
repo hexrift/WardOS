@@ -14,7 +14,14 @@
 //! [`NetworkCapability::Custom`] allowlist. Private, link-local, loopback, multicast and
 //! reserved ranges and the cloud metadata endpoint are refused in every mode, IP literals
 //! are refused, every resolved address is checked and connections go only to a checked
-//! address ([`ward_proxy::policy`]). No credential is injected (#267).
+//! address ([`ward_proxy::policy`]).
+//!
+//! A manifest's `credentials` grant ([`crate::credentials`], ADR-0034) adds one gateway
+//! route per grant: a request for `/<service>/…` is forwarded to the service's configured
+//! upstream with the leased credential injected by the proxy, the session broker's
+//! delivery A (ADR-0008, ADR-0032). A route is accepted only for a host the allowlist
+//! covers, so a credential never leaves for a host the attempt may not reach; every other
+//! request, to any host, carries nothing the proxy added.
 //!
 //! The proxy reports every verdict to a [`DecisionRecorder`], a bounded queue the attempt's
 //! reaper drains between waits; the registry, the attempt's single evidence writer
@@ -42,8 +49,8 @@ use ward_events::{
 };
 use ward_node_protocol::{HostAllowlist, TaskBinding};
 use ward_proxy::{
-    Config, Decision, Handle, Host, NetworkCapability, Observer, Proxy, Request, Resolver,
-    SystemResolver,
+    Config, Decision, GatewayRoute, Handle, Host, NetworkCapability, Observer, Proxy, Request,
+    Resolver, SystemResolver,
 };
 
 use crate::evidence::private_dir;
@@ -78,6 +85,9 @@ pub enum EgressError {
     /// The proxy could not bind its socket or start accepting.
     #[error("egress proxy could not start: {0}")]
     Proxy(#[from] ward_proxy::Error),
+    /// A credential route forwards to a host the allowlist does not cover.
+    #[error("a credential route forwards outside the allowlist")]
+    RouteOutsideAllowlist,
 }
 
 /// The egress directory of `binding` under the task root `root`:
@@ -332,6 +342,29 @@ impl AttemptEgress {
         allowlist: &HostAllowlist,
         resolver: Arc<dyn Resolver>,
     ) -> Result<Self, EgressError> {
+        Self::start_routed(dir, allowlist, Vec::new(), resolver)
+    }
+
+    /// [`Self::start_with`], also serving the credential `routes` (#267, ADR-0034), each
+    /// of which must forward to a host `allowlist` covers.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::start`], and [`EgressError::RouteOutsideAllowlist`] for a route to any
+    /// other host.
+    pub fn start_routed(
+        dir: &Path,
+        allowlist: &HostAllowlist,
+        routes: Vec<GatewayRoute>,
+        resolver: Arc<dyn Resolver>,
+    ) -> Result<Self, EgressError> {
+        let outside = routes.iter().any(|route| match &route.target().host {
+            Host::Name(name) => !allowlist.covers(name),
+            Host::Ip(_) => true,
+        });
+        if outside {
+            return Err(EgressError::RouteOutsideAllowlist);
+        }
         private_dir(dir).map_err(|error| match error {
             crate::evidence::EvidenceError::Io(error) => EgressError::Io(error),
             _ => EgressError::InsecurePath,
@@ -344,9 +377,12 @@ impl AttemptEgress {
         let hosts: BTreeSet<String> = allowlist.patterns().iter().cloned().collect();
         let recorder = Arc::new(DecisionRecorder::with_capacity(DECISION_QUEUE_CAPACITY));
         let observer: Arc<dyn Observer> = recorder.clone();
-        let config = Config::new(NetworkCapability::Custom(hosts))
-            .resolver(resolver)
-            .listen_unix(bind);
+        let config = routes.into_iter().fold(
+            Config::new(NetworkCapability::Custom(hosts))
+                .resolver(resolver)
+                .listen_unix(bind),
+            Config::gateway,
+        );
         let handle = Proxy::spawn(config, observer)?;
         Ok(Self {
             handle,
@@ -649,6 +685,145 @@ mod tests {
                 dropped: 3,
                 capacity: 512,
             }
+        );
+    }
+
+    fn fake_upstream() -> (u16, Arc<Mutex<Vec<String>>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let heads = Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                    head.push(byte[0]);
+                }
+                heads
+                    .lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&head).into_owned());
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                );
+            }
+        });
+        (port, seen)
+    }
+
+    fn send(egress: &AttemptEgress, request: &str) -> String {
+        let mut stream = connect(egress);
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        let _ = stream.read_to_end(&mut answer);
+        String::from_utf8_lossy(&answer).into_owned()
+    }
+
+    fn credential_route(port: u16) -> GatewayRoute {
+        GatewayRoute::new(
+            "/artifacts",
+            "artifacts.example",
+            port,
+            "authorization",
+            ward_proxy::Secret::from("Bearer leased-value"),
+        )
+        .unwrap()
+        .plain_upstream(true)
+    }
+
+    #[test]
+    fn a_credential_route_for_a_host_outside_the_allowlist_never_starts() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = GatewayRoute::new(
+            "/artifacts",
+            "elsewhere.example",
+            443,
+            "authorization",
+            ward_proxy::Secret::from("x"),
+        )
+        .unwrap();
+        assert!(matches!(
+            AttemptEgress::start_routed(
+                &root.path().join("o.egress"),
+                &allowlist(),
+                vec![outside],
+                Arc::new(StaticResolver::new()),
+            ),
+            Err(EgressError::RouteOutsideAllowlist)
+        ));
+        assert!(
+            !root
+                .path()
+                .join("o.egress")
+                .join(PROXY_SOCKET_FILE)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn the_credential_reaches_only_its_route_upstream_whatever_host_a_request_names() {
+        let (port, upstream) = fake_upstream();
+        let (decoy_port, decoy) = fake_upstream();
+        let root = tempfile::tempdir().unwrap();
+        let resolver = StaticResolver::new()
+            .with("artifacts.example", [IpAddr::from([127, 0, 0, 1])])
+            .with("decoy.example", [IpAddr::from([127, 0, 0, 1])]);
+        let allowed = HostAllowlist::new(vec![
+            "artifacts.example".to_owned(),
+            "decoy.example".to_owned(),
+        ])
+        .unwrap();
+        let egress = AttemptEgress::start_routed(
+            &root.path().join("c.egress"),
+            &allowed,
+            vec![credential_route(port)],
+            Arc::new(resolver),
+        )
+        .unwrap();
+
+        let routed = send(
+            &egress,
+            "GET /artifacts/v1/x HTTP/1.1\r\nHost: anything\r\nAuthorization: Bearer placeholder\r\n\r\n",
+        );
+        assert!(routed.starts_with("HTTP/1.1 200"), "{routed}");
+        let absolute = send(
+            &egress,
+            &format!(
+                "GET http://decoy.example:{decoy_port}/artifacts/v1/y HTTP/1.1\r\nHost: decoy.example\r\n\r\n"
+            ),
+        );
+        assert!(absolute.starts_with("HTTP/1.1 200"), "{absolute}");
+        let elsewhere = send(
+            &egress,
+            &format!(
+                "GET http://decoy.example:{decoy_port}/other HTTP/1.1\r\nHost: decoy.example\r\n\r\n"
+            ),
+        );
+        assert!(elsewhere.starts_with("HTTP/1.1 403"), "{elsewhere}");
+        assert!(ask(&egress, &format!("decoy.example:{decoy_port}")).starts_with("HTTP/1.1 403"));
+        assert!(ask(&egress, &format!("artifacts.example:{port}")).starts_with("HTTP/1.1 403"));
+
+        let seen = upstream.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for head in &seen {
+            let lower = head.to_ascii_lowercase();
+            assert!(
+                lower.contains("authorization: bearer leased-value"),
+                "{head}"
+            );
+            assert!(!lower.contains("placeholder"), "{head}");
+        }
+        assert!(seen[0].starts_with("GET /v1/x "), "{seen:?}");
+        assert!(seen[1].starts_with("GET /v1/y "), "{seen:?}");
+        assert!(decoy.lock().unwrap().is_empty());
+        let verdicts = egress.drain().decisions;
+        assert_eq!(verdicts.len(), 5, "{verdicts:?}");
+        assert!(
+            verdicts[..2]
+                .iter()
+                .all(|verdict| verdict.allowed && verdict.reason == "gateway /artifacts")
         );
     }
 

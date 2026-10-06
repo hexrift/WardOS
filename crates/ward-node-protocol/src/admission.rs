@@ -36,6 +36,9 @@ use ward_events::{AgentId, Blake3Hash, NodeId, SessionId, SnapshotId};
 
 use crate::TaskBinding;
 use crate::actions::{ActionError, ActionGrant, ActionGrantWire};
+use crate::credentials::{
+    CredentialError, CredentialGrantWire, CredentialGrants, grants_from_wire,
+};
 use crate::output::{OutputError, OutputGrant, OutputGrantWire};
 use crate::resources::{ResourceGrant, ResourceGrantWire};
 
@@ -87,6 +90,10 @@ pub enum TaskAdmissionError {
     /// The `actions` grant is outside its grammar (no kind or a repeated one, a zero
     /// bound, more pending than in all).
     MalformedActionGrant(ActionError),
+    /// The `credentials` grant is outside its grammar (no grant, too many, a service named
+    /// twice, an invalid service or host, a zero TTL, or a host the manifest's
+    /// `network.custom` does not cover).
+    MalformedCredentialGrant(CredentialError),
     /// The wall-clock budget is zero.
     ZeroBudget,
     /// The admission version is zero.
@@ -123,6 +130,7 @@ impl Display for TaskAdmissionError {
             Self::MalformedOutputGrant(_) => "capability manifest output grant is invalid",
             Self::MalformedResourceGrant => "capability manifest resources grant is invalid",
             Self::MalformedActionGrant(_) => "capability manifest actions grant is invalid",
+            Self::MalformedCredentialGrant(_) => "capability manifest credentials grant is invalid",
             Self::ZeroBudget => "wall-clock budget must be non-zero",
             Self::ZeroVersion => "admission version must be non-zero",
             Self::LineageTooLong => "authority lineage is too long",
@@ -246,6 +254,21 @@ impl HostAllowlist {
     pub fn patterns(&self) -> &[String] {
         &self.0
     }
+
+    /// Whether a pattern covers the DNS name `host`: a name covers itself, `*.` and a
+    /// name covers any name with at least one more label and never the name itself.
+    #[must_use]
+    pub fn covers(&self, host: &str) -> bool {
+        self.0
+            .iter()
+            .any(|pattern| match pattern.strip_prefix("*.") {
+                Some(name) => host
+                    .strip_suffix(name)
+                    .and_then(|labels| labels.strip_suffix('.'))
+                    .is_some_and(|labels| !labels.is_empty()),
+                None => pattern == host,
+            })
+    }
 }
 
 fn is_host_pattern(pattern: &str) -> bool {
@@ -280,8 +303,10 @@ pub enum NetworkGrant {
 /// This is the manifest grammar of protocol 1.3: the required field `network`, a
 /// [`NetworkGrant`], the optional field `output`, an [`OutputGrant`] (absent means
 /// no output is returned), the optional field `resources`, a [`ResourceGrant`] (absent
-/// means the manifest asks for no limit), and the optional field `actions`, an
-/// [`ActionGrant`] (absent means the attempt has no action channel). Unknown fields, a
+/// means the manifest asks for no limit), the optional field `actions`, an
+/// [`ActionGrant`] (absent means the attempt has no action channel), and the optional
+/// field `credentials`, [`CredentialGrants`] (absent means no credential is brokered;
+/// present, every host must be one `network.custom` covers). Unknown fields, a
 /// repeated field, anything that is not one JSON object and any value outside the grammar
 /// fail decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -293,6 +318,8 @@ pub struct CapabilityManifest {
     resources: Option<ResourceGrant>,
     #[serde(skip_serializing_if = "Option::is_none")]
     actions: Option<ActionGrant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credentials: Option<CredentialGrants>,
 }
 
 impl CapabilityManifest {
@@ -304,6 +331,7 @@ impl CapabilityManifest {
             output: None,
             resources: None,
             actions: None,
+            credentials: None,
         }
     }
 
@@ -326,6 +354,28 @@ impl CapabilityManifest {
     pub fn with_actions(mut self, actions: ActionGrant) -> Self {
         self.actions = Some(actions);
         self
+    }
+
+    /// The same manifest also asking for the credentials `credentials` brokers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::HostNotAllowlisted`] unless the manifest's
+    /// `network.custom` covers every grant's host.
+    pub fn with_credentials(
+        mut self,
+        credentials: CredentialGrants,
+    ) -> Result<Self, CredentialError> {
+        credentials.within(self.allowlist())?;
+        self.credentials = Some(credentials);
+        Ok(self)
+    }
+
+    const fn allowlist(&self) -> Option<&HostAllowlist> {
+        match &self.network {
+            NetworkGrant::Offline => None,
+            NetworkGrant::Custom(allowlist) => Some(allowlist),
+        }
     }
 
     /// Strictly decode manifest bytes.
@@ -359,12 +409,19 @@ impl CapabilityManifest {
             .map(ActionGrant::try_from)
             .transpose()
             .map_err(TaskAdmissionError::MalformedActionGrant)?;
-        Ok(Self {
+        let manifest = Self {
             network,
             output,
             resources,
             actions,
-        })
+            credentials: None,
+        };
+        match wire.credentials {
+            None => Ok(manifest),
+            Some(grants) => grants_from_wire(grants)
+                .and_then(|grants| manifest.with_credentials(grants))
+                .map_err(TaskAdmissionError::MalformedCredentialGrant),
+        }
     }
 
     /// The egress the manifest asks for.
@@ -390,6 +447,12 @@ impl CapabilityManifest {
     pub const fn actions(&self) -> Option<&ActionGrant> {
         self.actions.as_ref()
     }
+
+    /// The credentials the manifest asks the node to broker, if any.
+    #[must_use]
+    pub const fn credentials(&self) -> Option<&CredentialGrants> {
+        self.credentials.as_ref()
+    }
 }
 
 #[derive(Deserialize)]
@@ -402,6 +465,17 @@ struct CapabilityManifestWire {
     resources: Option<ResourceGrantWire>,
     #[serde(default, deserialize_with = "deserialize_present_actions")]
     actions: Option<ActionGrantWire>,
+    #[serde(default, deserialize_with = "deserialize_present_credentials")]
+    credentials: Option<Vec<CredentialGrantWire>>,
+}
+
+fn deserialize_present_credentials<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<CredentialGrantWire>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Vec::<CredentialGrantWire>::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_resources<'de, D>(

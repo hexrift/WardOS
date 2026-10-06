@@ -5,7 +5,10 @@ implemented today (ADR-0030 steps 1–9, 12 and 13: the network allowlist and bo
 result return, both additive within 1.3; the first single-node slice of #260:
 cgroup resource limits and accounting, and a bound on attempts executing at once, also
 additive within 1.3; and the action channel of
-[ADR-0031](decisions/ADR-0031-node-action-channel.md), #404, additive within 1.3 as well),
+[ADR-0031](decisions/ADR-0031-node-action-channel.md), #404, additive within 1.3 as well;
+and credentials as node capabilities of
+[ADR-0034](decisions/ADR-0034-node-brokered-credentials.md), the first node slice of #267,
+additive within 1.3 too),
 and the client and process adapter that drive it
 (§11). The cross-system acceptance suite that proves it against a real node (ADR-0030
 step 10, #332 slice 9) is [node-acceptance.md](node-acceptance.md). Three companion
@@ -46,7 +49,12 @@ admission example is a working test vector (§7.4).
   cgroup of its own, enforces the limits there and records what each attempt used
   (§6.5, §7.5, §9), and an `actions` grant only on a node started with
   `--action-channel`, which then gives the attempt a socket in the sandbox through which
-  the workload asks and the control plane answers, every exchange recorded (§6.7, §7.5);
+  the workload asks and the control plane answers, every exchange recorded (§6.7, §7.5),
+  and a `credentials` grant only on a node started with `--credentials` (and
+  `--network-allowlist`), which then leases each granted service's credential from the
+  provider its operator configured, has the attempt's egress proxy inject it into requests
+  for that service's allowlisted host only, never into the sandbox, and revokes it at the
+  provider when the attempt ends (§6.8, §7.5);
   any other grant is refused `unsupported_grant` at `admit`, never run with less silently.
 - How much the node runs at once is the operator's choice: a node started with
   `--max-running` executes at most that many attempts at once and refuses a `start` past
@@ -59,8 +67,9 @@ admission example is a working test vector (§7.4).
   planes in other languages), §11. Both run on the node's host, as the node's uid or as
   a uid the node's operator listed with `--client-uid` (§2.1, §11.1).
 - Not implemented yet: a loopback relay and `HTTP_PROXY` environment inside the sandbox
-  (the proxy is reached through its Unix socket, §9), credential injection (#267),
-  approvals the node enforces (an approval through the action channel is a recorded
+  (the proxy is reached through its Unix socket, §9), credentials delivered any other way
+  than by proxy injection, or for anything but HTTP to one configured host (#267), approvals
+  the node enforces (an approval through the action channel is a recorded
   statement the workload acts on, §6.7), an event stream (`stream`), a workspace export as a snapshot (`snapshots.read` and
   `snapshots.diff` stay `false`; `result` returns declared files only, §6.6), and any
   remote transport or mTLS. The only transport is a
@@ -76,8 +85,8 @@ admission example is a working test vector (§7.4).
 
 ```text
 ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
-  [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist] [--output-return] \
-  [--action-channel] [--cgroup-root <dir>] \
+  [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist [--credentials <file>]] \
+  [--output-return] [--action-channel] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
   [--client-uid <uid>]… [--client-group <group>]
 ```
@@ -92,6 +101,7 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--network-allowlist` | no | Honour a manifest's `network.custom` host allowlist (§7.5): the attempt runs behind a node-owned egress proxy allowing exactly those hosts, with IP literals, private ranges and the metadata endpoint always refused (§9), and the node reports `network.proxy_allowlist` `true` (§5). Needs `--task-root`. Without it every `network.custom` manifest is refused `unsupported_grant`. |
 | `--output-return` | no | Honour a manifest's `output` grant (§7.5): the node keeps the first `stdio_bytes` of the workload's stdout and stderr, collects the declared workspace files once the attempt has ended (relative paths only, nothing followed outside the workspace, bounded), stores the result in `<task-root>/<task>/<attempt>.output/` (§6.6) and returns it through `result`; the capability document then carries `output` with `stdio` and `files` `true` (§5). Needs `--task-root`. Without it every manifest with `output` is refused `unsupported_grant` and `result` is `unsupported_operation`. |
 | `--action-channel` | no | Honour a manifest's `actions` grant (§7.5): the attempt gets its own action channel, a socket in `<task-root>/<task>/<attempt>.actions/` bound into the sandbox at `/run/ward/actions.sock` and named by `WARD_ACTION_SOCKET`, on which the workload asks bounded questions; the node records every request and answer in the attempt's evidence log, relays them to the control plane (`actions`) and the control plane's answers back (`answer`), and the capability document carries `actions` (§5, §6.7). An approval is a recorded statement, not a capability the node enforces. Needs `--task-root`. Without it every manifest with `actions` is refused `unsupported_grant` and both requests are `unsupported_operation`. |
+| `--credentials` | no | The operator's credentials file (§6.8): the credential providers (the `[provider.<name>]` tables of credential-broker.md §5.1) and the services they back. A manifest's `credentials` grant for a configured service is then honoured (§7.5): its lease is issued at `start`, bounded by the attempt, injected by the attempt's egress proxy into requests for the service's host, and revoked at the provider when the attempt ends; the capability document reports `credentials` `true` (§5). The file must be the node user's own regular file, not a symlink, writable by no one else, at most 64 KiB; a malformed or unsafe file stops the node. Needs `--network-allowlist`. Without it every manifest with `credentials` is refused `unsupported_grant`. |
 | `--cgroup-root` | no | A cgroup v2 directory delegated to the node: writable by the node's uid and holding no process of its own (for systemd, a unit with `Delegate=yes` whose main process sits in a sub-cgroup, `DelegateSubgroup=`). The node refuses to start if it is not on a cgroup v2 filesystem, if one of the `cpu`, `memory` and `pids` controllers it offers cannot be enabled in its `cgroup.subtree_control`, or if no cgroup can be created under it. Every attempt then runs in a cgroup of its own, `<dir>/<attempt>`, created before the spawn and removed once the workload is reaped; a manifest's `resources` limits are written there (§7.5, §9); what the attempt used is read from the kernel's counters and recorded (§6.5); and the node reports `resources` with the controllers it enabled (§5). At start the node also kills and removes every attempt cgroup (`exec_…`) a previous run left under it. Needs `--task-root`. Without it every manifest with `resources` is refused `unsupported_grant` and nothing is measured. |
 | `--max-running` | no | At most this many attempts (1 to 1 024) execute at once: from the spawn until the reaper has reaped the workload, paused attempts and attempts whose kill is pending included. A `start` past it is refused `capacity_exhausted` with the task still `ready` and nothing materialised (§8.2); the node reports the bound, the running count and its headroom in `scheduling` (§5). Needs `--task-root`. Without it the node bounds nothing, as before. |
 | `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
@@ -367,14 +377,15 @@ well, `network.proxy_allowlist` reads `true`):
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
 | `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
+| `credentials.proxy_injection`, `credentials.scoped_http_gateway` | Both `true` exactly when `network.proxy_allowlist` is and the node was started with `--credentials` (§2.1): a manifest's `credentials` grant for a service the operator configured is then honoured, its lease injected by the attempt's egress proxy into a route scoped to that service's host and paths (§6.8). Otherwise both `false`, and such a manifest is refused `unsupported_grant` at `admit`. The section's shape is unchanged, so a strict decoder of any 1.3 revision reads it. Which services a node offers is the operator's to say; the document does not list them. |
 | `resources.cpu`, `resources.memory`, `resources.pids` | Present, as `"resources":{"cpu":…,"memory":…,"pids":…}` after `output` (or after `verifier` when `output` is absent), exactly when `lifecycle.start` is and the node was started with `--cgroup-root` (§2.1): every attempt then runs in a cgroup of its own and what it used is recorded (§6.5). Each flag is `true` when the node enabled that controller and enforces the matching limit of a `resources` grant (`cpu_millis`, `memory_bytes`, `pids`, §7.5). Otherwise the section is absent, nothing is measured, and every `resources` grant is refused `unsupported_grant`. New in this revision of 1.3, with the same caveat as `output`: a strict decoder of an earlier revision refuses a document that carries it. |
 | `scheduling` | Present, as `"scheduling":{"max_running":…,"running":…,"memory_floor_bytes":…,"memory_available_bytes":…,"disk_floor_bytes":…,"disk_available_bytes":…}` after `resources` (or where `resources` would be), exactly when `lifecycle.start` is and the node was started with `--max-running`. Read when the document is served: `running` counts the attempts executing now (spawned and not yet reaped), the `*_available_bytes` are the host's `MemAvailable` and the task root filesystem's available space (`0` if they cannot be read), and a floor of `0` means none. A `start` is refused `capacity_exhausted` while `running` is at `max_running` or an available amount is below its floor (§8.2). New in this revision of 1.3, with the same caveat as `output`. |
 | `output.stdio`, `output.files` | Present, as `"output":{"stdio":true,"files":true}` after `verifier`, exactly when `lifecycle.start` is and the node was started with `--output-return` (§2.1): a manifest's `output` grant (§7.5) is then honoured and `result` returns an ended attempt's bounded stdout, stderr and declared files (§6.6). Otherwise the section is absent, which means both `false`, and such a manifest is refused `unsupported_grant` at `admit`. The section is new in this revision of 1.3: a strict decoder of an earlier 1.3 revision refuses a document that carries it, so start a node with `--output-return` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
 | `actions.approval`, `actions.decision`, `actions.max_pending`, `actions.max_total`, `actions.max_wait_secs` | Present, as `"actions":{"approval":true,"decision":true,"max_pending":8,"max_total":64,"max_wait_secs":3600}` after `verifier` (and after `output`, `resources` and `scheduling` when those are present), exactly when `lifecycle.start` is and the node was started with `--action-channel` (§2.1): a manifest's `actions` grant (§7.5) is then honoured within those ceilings, and `actions` and `answer` are served (§6.7). Otherwise the section is absent, which means no channel, and such a manifest is refused `unsupported_grant` at `admit`. Like `output`, the section is new in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--action-channel` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 
-Everything else (`isolation.backends`, `credentials`, `snapshots.diff`,
-`snapshots.read`, `verifier`) is `false`: the node offers none of it yet. 1.1 and 1.2
+Everything else (`isolation.backends`, `snapshots.diff`, `snapshots.read`, `verifier`) is
+`false`: the node offers none of it yet. 1.1 and 1.2
 documents keep their earlier content: they never carry `admit`, `start`, `output`,
 `resources`, `scheduling` or `actions`,
 report `stop`, `pause` and `revoke` as `false`, and report the execution flags
@@ -670,6 +681,7 @@ evidence log per attempt it admits:
 <task-root>/<task>/<attempt>.evidence/HEAD          the sealed head, written by seal (0400)
 <task-root>/<task>/<attempt>.output/result.json     the stored result of an output grant (§6.6; mode 0600)
 <task-root>/<task>/<attempt>.actions/actions.sock   the action channel's socket while the attempt runs (§6.7)
+<task-root>/<task>/<attempt>.credentials/leases.json the revocation handles of the attempt's live leases (§6.8)
 ```
 
 The directories (mode 0700, like `<task-root>/<task>/`) sit beside the attempt's
@@ -696,13 +708,17 @@ task, attempt and lease ids as 16 big-endian bytes each. Records, in order:
 | `NodeActionRequested` | The workload asked through the attempt's action channel (§6.7: an `actions` grant on a node started with `--action-channel`) and the node accepted the request. Appended before the control plane can list or answer it. | The node's request number (from 1), the kind (`approval`, `decision`), and the size and `BLAKE3-256` digest of the summary and of the detail. Never the text. |
 | `NodeActionAnswered` | A request was answered: by `answer` (appended before the workload is told), or by the node: `expired` once its wait ran out, `cancelled` when the attempt ended, the workload's connection closed, the channel closed, or a restarted node recovered the attempt. Every pending request is answered before `NodeAttemptEnded` or `NodeAttemptRecovered`. | The request number, the decision (`approved`, `denied`, `expired`, `cancelled`), the `answer`'s operation id (none for the node's own answers), and the size and digest of the note. Never the note. |
 | `NodeActionRefused` | The node refused a line on the channel and closed that connection without a reply (§6.7): oversized, malformed, a node-protocol or control-protocol request, a kind not granted, a repeated id, too many pending or in all. At most 16 per attempt: the 16th closes the channel. | The reason and how many bytes of the line the node read. |
+| `CredentialGranted` | The attempt was admitted with a `credentials` grant on a node started with `--credentials` (§6.8) and the provider issued a lease for a granted service: before `NodeAttemptLaunched`; or the node renewed one. | The service, the subject `issued <host> lease <id>` or `renewed <host> lease <id>`, the lease's permissions and lifetime, delivery `ProxyInjected`. The lease id is `b3:` and 32 hex digits of the `BLAKE3-256` digest of the provider's revocation handle, or `static`. Never the leased value or the handle. |
+| `CredentialDenied` | No lease could be issued for a granted service (before `NodeAttemptLaunched`), a renewal failed, or the provider did not confirm a revocation (after its `CredentialRevoked`). | The service, the host, and the rule `credential-provider:<provider>:<state>`, `credential-renew:<provider>:<state>` or `credential-revoke:<provider>:<state>` with the provider's named state (`unreachable`, `timed-out`, `tls-failed`, `auth-rejected`, `sealed`, `misconfigured`, `bad-response`, `refused`, `not-found` or `binding:<rule>`). |
+| `CredentialRevoked` | The attempt ended and its lease's route was withdrawn and the lease revoked at the provider: before `NodeAttemptEnded`; or a restarted node revoked a lease a node that died left behind: before `NodeAttemptRecovered`. | The service and the reason: `UserRevoked` for `revoke`, `SessionEnded` for every other end. |
 | `NodeAttemptEnded` | The attempt ended: natural exit, budget kill, a lost child, an ambiguous launch, a `stop` or `revoke` (from `ready`, or with its kill reaped, or a revoke whose reap was not confirmed). | The state (`exited`, `stopped`, `revoked`), the receipt outcome, the cause (exit code, budget, killed, lost, ambiguous, not started, unconfirmed) and the `stop` or `revoke` operation id. |
 | `NodeAttemptRecovered` | The state the node holds differs from the state the log last shows: after a restart, before the node serves, and before sealing. | The state and outcome the node holds. |
 | `NodeAttemptSealed` | `seal` took effect; the log is then sealed. | The `seal` operation id. |
 
 Every record is metadata; workload output is never logged (an output record carries
 counts, sizes and digests, never a byte of the output), and neither is anything a workload
-or a control plane said through the action channel (§6.7: sizes and digests only). A record is fsynced before the
+or a control plane said through the action channel (§6.7: sizes and digests only), nor a
+leased credential or its revocation handle (§6.8). A record is fsynced before the
 node answers its verb. If it cannot be appended, the verb is refused
 `resource_unavailable` and nothing changes: the task record written for it is restored,
 and a `pause` or `resume` undoes its freeze or thaw first. One exception is `admit`: its
@@ -725,7 +741,8 @@ that does not match) refuses every further append with `resource_unavailable` an
 restarted node from starting. The log is bounded at 256 KiB; records that do not end an
 attempt are refused `resource_unavailable` once it would pass 240 KiB, so the records that
 end, recover and seal it always fit; the node's own `expired` and `cancelled` answers to
-action-channel requests (§6.7) may use that reserve too, since they are bounded by the
+action-channel requests (§6.7) and the `CredentialDenied` and `CredentialRevoked` records
+of a `credentials` grant (§6.8) may use that reserve too, since they are bounded by the
 grant and must never be lost.
 
 To verify a log, as an operator or a control plane with access to the host:
@@ -923,6 +940,84 @@ exact binding, on a socket the node serves only to its own uid and its listed cl
 a statement the node records and relays, which the workload acts on because it chose to
 wait for it; the node enforces nothing on it at this revision (no capability, credential
 or network is widened; node-security-limitations.md §3).
+
+### 6.8 Brokered credentials
+
+A node started with `--credentials` (§2.1) honours a manifest's `credentials` grant
+(§7.5) by leasing, for the attempt, a credential for each granted service from the
+provider its operator configured, and having the attempt's egress proxy inject it
+([ADR-0034](decisions/ADR-0034-node-brokered-credentials.md)). The control plane names a
+service, never a secret; the secret never enters the sandbox.
+
+**The operator's file.** One TOML file, the node user's own, writable by no one else:
+
+```toml
+[provider.bao]
+kind = "openbao"                          # or "vault": the same HTTP API
+address = "https://bao.internal:8200"     # TLS required
+token_file = "/etc/ward-node/bao.token"   # 0600, the node user's; the node's provider token
+ca_bundle = "/etc/ward-node/bao-ca.pem"   # optional; the host trust store otherwise
+timeout_ms = 2000                         # every provider call; at most 5000 on a node
+max_ttl_secs = 3600                       # the longest lease this provider may issue
+
+[service.artifacts]
+provider = "bao"
+engine = "token"                          # a token role; or "kv" with mount, path, field
+role = "ward-artifacts"
+permissions = ["artifacts-read"]          # the lease's policies; "write" opens writes
+max_ttl_secs = 900                        # the longest `ttl_secs` the node honours for it
+renew = false                             # renew the lease while the attempt runs
+upstream = "artifacts.example.com:443"    # the only place the credential goes, over TLS
+header = "authorization"
+value_prefix = "Bearer "
+paths = ["/v1/repos/acme"]                # the resource paths the route may reach
+```
+
+The provider tables are those of the session broker (credential-broker.md §5.1), with the
+same checks on the address and the token file. A service name is `[a-z][a-z0-9-]{0,31}` and
+its upstream host a lowercase DNS name; at least one service is required.
+
+**What the workload does.** It sends an ordinary HTTP/1.1 request to the attempt's proxy
+socket (`WARD_PROXY_SOCKET`, §9) for the path `/<service>/…`:
+
+```text
+GET /artifacts/v1/repos/acme/latest HTTP/1.1
+Host: artifacts.example.com
+```
+
+The proxy strips `/<service>`, forwards the request over TLS to the service's `upstream`
+with the configured header set to `value_prefix` and the leased value (replacing any
+header of that name the workload sent), within the service's `paths` and read-only unless
+the service's permissions include `write`, and streams the answer back
+(credential-broker.md §4, route scope). Nothing is added to the sandbox's environment,
+files or sockets; a `CONNECT` tunnel is never injected into, and a request to any other
+host carries nothing the proxy added. Each such request is a `NetworkRequested` verdict in
+the evidence log (§6.5).
+
+**The lease.** Issued at `start`, before the spawn, bound to the attempt (the provider's
+session is the attempt id), the service and the upstream host as its audience; it lives at
+most the shortest of the grant's `ttl_secs`, the service's and the provider's maximum, and
+the attempt's wall-clock budget. With `renew = true` the node renews it once a third of its
+period is left, never past that maximum; a renewal that fails stops renewing it and it runs
+out on time. While the attempt is paused its proxy refuses every request (§9), so nothing
+is injected. Past its expiry, and as soon as the attempt ends, the route answers `403`
+before anything is resolved or connected.
+
+**Revocation.** When the attempt ends — its exit, the budget, `stop`, `revoke`, an
+ambiguous launch, a `revoke` whose reap is not confirmed — the node withdraws every route
+at once and revokes every lease at its provider, recording each before `NodeAttemptEnded`
+(§6.5). The revocation handles of the attempt's live leases (token accessors, never the
+leased values) are kept in `<task-root>/<task>/<attempt>.credentials/leases.json` (mode
+0600 in a 0700 directory beside the workspace) from before the spawn until they are
+revoked; a node restarted after it died revokes every lease it finds there before it
+serves, recorded before `NodeAttemptRecovered`. A lease the provider cannot revoke at the
+source (a KV read) ends with its route.
+
+**Provider outage.** A provider that cannot serve issues nothing: the attempt still runs,
+its request for `/<service>/…` is answered `403 Forbidden` with the body `credential lease
+expired` and recorded as a `NetworkDenied` verdict, and the grant's `CredentialDenied`
+record names the provider's state. There is no fallback to another credential. A control
+plane reads the denial from the evidence log, or from the workload's own outcome.
 
 ## 7. The admission envelope
 
@@ -1155,6 +1250,10 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | `actions` | Optional (new in this revision of 1.3, like `output`). `{"kinds": [kinds], "max_pending": P, "max_total": T, "wait_secs": W}`, all four required: give the attempt an action channel for the listed kinds, with at most `P` requests waiting at once, `T` in the attempt's lifetime, each answered `expired` after `W` seconds (§6.7). |
 | `actions.kinds` | 1–2 of `approval` and `decision`, no repeats. Any other kind fails envelope decoding. |
 | `actions.max_pending`, `actions.max_total`, `actions.wait_secs` | Integers ≥ 1, with `max_pending` ≤ `max_total`. The node honours at most 8 pending, 64 in all and 3600 seconds (its capability document says so, §5), and refuses a larger grant `unsupported_grant`. |
+| `credentials` | Optional (new in this revision of 1.3, like `output`). An array of 1–4 grants `{"service": S, "host": H, "ttl_secs": T}`, all three required, no service twice: lease service `S`'s credential for the attempt, for at most `T` seconds, injected by the attempt's egress proxy into requests for `H` only (§6.8). |
+| `credentials[].service` | 1–32 bytes, `[a-z][a-z0-9-]*`: a service the node's operator configured. |
+| `credentials[].host` | A lowercase DNS name in the `network.custom` host grammar, without a wildcard and not an address literal, that one of the manifest's own `network.custom` patterns covers; so a manifest with `credentials` names `network.custom`. A host outside the allowlist fails decoding. |
+| `credentials[].ttl_secs` | Integer ≥ 1. The node honours at most the service's `max_ttl_secs`, and refuses a larger grant `unsupported_grant`; the lease is shorter still when the attempt's budget is. |
 | `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
@@ -1165,10 +1264,14 @@ which a node started with `--network-allowlist` reports (§2.1), and `output` on
 every limit it names has its flag `true` in the document's `resources` section, which a
 node started with `--cgroup-root` reports, and only within the ceilings above, and
 `actions` only when the document carries an `actions` section offering every listed kind,
-which a node started with `--action-channel` reports, and only within its ceilings; the
+which a node started with `--action-channel` reports, and only within its ceilings, and
+`credentials` only when `credentials.proxy_injection` is `true`, which a node started with
+`--credentials` reports, and only for a service its operator configured, for that service's
+host and within its ceiling; the
 workload then runs behind the attempt's own egress proxy allowing exactly the listed
 patterns (§9), its output is kept and returned as §6.6 says, its process tree is held to
-the limits as §9 says, and its channel is served as §6.7 says. A
+the limits as §9 says, its channel is served as §6.7 says, and its credentials are leased
+and injected as §6.8 says. A
 manifest that asks for a grant the node does not honour is refused `unsupported_grant`
 (§8.1 step 16): the node refuses what it cannot enforce
 rather than run the workload with less than its manifest says. The refusal comes after
@@ -1215,6 +1318,14 @@ Decodes; honoured on a node started with `--action-channel`, refused `unsupporte
 on any other, as is `{"max_pending":9,…}` on every node.
 
 ```json
+{"network":{"custom":["artifacts.example.com"]},"credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}]}
+```
+
+Decodes; honoured on a node started with `--network-allowlist` and `--credentials` whose
+file configures `artifacts` with that upstream host and a `max_ttl_secs` of at least 600,
+refused `unsupported_grant` on any other.
+
+```json
 {"network":"development"}
 ```
 
@@ -1222,8 +1333,12 @@ on any other, as is `{"max_pending":9,…}` on every node.
 (`authority_denied`), as do `{}`, `{"network":{"custom":[]}}`,
 `{"network":"offline","output":{"stdio_bytes":1,"files":["../x"],"files_bytes":1}}`,
 `{"network":"offline","actions":{"kinds":["credential"],"max_pending":1,"max_total":1,"wait_secs":1}}`,
-an `actions` grant with no kind, a zero bound or `max_pending` above `max_total`, and any
-manifest with a field other than `network`, `output`, `resources` and `actions`.
+an `actions` grant with no kind, a zero bound or `max_pending` above `max_total`,
+`{"network":"offline","credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}]}`
+(no allowlist covers the host), a `credentials` grant naming a header, a provider or a
+secret, an empty `credentials` list, a zero `ttl_secs` or a wildcard host, and any
+manifest with a field other than `network`, `output`, `resources`, `actions` and
+`credentials`.
 
 ## 8. Verification order and rejection reasons
 
@@ -1249,7 +1364,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1322,7 +1437,7 @@ task to evict it is refused `resource_unavailable`.
 | `stale_operation` | The request is stale and nothing was done. From `admit`: the envelope `version` is not greater than the last version the node durably accepted for the task (an old or replayed envelope, also after a restart). From `pause` or `resume`: the `operation_id` took effect earlier and a later operation of the same verb has superseded it (§6.3). From `create`: the attempt was replaced by a later attempt of the task and is retired (§6.1). |
 | `invalid_state` | The task is not in a state that allows the verb, or another operation already did it. From `result`: the attempt has not ended yet (§6.6). |
 | `authority_denied` | Untrusted key, bad signature, malformed envelope (a capability manifest outside the grammar of §7.5 included), a root lease `issuer` that is not the principal bound to the signing key, wrong audience, not yet valid, or authority that does not cover the task or agent. |
-| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings (§6.6), a `resources` grant on a node without `--cgroup-root`, naming a limit whose controller the node has not enabled, or above its ceilings, or an `actions` grant on a node without `--action-channel` or above its ceilings (§6.7). The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
+| `unsupported_grant` | From `admit` only: the envelope's capability manifest decodes but asks for a grant this node cannot honour (§7.5): a `network.custom` allowlist on a node without `--network-allowlist`, an `output` grant on a node without `--output-return` or above its ceilings (§6.6), a `resources` grant on a node without `--cgroup-root`, naming a limit whose controller the node has not enabled, or above its ceilings, an `actions` grant on a node without `--action-channel` or above its ceilings (§6.7), or a `credentials` grant on a node without `--credentials`, for a service its operator did not configure, a host other than that service's upstream host, or a `ttl_secs` above the service's ceiling (§6.8). The task stays `created` and no version is consumed; re-admit under the same version with a manifest the node honours. Protocol 1.3 and later. |
 | `capacity_exhausted` | From `start` only, on a node started with `--max-running` (§2.1): the node already executes as many attempts as its bound, or the host's available memory or the task root's available disk is below the configured floor. Nothing changed: the task stays `ready`, nothing is materialised or recorded; send the same `start` again once an attempt has ended (§6.1). New in this revision of 1.3: a strict decoder of an earlier revision does not know the string, which is why only a node started with `--max-running` sends it. |
 | `resource_unavailable` | Registry full with no sealed task to evict, snapshot missing, workspace exists, spawn failed, a state write failed or would exceed its bound (admission version, revocation, retired attempt or task record), an evidence record could not be appended (§6.5), stop not confirmed in time, a pause or resume not confirmed, or an attempt's 128 pauses used up. From `result`: no stored result exists for the ended attempt (§6.6). |
 | `unsupported_operation` | The verb is not implemented (`stream`), or not enabled on this node or connection (no `--task-root`, or protocol 1.2; `result` without `--output-return`; `actions` and `answer` without `--action-channel`). |
@@ -1392,7 +1507,9 @@ answer every new connection `503 paused by ward` and hold established relays unt
 `resume`; `stop`, `revoke`, the budget kill and the attempt's own exit shut it down and
 unlink the socket; a node restart ends it with the node. There is no loopback relay and
 no `HTTP_PROXY` inside the sandbox yet: a workload reaches the proxy through the socket
-`WARD_PROXY_SOCKET` names. No credential is injected (#267).
+`WARD_PROXY_SOCKET` names. A `credentials` grant, on a node started with `--credentials`,
+adds the attempt's credential routes to that proxy (§6.8); nothing else injects a
+credential, and nothing about one is bound into the sandbox.
 
 An `actions` manifest, on a node started with `--action-channel` (§2.1), binds one more
 socket: the attempt's action channel, from `<task-root>/<task>/<attempt>.actions/`
@@ -1703,8 +1820,12 @@ bad flags. A command line is at most 256 KiB.
 
 - Egress is HTTP(S) through the attempt's proxy socket only, and only on a node started
   with `--network-allowlist` (§7.5, §9): there is no loopback relay or `HTTP_PROXY` in
-  the sandbox, patterns are host-level, and no credential is injected (#267). On any
-  other node a manifest with `network.custom` is refused `unsupported_grant`.
+  the sandbox, and patterns are host-level. On any other node a manifest with
+  `network.custom` is refused `unsupported_grant`.
+- A credential reaches a workload only as a header the attempt's proxy injects on the
+  route of a service the node's operator configured, on a node started with
+  `--credentials` (§6.8); the adapter can grant it, never hand a token to the workload,
+  and learns of a provider outage only from the evidence log or the workload (#267).
 - Output comes back only as a bounded result on a node started with `--output-return`
   (§6.6): the head of each stream up to 1 MiB and the files the manifest declared by exact
   path, up to 8 MiB of content, with digests for the rest. There is no tail, no streaming
@@ -1715,7 +1836,7 @@ bad flags. A command line is at most 256 KiB.
 - There is no event stream (`stream`); progress is what `inspect` reports. The action
   channel (§6.7) carries bounded questions out and answers in, on a node started with
   `--action-channel`, but an approval through it is a recorded statement, not something
-  the node enforces, and no credential reaches the workload through it (#267).
+  the node enforces, and no credential reaches the workload through it.
 
 The honest integration shape today is therefore running governed tool actions and
 verification runs, an `argv` over a snapshot with a budget, through the node, reading the

@@ -2425,6 +2425,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ward-credentials"
+version = "0.18.1"
+dependencies = [
+ "nix 0.30.1",
+ "rcgen",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
 name = "ward-daemon"
 version = "0.18.1"
 dependencies = [
@@ -2434,7 +2449,6 @@ dependencies = [
  "nix 0.30.1",
  "rcgen",
  "rustls",
- "rustls-native-certs",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -2443,6 +2457,7 @@ dependencies = [
  "toml",
  "ward-agent",
  "ward-agent-adapter",
+ "ward-credentials",
  "ward-events",
  "ward-launch",
  "ward-node-protocol",
@@ -2450,7 +2465,6 @@ dependencies = [
  "ward-proxy",
  "ward-sandbox",
  "ward-snapshot",
- "zeroize",
 ]
 
 [[package]]
@@ -2488,9 +2502,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+ "toml",
  "ward-authority",
+ "ward-credentials",
  "ward-events",
  "ward-launch",
+ "ward-node",
  "ward-node-protocol",
  "ward-proxy",
  "ward-sandbox",

@@ -3,11 +3,13 @@
 Status: living document; the project's phase is in docs/status.toml and the README.
 Implemented: the model-API gateways (Anthropic, OpenAI; see
 [agent-integration.md](agent-integration.md) §3), the GitHub adapter in gateway
-mode (§4), and the credential-provider interface with a Vault/OpenBao backend for
-short-lived, proxy-injected leases (§5, #267). Registry and SSH adapters, cloud STS
-backends, minted tokens and the encrypted vault are ahead. Decision records:
+mode (§4), the credential-provider interface with a Vault/OpenBao backend for
+short-lived, proxy-injected leases (§5, #267), and the same providers brokering leases to
+`ward-node` workloads (§8). Registry and SSH adapters, cloud STS backends, minted tokens
+and the encrypted vault are ahead. Decision records:
 [ADR-0008](decisions/ADR-0008-credential-broker.md),
-[ADR-0032](decisions/ADR-0032-credential-provider-interface.md).
+[ADR-0032](decisions/ADR-0032-credential-provider-interface.md),
+[ADR-0034](decisions/ADR-0034-node-brokered-credentials.md).
 
 ## 1. Problem
 
@@ -86,7 +88,8 @@ route and the request line; the upstream's own authorisation still applies on to
 ## 5. Backend: credential providers
 
 Every brokered credential comes from a **credential provider**
-(`ward-daemon::credentials::CredentialProvider`, ADR-0032): `issue(request) -> lease`,
+(`ward_credentials::CredentialProvider`, ADR-0032, re-exported as
+`ward_daemon::credentials`; the node uses the same crate, §8): `issue(request) -> lease`,
 `renew`, `revoke` and `health`. A request names the session (the task), the service, the
 scope (resource paths at the upstream, a permission set, whether writes are allowed), a
 TTL, a maximum TTL and an audience (the upstream host). Two providers exist:
@@ -215,3 +218,31 @@ No token values are ever printed, by type construction (`Secret<T>` has no `Disp
 * Proxy injection for a host that also appears unauthenticated in the same session: the
   proxy injects only on `(host, path-prefix, method)` tuples of an active grant.
 * Injected requests are logged with method, host, path, status; never headers or bodies.
+
+## 8. Credentials for `ward-node` workloads
+
+A `ward-node` started with `--network-allowlist` and `--credentials <file>` brokers the same
+providers to admitted attempts
+([ADR-0034](decisions/ADR-0034-node-brokered-credentials.md),
+[node-integration.md](node-integration.md) §6.8). The differences from a session:
+
+* **Who decides.** The control plane's signed manifest asks for a service by name, for a
+  host its own network allowlist covers and a TTL
+  (`"credentials":[{"service":"artifacts","host":"artifacts.example.com","ttl_secs":600}]`);
+  the node's operator decides what the service is in the node's own file (the
+  `[provider.<name>]` tables of §5.1, and `[service.<name>]` tables naming the engine,
+  permissions, paths, upstream, header and the longest TTL honoured). There is no `ask` and
+  no project policy: an unconfigured service, another host or a longer TTL is refused
+  `unsupported_grant` at `admit`.
+* **Lifetime.** A lease lives no longer than the grant, the service, the provider and the
+  attempt's budget; it is revoked at the provider when the attempt ends, whatever ended it,
+  and a node restarted after it died revokes what it finds in the attempt's kept handles
+  (`<task-root>/<task>/<attempt>.credentials/leases.json`, the revocation handles only)
+  before it serves. A pause does not revoke it: the paused proxy injects nothing, and the
+  budget keeps running.
+* **Records.** The attempt's evidence log, not a grant history: `CredentialGranted`
+  (`issued` or `renewed <host> lease <id>`), `CredentialDenied` with the rule
+  `credential-provider:`, `credential-renew:` or `credential-revoke:<provider>:<state>`, and
+  `CredentialRevoked`, all origin `node`, none carrying a secret or a handle.
+* **Provider calls** are bounded at 5 seconds on a node, so revoking fits within the bound
+  `stop` and `revoke` wait for.

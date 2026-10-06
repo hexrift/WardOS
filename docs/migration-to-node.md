@@ -24,8 +24,8 @@ neither reads or converts the other's.
 | What runs | One `wardd serve` per session, spawned detached by `ward up`, owning the session's hash chain and control socket ([ADR-0015](decisions/ADR-0015-single-writer-daemon.md)); the bubblewrap sandbox, the egress proxy and the hook listener in the `ward` process that launched them (ADR-0013); the trusted verifier on `ward verify` | One `ward-node` process for the host, serving a Unix socket on protocol 1.0 to 1.3 ([compatibility.md](compatibility.md)); one bubblewrap sandbox per admitted attempt, spawned and reaped by the node through `ward-launch` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) §3) |
 | Unit of work | A session: a project worktree, an agent, a policy, from `ward up` to `ward stop` | A task attempt: an argv over an imported snapshot with a wall-clock budget, from `admit` to `seal` |
 | Who owns authority | The local user, through policy: `.ward/policy.yaml` merged with the user and system policy into a capability manifest that only narrows (security-model.md G7) | An external control plane, through an issuer key the node's operator put in the trust store; the node admits only a signed, audience-bound, versioned envelope and verifies it before anything is materialised (ADR-0030 §2) |
-| Network | The session proxy: the manifest's host allowlist, private ranges denied, credentials injected, a loopback relay for `HTTP_PROXY` clients | Offline by default; with `--network-allowlist` a `network.custom` manifest runs behind a per-attempt proxy with the session proxy's rules, reached through its Unix socket, with no relay and no credentials (node-integration.md §9); any other grant is refused `unsupported_grant` at `admit` (§7.5) |
-| Credentials | The vault (`ward vault`) and proxy injection; brokered credentials the policy marks `ask` are approved per session | None reach a workload by any route (node-security-limitations.md §3.2) |
+| Network | The session proxy: the manifest's host allowlist, private ranges denied, credentials injected, a loopback relay for `HTTP_PROXY` clients | Offline by default; with `--network-allowlist` a `network.custom` manifest runs behind a per-attempt proxy with the session proxy's rules, reached through its Unix socket, with no relay, and credentials only on the routes of `--credentials` services (node-integration.md §6.8, §9); any other grant is refused `unsupported_grant` at `admit` (§7.5) |
+| Credentials | The vault (`ward vault`) and proxy injection; brokered credentials the policy marks `ask` are approved per session | With `--credentials`, leases from the operator's providers for the services a signed manifest grants, injected by the attempt's proxy and revoked when it ends (node-integration.md §6.8); nothing else reaches a workload (node-security-limitations.md §3.2) |
 | Approvals | Held by the daemon, answered by the user or the desktop (`agent-integration.md` §4.1) | None: there is no channel from the sandbox to anyone (node-security-limitations.md §3.2) |
 | Intervention | `ward pause`, `ward resume`, `ward stop`, `ward stop --restore-entry` ([ADR-0019](decisions/ADR-0019-authority-freshness-intervention.md) §3) | `pause`, `resume`, `stop`, `revoke` over the socket, each confirmed before it is answered (node-integration.md §6) |
 | Evidence | One session log, `~/.local/state/ward/sessions/<id>/events.log`, written only by that session's `wardd`, sealed with `HEAD` by `ward stop` | One evidence log per attempt, `<task-root>/<task>/<attempt>.evidence/events.log`, written only by the node, sealed with `HEAD` by `seal` (node-integration.md §6.5) |
@@ -52,7 +52,10 @@ neither reads or converts the other's.
 
 ### 1.2 What has no equivalent
 
-- **Approvals and credentials.** The node has no approval hold and no credential broker.
+- **Approvals and credentials.** The node has no approval hold. Its credential broker
+  takes no per-session `ask` and no project policy: on a node started with `--credentials`
+  the control plane's signed manifest grants a service the node's operator configured, and
+  the node's proxy injects its lease (node-integration.md §6.8, ADR-0034).
   On a node started with `--action-channel` a workload can ask the control plane a
   bounded question through its attempt's action channel and receives a recorded answer
   (node-integration.md §6.7, ADR-0031, #404), but an approval is a statement the workload
@@ -214,30 +217,48 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   evidence log before it shows or relays it, answers `expired` past the grant's wait and
   `cancelled` when the attempt ends, keeps requests pending through a pause, and answers
   a control-protocol line on the channel with nothing (node-integration.md §6.7); the
-  capability document carries `actions` only on such a node, additively within 1.3. Still
-  open: approvals become a hold the node applies on the control plane's answer (today an
-  approval is a recorded statement the workload acts on, node-security-limitations.md
-  §3.2); credentials become brokered, scoped and revocable node capabilities (#267),
-  injected by the node's proxy and never materialised in the sandbox. The per-session
-  approval hold (`agent-integration.md` §4.1) and the vault's injection are the behaviour
-  to preserve.
+  capability document carries `actions` only on such a node, additively within 1.3.
+  Credentials are brokered, scoped and revocable node capabilities as well (the first node
+  slice of #267, [ADR-0034](decisions/ADR-0034-node-brokered-credentials.md)): a node
+  started with `--network-allowlist` and `--credentials` (the operator's file of providers
+  and services) honours a manifest's `credentials` grant naming a configured service, a host
+  its own allowlist covers and a TTL; it leases the credential through the session broker's
+  provider interface and rules (now the `ward-credentials` crate both runtimes share), bound
+  to the attempt and its budget, has the attempt's egress proxy inject it into requests for
+  `/<service>/…` to that host only, never into the sandbox, revokes it at the provider when
+  the attempt ends and when a restarted node finds a lease a dead node left, fails closed
+  with a named state and a `403`, and records every grant in the evidence log without its
+  secret (node-integration.md §6.8); the capability document reports
+  `credentials.proxy_injection` only on such a node, with its shape unchanged. Still open:
+  approvals become a hold the node applies on the control plane's answer (today an approval
+  is a recorded statement the workload acts on, node-security-limitations.md §3.2), and
+  the rest of #267 for the node (delivery B, the services advertised, approvals as a hold
+  on a credential). The per-session approval hold (`agent-integration.md` §4.1) is the
+  behaviour to preserve.
 - **What stays compatible.** Stage 2 envelopes and every attempt log. The per-session
-  mode, which keeps its own approvals and vault until stage 4.
+  mode, which keeps its own approvals and vault until stage 4; its credential providers are
+  the same code, moved behaviour-preserving into `ward-credentials`.
 - **What breaks.** The sandbox gains a socket into it. The session mode's security proofs
   for the hook socket (ST-016, ST-027: a control-protocol request on the hook socket gets
   nothing) are the bar the node channel had to meet, and it meets it: a lifecycle request
   or a `hello` on the channel gets zero bytes and a closed connection and is recorded as
   a refusal (node-acceptance.md §2.5); the capability document says whether a node offers
-  the channel, so a control plane never assumes it (node-integration.md §5).
+  the channel, so a control plane never assumes it (node-integration.md §5). Brokered
+  credentials add no socket and nothing to the sandbox; what they add is a file of the
+  operator's naming the providers the node may call, and the revocation handles of live
+  leases kept beside each attempt's workspace until they are revoked.
 - **Rollback.** As stage 2: drop `--action-channel`, or roll the node back to a release
   without it; a control plane that still grants `actions` is then refused
   `unsupported_grant` (or `authority_denied` by a node older than the grammar) rather than
   run without the channel, and `actions` and `answer` are `unsupported_operation` (or
   unknown, closing the connection). Logs with `NodeAction*` records need a `ward` at least
-  this new (§4.1).
+  this new (§4.1). Drop `--credentials` likewise: a `credentials` grant is then refused
+  `unsupported_grant` (`authority_denied` by a node older than the grammar), and leases
+  already issued end with their attempts or at their own TTL; the credential records reuse
+  kinds every `ward` reads.
 - **Issues.** [#404](https://github.com/hexrift/WardOS/issues/404) for the channel (done);
-  [#267](https://github.com/hexrift/WardOS/issues/267) for credentials, which
-  node-security-limitations.md §3.2 orders after the network allowlist; no issue for
+  [#267](https://github.com/hexrift/WardOS/issues/267) for credentials (the first node
+  slice is in place; what remains is node-security-limitations.md §3.2); no issue for
   approvals as an enforced node capability, since #269 was closed as superseded by #332.
 
 ### 3.5 Stage 4: the desktop and `ward up` on a local node, per-session `wardd` retired

@@ -9,6 +9,7 @@ members = [
     "crates/ward-proxy",
     "crates/ward-agent",
     "crates/ward-authority",
+    "crates/ward-credentials",
     "crates/ward-agent-adapter",
     "crates/ward-daemon",
     "crates/ward-node-protocol",
