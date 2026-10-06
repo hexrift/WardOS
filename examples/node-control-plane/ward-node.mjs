@@ -57,6 +57,13 @@ export const OUTPUT_CEILINGS = Object.freeze({ stdioBytes: 1_048_576, filesBytes
  */
 export const RESOURCE_CEILINGS = Object.freeze({ pids: 65_536, cpuMillisPerCpu: 1000 });
 
+/**
+ * How `Adapter.run` paces a capacity wait (§8.2) unless told otherwise: the first wait
+ * after a `start` refused `capacity_exhausted` is `firstDelayMs`, each next one twice the
+ * last, at most `maxDelayMs`, all within the run's `capacityWaitMs`.
+ */
+export const CAPACITY_WAIT = Object.freeze({ firstDelayMs: 250, maxDelayMs: 5000 });
+
 /** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
 export const ACTION_KINDS = Object.freeze(["approval", "decision"]);
 
@@ -1268,6 +1275,16 @@ export function adapterNodeArgs({ socket, tls }) {
 }
 
 /**
+ * Whether an attempt report (§11.3) is a `start` the node refused `capacity_exhausted`
+ * (§8.2): the task is still `ready` and its admission valid, so the same `start` (the same
+ * run, with the same operation ids) may be sent again once the node has room.
+ */
+export function capacityExhausted(report) {
+  const refused = report?.outcome?.refused;
+  return refused?.verb === "start" && refused?.reason === "capacity_exhausted";
+}
+
+/**
  * One `ward-node-adapter` process: JSON commands in, JSON events out, one per line. The
  * adapter is spawned the way any external tool is, with `--socket` (or `--connect-tls` and
  * its files, see `adapterNodeArgs`) on its command line; `command` is the executable and
@@ -1281,6 +1298,9 @@ export class Adapter {
   #waiters = [];
   #exit = null;
   #trace;
+  #waiting = false;
+  #cancelRequested = false;
+  #wake = null;
 
   constructor({ command = ["ward-node-adapter"], socket, tls, timeoutMs, connectTimeoutMs, env = process.env, trace = null }) {
     const [executable, ...leading] = command;
@@ -1389,25 +1409,117 @@ export class Adapter {
 
   /**
    * Drive one attempt with a pre-signed envelope: `create`, `admit`, `start`, poll, read the
-   * receipt, `seal`. Resolves with every event and the `done` report once the adapter
-   * writes it; `onEvent` sees each event as it arrives. Replaying with the same `signed`
-   * and `operationIds` after a restart acts on nothing (§6.3).
+   * receipt, `seal`. Resolves with every event, the `done` report once the adapter writes
+   * it, and `capacityWaits`; `onEvent` sees each event as it arrives. Replaying with the
+   * same `signed` and `operationIds` after a restart acts on nothing (§6.3).
+   *
+   * With `capacityWaitMs` (default 0: none), a `start` the node refuses `capacity_exhausted`
+   * (§8.2, `capacityExhausted`) is not the end: the task is still `ready`, so the same `run`
+   * command (the same signed bytes, proof and operation ids, hence the same `start`) is sent
+   * again after `capacityDelayMs` (default `CAPACITY_WAIT.firstDelayMs`), each wait twice
+   * the last up to `capacityMaxDelayMs`, until the node starts it or `capacityWaitMs` is
+   * spent; nothing is re-signed and no version is allocated. Before each wait the node's
+   * `scheduling` (§5) is read, and the wait {retry, operation_id, delay_ms, scheduling} is
+   * listed in `capacityWaits` and passed to `onCapacityWait`. Once the wait is spent the
+   * last report, the refusal, is the result. A `cancel()` while waiting revokes the ready
+   * attempt under the scheme's `revoke` id and sends the run once more, which replays
+   * `create` and `admit`, sends no `start` and seals it; that report is the result, with
+   * `cancelled` true and every operation of both runs and the revoke in `operations`.
    */
-  async run(signed, { operationIds: ids, taskRoot, pollMs, maxPollMs, graceMs, onEvent } = {}) {
+  async run(signed, options = {}) {
+    const { operationIds: ids, taskRoot, pollMs, maxPollMs, graceMs, onEvent, onCapacityWait } = options;
+    const {
+      capacityWaitMs = 0,
+      capacityDelayMs = CAPACITY_WAIT.firstDelayMs,
+      capacityMaxDelayMs = CAPACITY_WAIT.maxDelayMs,
+    } = options;
+    if (!Number.isSafeInteger(capacityWaitMs) || capacityWaitMs < 0) refuse("capacityWaitMs is an integer >= 0");
+    for (const [name, value] of [["capacityDelayMs", capacityDelayMs], ["capacityMaxDelayMs", capacityMaxDelayMs]]) {
+      if (!Number.isSafeInteger(value) || value < 1) refuse(`${name}, a capacity wait's delay, is an integer >= 1`);
+    }
     const command = { cmd: "run", envelope_json: signed.envelope_json, proof: signed.proof };
     if (ids !== undefined) command.operation_ids = { start_at: ids.start_at ?? ids };
     if (pollMs !== undefined) command.poll_ms = pollMs;
     if (maxPollMs !== undefined) command.max_poll_ms = maxPollMs;
     if (graceMs !== undefined) command.grace_ms = graceMs;
     if (taskRoot !== undefined) command.task_root = taskRoot;
-    this.send(command);
+    const deadline = Date.now() + capacityWaitMs;
     const events = [];
+    const capacityWaits = [];
+    let delay = capacityDelayMs;
+    this.#cancelRequested = false;
+    for (;;) {
+      const report = await this.#runOnce(command, events, onEvent);
+      const remaining = deadline - Date.now();
+      if (!capacityExhausted(report) || this.#cancelRequested || remaining <= 0) return { events, report, capacityWaits };
+      // Idle between runs: a cancel now revokes through this adapter instead of signalling it.
+      this.#waiting = true;
+      try {
+        const capabilities = await this.capabilities();
+        const start = report.operations?.find((operation) => operation.verb === "start");
+        const wait = {
+          retry: capacityWaits.length + 1,
+          operation_id: start?.operation_id ?? null,
+          delay_ms: Math.min(delay, remaining),
+          scheduling: capabilities?.scheduling ?? null,
+        };
+        capacityWaits.push(wait);
+        if (onCapacityWait) onCapacityWait(wait);
+        await this.#idle(wait.delay_ms);
+        if (this.#cancelRequested) {
+          return { events, report: await this.#cancelReady(report, command, events, onEvent), capacityWaits };
+        }
+      } finally {
+        this.#waiting = false;
+      }
+      delay = Math.min(delay * 2, capacityMaxDelayMs);
+    }
+  }
+
+  /** Send one `run` command and collect its events to `done`. */
+  async #runOnce(command, events, onEvent) {
+    this.send(command);
     for (;;) {
       const event = await this.next();
       events.push(event);
       if (onEvent) onEvent(event);
-      if (event.event === "done") return { events, report: event.report };
+      if (event.event === "done") return event.report;
     }
+  }
+
+  /** Wait `ms`, or less when `cancel()` is called meanwhile (or was already). */
+  #idle(ms) {
+    if (this.#cancelRequested) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, ms);
+      function done() {
+        clearTimeout(timer);
+        resolve();
+      }
+      this.#wake = done;
+    }).finally(() => {
+      this.#wake = null;
+    });
+  }
+
+  /**
+   * End an attempt left `ready` by a capacity refusal when its run is cancelled: `revoke`
+   * under the scheme's id, so nothing starts it later, then the same run once more, which
+   * finds it revoked, sends no `start`, reads the receipt and seals.
+   */
+  async #cancelReady(refused, command, events, onEvent) {
+    const revokeId = operationIds(command.operation_ids?.start_at ?? 1).revoke;
+    const revoked = await this.revoke(refused.binding, revokeId);
+    const sealed = await this.#runOnce(command, events, onEvent);
+    return {
+      ...sealed,
+      cancelled: true,
+      operations: [
+        ...(refused.operations ?? []),
+        { verb: "revoke", operation_id: revokeId, state: revoked.state ?? null, reason: revoked.reason ?? null },
+        ...(sealed.operations ?? []),
+      ],
+    };
   }
 
   /**
@@ -1565,8 +1677,17 @@ export class Adapter {
     return { state: null, answers };
   }
 
-  /** Cancel the attempt this adapter is running: the adapter revokes, seals and writes `done`. */
+  /**
+   * Cancel the attempt this adapter is running: the adapter revokes, seals and writes
+   * `done`. While `run` waits out a capacity refusal the adapter is idle and is not
+   * signalled (an idle adapter exits at once); `run` revokes and seals the ready attempt.
+   */
   cancel() {
+    this.#cancelRequested = true;
+    if (this.#waiting) {
+      if (this.#wake) this.#wake();
+      return;
+    }
     if (this.#exit === null) this.#child.kill("SIGTERM");
   }
 

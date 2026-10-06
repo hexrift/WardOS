@@ -25,6 +25,12 @@ export const OUTPUT_CEILINGS: Readonly<{ stdioBytes: 1048576; filesBytes: 838860
  */
 export const RESOURCE_CEILINGS: Readonly<{ pids: 65536; cpuMillisPerCpu: 1000 }>;
 
+/**
+ * How `Adapter.run` paces a capacity wait (§8.2) unless told otherwise: 250 ms after the
+ * first `capacity_exhausted`, each next wait twice the last, at most 5 s.
+ */
+export const CAPACITY_WAIT: Readonly<{ firstDelayMs: 250; maxDelayMs: 5000 }>;
+
 /** The kinds of request a workload may send on the action channel (§6.7, ADR-0031). */
 export const ACTION_KINDS: ReadonlyArray<ActionKind>;
 
@@ -655,6 +661,30 @@ export interface AdapterOptions {
   trace?: ((line: string) => void) | null;
 }
 
+/**
+ * The `scheduling` section of a capability document (§5), read when it is served: present
+ * on a node started with `--max-running`. A floor of 0 means none.
+ */
+export interface Scheduling {
+  max_running: number;
+  running: number;
+  memory_floor_bytes: number;
+  memory_available_bytes: number;
+  disk_floor_bytes: number;
+  disk_available_bytes: number;
+}
+
+/** One wait of a run whose `start` the node refused `capacity_exhausted` (§8.2). */
+export interface CapacityWait {
+  /** 1 for the first wait, then 2, …: the number of the `run` sent again after it. */
+  retry: number;
+  /** The refused `start`'s operation id, the one sent again. */
+  operation_id: number | null;
+  delay_ms: number;
+  /** The node's `scheduling` read before the wait; `null` when it reports none. */
+  scheduling: Scheduling | null;
+}
+
 export interface RunOptions {
   operationIds?: OperationIds | number;
   taskRoot?: string;
@@ -662,7 +692,24 @@ export interface RunOptions {
   maxPollMs?: number;
   graceMs?: number;
   onEvent?: (event: AdapterEvent) => void;
+  /**
+   * How long a `start` refused `capacity_exhausted` is waited out, sending the same run
+   * again (same bytes, proof and operation ids); default 0, none.
+   */
+  capacityWaitMs?: number;
+  /** The first wait; default `CAPACITY_WAIT.firstDelayMs`. Each next one is twice the last. */
+  capacityDelayMs?: number;
+  /** The longest wait; default `CAPACITY_WAIT.maxDelayMs`. */
+  capacityMaxDelayMs?: number;
+  /** Each wait as it begins. */
+  onCapacityWait?: (wait: CapacityWait) => void;
 }
+
+/**
+ * Whether a report is a `start` the node refused `capacity_exhausted` (§8.2): the task is
+ * still `ready`, and the same run may be sent again once the node has room.
+ */
+export function capacityExhausted(report: AttemptReport): boolean;
 
 export class Adapter {
   constructor(options: AdapterOptions);
@@ -692,8 +739,17 @@ export class Adapter {
    * answer is replayed under its id instead of asking the policy again.
    */
   answerLoop(binding: Binding, policy: AnswerPolicy, options?: AnswerLoopOptions): Promise<{ state: LifecycleState | null; answers: LoopAnswer[] }>;
-  run(signed: Pick<SignedEnvelope, "envelope_json" | "proof">, options?: RunOptions): Promise<{ events: AdapterEvent[]; report: AttemptReport }>;
-  /** SIGTERM to the adapter: it revokes and seals the running attempt and writes `done`. */
+  /**
+   * Drive one attempt to `done`. With `capacityWaitMs`, a `start` refused
+   * `capacity_exhausted` is sent again (the same run) with backoff until it is accepted or
+   * the wait is spent, every wait listed in `capacityWaits`; never re-signed.
+   */
+  run(signed: Pick<SignedEnvelope, "envelope_json" | "proof">, options?: RunOptions): Promise<{ events: AdapterEvent[]; report: AttemptReport; capacityWaits: CapacityWait[] }>;
+  /**
+   * SIGTERM to the adapter: it revokes and seals the running attempt and writes `done`.
+   * While `run` waits out a capacity refusal, `run` revokes and seals the ready attempt
+   * itself instead.
+   */
   cancel(): void;
   close(): Promise<number>;
 }

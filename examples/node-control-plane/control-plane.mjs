@@ -24,6 +24,7 @@ import {
   agentAdapterOf,
   answerOperationId,
   buildEnvelope,
+  capacityExhausted,
   credentialsGrant,
   credentialsGrantOf,
   decodeActions,
@@ -72,7 +73,7 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                [--actions-wait-secs <n>] [--approve-all | --deny-all | --ask] [--note <text>]
                [--actions-poll-ms <n>] [--credential <service>=<host>[:<ttl-secs>]]...
                [--hold host=<pattern> | --hold service=<name>]... [--agent-adapter <id>]
-               [--cpu-millis <n>] [--memory-bytes <n>] [--pids <n>]
+               [--cpu-millis <n>] [--memory-bytes <n>] [--pids <n>] [--capacity-wait-secs <n>]
                [--cancel-after <ms>] [--adapter <bin>] [--timeout-ms <n>] [--trace] -- <argv>...
                Admit, start, watch and seal one attempt; print its outcome as one JSON line.
                SIGINT or SIGTERM cancels it (revoke, then seal). Any of --stdio-bytes, --files
@@ -127,12 +128,24 @@ const USAGE = `usage: control-plane.mjs <command> [options]
                that does not report resources with each named limit true, or whose capacity
                is below a limit, is refused here (unsupported_grant) before anything is
                signed. The outcome lists the grant in resources.
+               --capacity-wait-secs (default 30; 0 disables) bounds how long run waits when
+               the node refuses start capacity_exhausted (a node started with --max-running
+               at its bound or below a headroom floor): the attempt stays admitted and
+               ready, and run sends the same run again (the same signed bytes and operation
+               ids, so the same start) after 250 ms, doubling to 5 s, until the node starts
+               it or the wait is spent (never past --valid-for-ms: a start after the
+               envelope expires is lease_expired). Before each wait it reads the node's scheduling and
+               prints it on stderr; the outcome lists every wait in capacity_waits. When the
+               wait is spent the outcome is the refusal (exit 1) and the attempt is still
+               ready: replay sends the same start again. A cancel while waiting revokes the
+               attempt, then seals it.
   replay       --socket <path> --state-dir <dir> --attempt <exec_…> [--out-dir <dir>] [--adapter <bin>] [--trace]
                [--approve-all | --deny-all | --ask] [--note <text>]
                Resend a recorded run with the same bytes and operation ids; nothing acts twice.
                A policy answers its action channel as run's does, replaying recorded answers;
                a recorded credentials grant, hold, resources grant and agent adapter are
-               listed in the outcome as run's are.
+               listed in the outcome as run's are. A replay sends the run once: a start
+               refused capacity_exhausted is its outcome, never waited out.
   inspect      --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…>
   result       --socket <path> --task <task_…> --attempt <exec_…> --lease <lease_…> [--out-dir <dir>]
                Read an ended attempt's stored result again (its run must have carried the grant).
@@ -196,6 +209,7 @@ const OPTIONS = {
   "cpu-millis": { type: "string" },
   "memory-bytes": { type: "string" },
   pids: { type: "string" },
+  "capacity-wait-secs": { type: "string" },
   "approve-all": { type: "boolean" },
   "deny-all": { type: "boolean" },
   ask: { type: "boolean" },
@@ -448,7 +462,8 @@ function printAnswer(answer) {
 
 /**
  * Drive a run and, with a policy, answer its action channel from a second adapter beside
- * it until the run's `done`. Resolves with the report, the answers and the loop's failure.
+ * it until the run's `done`. Resolves with the report, the capacity waits, the answers and
+ * the loop's failure.
  */
 async function driveWithAnswers(values, signed, options, cancelAfterMs, answering) {
   const adapter = adapterOf(values);
@@ -467,9 +482,9 @@ async function driveWithAnswers(values, signed, options, cancelAfterMs, answerin
       })
       .catch((error) => ({ answers: [], error }));
   }
-  let report;
+  let driven;
   try {
-    report = await drive(adapter, signed, options, cancelAfterMs);
+    driven = await drive(adapter, signed, options, cancelAfterMs);
   } finally {
     controller.abort();
     await adapter.close();
@@ -479,7 +494,7 @@ async function driveWithAnswers(values, signed, options, cancelAfterMs, answerin
     answering.close();
     await answerer.close().catch(() => 1);
   }
-  return { report, answers: loopResult.answers, loopError: loopResult.error ?? null };
+  return { ...driven, answers: loopResult.answers, loopError: loopResult.error ?? null };
 }
 
 /**
@@ -514,6 +529,47 @@ function renderOutput(output, outDir) {
   };
 }
 
+/** What a capacity wait's `scheduling` says is full: the running bound, or a floor the host is below. */
+function describeScheduling(scheduling) {
+  if (scheduling === null) return "the node reports no scheduling";
+  const full = [`the node runs ${scheduling.running} of ${scheduling.max_running} attempts`];
+  if (scheduling.memory_floor_bytes > 0 && scheduling.memory_available_bytes < scheduling.memory_floor_bytes) {
+    full.push(`${scheduling.memory_available_bytes} bytes of memory available, below its floor of ${scheduling.memory_floor_bytes}`);
+  }
+  if (scheduling.disk_floor_bytes > 0 && scheduling.disk_available_bytes < scheduling.disk_floor_bytes) {
+    full.push(`${scheduling.disk_available_bytes} bytes of disk available, below its floor of ${scheduling.disk_floor_bytes}`);
+  }
+  return full.join(", ");
+}
+
+function printCapacityWait(wait) {
+  process.stderr.write(
+    `control-plane: start (operation ${wait.operation_id}) refused capacity_exhausted: ${describeScheduling(wait.scheduling)}; ` +
+      `sending the same start again in ${wait.delay_ms} ms (retry ${wait.retry})\n`,
+  );
+}
+
+/**
+ * List the capacity waits in the outcome of a run that met `capacity_exhausted`, and say
+ * on stderr when it ended there: the attempt is admitted and ready, and a replay sends the
+ * same start again.
+ */
+function withCapacity(outcome, report, capacityWaits, waitSecs) {
+  const refused = capacityExhausted(report);
+  if (capacityWaits.length > 0 || refused) outcome.capacity_waits = capacityWaits;
+  if (refused && !outcome.cancelled) {
+    const start = report.operations?.find((operation) => operation.verb === "start")?.operation_id;
+    const how =
+      waitSecs > 0
+        ? `stayed at capacity for ${waitSecs} s (${capacityWaits.length} retries of start operation ${start})`
+        : `is at capacity (start operation ${start} refused capacity_exhausted, no wait)`;
+    process.stderr.write(
+      `control-plane: the node ${how}; the attempt is admitted and ready: replay --attempt ${report.binding?.attempt} sends the same start again\n`,
+    );
+  }
+  return outcome;
+}
+
 function emit(object) {
   process.stdout.write(`${JSON.stringify(object)}\n`);
 }
@@ -523,14 +579,17 @@ function exitStatusOf(outcome) {
   return outcome.outcome === "completed" && !outcome.cancelled && !outcome.outputMissing ? 0 : 1;
 }
 
-/** Drive a run to its outcome, cancelling on SIGINT/SIGTERM and after `cancelAfterMs` if set. */
+/**
+ * Drive a run to its outcome, cancelling on SIGINT/SIGTERM and after `cancelAfterMs` if
+ * set; resolves with the report and the capacity waits it took.
+ */
 async function drive(adapter, signed, options, cancelAfterMs) {
   let timer = null;
   const cancel = () => adapter.cancel();
   process.once("SIGINT", cancel);
   process.once("SIGTERM", cancel);
   try {
-    const { report } = await adapter.run(signed, {
+    const { report, capacityWaits } = await adapter.run(signed, {
       ...options,
       onEvent: (event) => {
         if (cancelAfterMs !== undefined && timer === null && event.event === "state" && event.state === "running") {
@@ -538,7 +597,7 @@ async function drive(adapter, signed, options, cancelAfterMs) {
         }
       },
     });
-    return report;
+    return { report, capacityWaits };
   } finally {
     if (timer !== null) clearTimeout(timer);
     process.off("SIGINT", cancel);
@@ -608,6 +667,7 @@ async function run(values, argv) {
   const session = idOf("sess", values.session ?? callerAttempt);
   const budgetMs = integer(values, "budget-ms");
   const validForMs = integer(values, "valid-for-ms", 15 * 60_000);
+  const capacityWaitSecs = integer(values, "capacity-wait-secs", 30);
   // The grants, the policy and the node's offer of a credential broker and of approval
   // holds are checked before a version is allocated or anything is signed.
   const workloadManifest = manifestOf(values, budgetMs);
@@ -651,10 +711,10 @@ async function run(values, argv) {
   };
   // The record goes to disk before the first byte is sent, so a restart can replay it.
   saveRunRecord(join(stateDir, "runs"), record);
-  const { report, answers, loopError } = await driveWithAnswers(
+  const { report, capacityWaits, answers, loopError } = await driveWithAnswers(
     values,
     signed,
-    { operationIds: ids, taskRoot: record.task_root ?? undefined },
+    { operationIds: ids, taskRoot: record.task_root ?? undefined, capacityWaitMs: Math.min(capacityWaitSecs * 1000, validForMs), onCapacityWait: printCapacityWait },
     values["cancel-after"] === undefined ? undefined : integer(values, "cancel-after"),
     answering === null ? null : { ...answering, runDir: join(stateDir, "runs") },
   );
@@ -664,16 +724,20 @@ async function run(values, argv) {
   if (workloadManifest?.credentials !== undefined) outcome.credentials = workloadManifest.credentials;
   if (workloadManifest?.hold !== undefined) outcome.hold = workloadManifest.hold;
   if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
+  withCapacity(outcome, report, capacityWaits, capacityWaitSecs);
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
 
 async function replay(values) {
+  if (values["capacity-wait-secs"] !== undefined) {
+    throw new UsageError("replay sends the recorded run once; --capacity-wait-secs is run's (a replay at capacity is refused, and is sent again by another replay)");
+  }
   const runs = join(need(values, "state-dir"), "runs");
   const record = loadRunRecord(runs, wardId(values, "attempt", "exec"));
   const granted = actionsGrantOf(record.envelope_json) !== null;
   const answering = policyOf(values, granted);
-  const { report, answers, loopError } = await driveWithAnswers(
+  const { report, capacityWaits, answers, loopError } = await driveWithAnswers(
     values,
     { envelope_json: record.envelope_json, proof: record.proof, binding: record.binding },
     { operationIds: operationIds(record.operation_ids.start_at), taskRoot: record.task_root ?? undefined },
@@ -695,6 +759,7 @@ async function replay(values) {
   if (hold !== null) outcome.hold = hold;
   const agentAdapter = agentAdapterOf(record.envelope_json);
   if (agentAdapter !== null) outcome.agent_adapter = agentAdapter;
+  withCapacity(outcome, report, capacityWaits, 0);
   emit({ ...outcome, output: renderOutput(outcome.output, values["out-dir"]) });
   return withLoop(exitStatusOf(outcome), outcome, loopError);
 }
