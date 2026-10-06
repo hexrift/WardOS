@@ -13,6 +13,7 @@
 //! hold it, and `ask` passes through as before.
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::fd::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 use serde::{Deserialize, Serialize};
 use ward_events::{ClaimKind, ObserverSource, Origin, PayloadText, WardEvent};
 use ward_policy::ObserverMode;
@@ -282,6 +284,9 @@ pub struct Hooks {
     /// the claims is what makes the cutover exact — see [`Bounded`].
     claims: Arc<Bounded<Claim>>,
     shutdown: Arc<AtomicBool>,
+    /// Ends the accept thread's park in `poll(2)` without going through the socket
+    /// path, which a scratch sweep may already have unlinked (#417).
+    wake: UnixStream,
     /// The accept thread, taken by whichever of `quiesce`/`stop` runs first.
     thread: Mutex<Option<JoinHandle<()>>>,
 }
@@ -330,6 +335,9 @@ impl Hooks {
         let socket = dir.join("hooks.sock");
         let listener = UnixListener::bind(&socket)
             .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
+        let (wake, wake_rx) = UnixStream::pair()
+            .and_then(|pair| listener.set_nonblocking(true).map(|()| pair))
+            .map_err(|e| Error::Sandbox(format!("hook socket {}: {e}", socket.display())))?;
         let claims = Arc::new(Bounded::new(max_claims));
         // Handler threads in flight, tracked in the claim queue's own lock. The accept
         // loop never serves a connection itself: it spawns a handler up to
@@ -343,10 +351,20 @@ impl Hooks {
             let (claims, shutdown) = (claims.clone(), shutdown.clone());
             std::thread::spawn(move || {
                 let protected = Arc::new(protected);
-                for stream in listener.incoming().flatten() {
+                loop {
+                    let mut fds = [
+                        PollFd::new(listener.as_fd(), PollFlags::POLLIN),
+                        PollFd::new(wake_rx.as_fd(), PollFlags::POLLIN),
+                    ];
+                    // An interrupted park just falls through: the listener is
+                    // non-blocking, so an accept with nothing pending returns at once.
+                    let _ = poll(&mut fds, PollTimeout::NONE);
                     if shutdown.load(Ordering::SeqCst) {
                         break;
                     }
+                    let Ok((stream, _)) = listener.accept() else {
+                        continue;
+                    };
                     if !claims.enter(max_handlers) {
                         // Defined overload response: refuse and close at once (never block
                         // the accept loop), counted so the drop is surfaced on the next
@@ -381,6 +399,7 @@ impl Hooks {
             socket,
             claims,
             shutdown,
+            wake,
             thread: Mutex::new(Some(thread)),
         })
     }
@@ -425,19 +444,24 @@ impl Hooks {
         out
     }
 
-    /// Flag shutdown and unblock and join the accept thread, so no further
+    /// Flag shutdown and wake and join the accept thread, so no further
     /// connection is served. Idempotent; the handlers already in flight are not
     /// touched.
+    ///
+    /// The wake is the private socket pair, never a connection to [`socket`](Self::socket):
+    /// the socket file lives in the run directory, which the daemon's scratch sweep
+    /// removes once the session's log is sealed — a `Stop` can seal it while this
+    /// launch is still winding down — and a wake that cannot reach the listener
+    /// left this join waiting forever (#417).
     fn stop_accepting(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
-        // Unblock the accept loop; it sees the flag and exits.
-        drop(UnixStream::connect(&self.socket));
         let thread = self
             .thread
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
         if let Some(thread) = thread {
+            drop((&self.wake).write_all(&[1]));
             drop(thread.join());
         }
     }
@@ -1539,5 +1563,25 @@ mod tests {
         for a in held {
             let _ = a.join();
         }
+    }
+
+    #[test]
+    fn quiesce_and_stop_return_once_the_socket_file_is_gone() {
+        // #417: the scratch sweep can remove the run directory while a stopped launch
+        // is still finishing, so shutting the broker down must not need the socket path.
+        let dir = tempfile::tempdir().unwrap();
+        let hooks = Hooks::start(dir.path(), step(false, false), protected()).unwrap();
+        std::fs::remove_file(hooks.socket()).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let lost = hooks.quiesce(Duration::ZERO);
+            hooks.stop();
+            done_tx.send(lost).unwrap();
+        });
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(10)),
+            Ok(0),
+            "the accept thread was never woken"
+        );
     }
 }
