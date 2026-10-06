@@ -12,15 +12,17 @@ whose migration map this document makes concrete; the node's contract is
 [node-security-limitations.md](node-security-limitations.md).
 
 Two things this document does not do. It does not promise dates: stages 2 to 4 below are
-not scheduled, and where no issue exists it says so. And it describes no data migration,
-because none exists yet and none is needed today: the two modes keep separate state and
-neither reads or converts the other's.
+not scheduled, and where no issue exists it says so. And it converts no data: the two
+modes keep separate state and neither rewrites the other's. The one migration there is,
+`ward node migrate` ([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md), §3.5),
+carries an installation into a local node of its own by importing its retained snapshots
+and recording its evidence and policy where they are, never by converting them.
 
 ## 1. The two modes, side by side
 
 | | Per-session mode | Node mode |
 | --- | --- | --- |
-| What starts it | `ward up` in a project directory (or `ward claude`, `ward codex`, `ward run`) | The operator starts `ward-node --socket … --state-dir … --node-id … --trusted-issuers … --task-root …` as a service of the host (node-integration.md §2.1, node-integration-guide.md §3) |
+| What starts it | `ward up` in a project directory (or `ward claude`, `ward codex`, `ward run`) | The operator starts `ward-node --socket … --state-dir … --node-id … --trusted-issuers … --task-root …` as a service of the host (node-integration.md §2.1, node-integration-guide.md §3); on an installation `ward node migrate` moved into local node mode, `ward node serve` starts it on the node home's paths (ADR-0040) |
 | What runs | One `wardd serve` per session, spawned detached by `ward up`, owning the session's hash chain and control socket ([ADR-0015](decisions/ADR-0015-single-writer-daemon.md)); the bubblewrap sandbox, the egress proxy and the hook listener in the `ward` process that launched them (ADR-0013); the trusted verifier on `ward verify` | One `ward-node` process for the host, serving a Unix socket on protocol 1.0 to 1.3 ([compatibility.md](compatibility.md)); one bubblewrap sandbox per admitted attempt, spawned and reaped by the node through `ward-launch` ([ADR-0030](decisions/ADR-0030-node-task-admission-and-execution-ownership.md) §3) |
 | Unit of work | A session: a project worktree, an agent, a policy, from `ward up` to `ward stop` | A task attempt: an argv over an imported snapshot with a wall-clock budget, from `admit` to `seal` |
 | Who owns authority | The local user, through policy: `.ward/policy.yaml` merged with the user and system policy into a capability manifest that only narrows (security-model.md G7) | An external control plane, through an issuer key the node's operator put in the trust store; the node admits only a signed, audience-bound, versioned envelope and verifies it before anything is materialised (ADR-0030 §2) |
@@ -40,6 +42,7 @@ neither reads or converts the other's.
 | --- | --- | --- |
 | A session | A task attempt | A session may launch many commands; an attempt runs one argv and ends. A retry is a new attempt under a new envelope, never a re-run (ADR-0030 §6) |
 | `ward up` | `create`, then `admit`, then `start` | `ward up` also records the project's current session and takes the entry snapshot; the node materialises a snapshot the operator imported beforehand with `ward-node snapshot import` |
+| `ward run` | `ward run --via-node` | In local node mode (ADR-0040 §3): one attempt over a fresh or a migrated snapshot, signed by the local issuer, `create` to `seal`, the project's policy compiled into the manifest or refused by name; the worktree is not written and nothing runs in-process |
 | `ward pause` / `ward resume` | `pause` / `resume` | Both freeze the whole process tree and confirm it before answering. The session pause also closes the proxy, suspends credential grants and holds approvals (security-model.md G13); the node has none of those to hold. The node freeze is signal-only and never uses the cgroup freezer |
 | `ward stop` | `stop`, then `seal` | `ward stop` terminates, confirms, records `WorkloadsTerminated`, `SessionEnded` and seals in one operation; on the node, `stop` ends the attempt with a `failed` receipt and `seal` is a separate verb |
 | No counterpart | `revoke` | Revocation is durable before the kill and refuses every later `admit` or `start` under the lease, across restarts (node-integration.md §2.5). The per-session equivalent is the user's own policy change, which applies to the next session only (G7) |
@@ -78,10 +81,11 @@ neither reads or converts the other's.
   socket (`desktop.md`). None of them reads an attempt evidence log or drives a node.
 - **Verification.** `ward verify` and TamperWard act on a session. The node reports what
   it did; certification is the control plane's (ADR-0029 non-goals, node-security-limitations.md §3.3).
-- **The local issuer.** ADR-0030 §2 describes a local issuer key the `ward` CLI would
-  sign with. At this revision the `ward` CLI does not sign or send anything to a node;
-  a key is made and used with `ward-node-client` or the adapter (node-integration.md §11),
-  whoever runs it.
+- **The local issuer.** ADR-0030 §2 describes a local issuer key the `ward` CLI signs
+  with. `ward node migrate` creates it (mode 0600, in the node home) and puts it in the
+  node's trust store, and `ward run --via-node` signs with it (ADR-0040); no other `ward`
+  command signs or sends anything to a node. Outside local node mode a key is made and
+  used with `ward-node-client` or the adapter (node-integration.md §11), whoever runs it.
 
 ## 2. Coexistence today
 
@@ -95,11 +99,11 @@ changes the other.
 | Code | `ward-launch` (the bubblewrap launch, freeze and kill primitives; `ward-daemon` re-exports them unchanged), `ward-events` (records, chain, wire format, log reader and writer), `ward-snapshot` (content-addressed store), `ward-proxy` (the egress proxy and its policy, which the node runs once per attempt with a network allowlist) | `ward-daemon` is not a dependency of `ward-node` (ADR-0030 §3), and `ward-node-protocol` does not depend on `ward-policy`: the envelope's `network` manifest repeats `ward-policy`'s spelling and host grammar in its own types. The node has no in-sandbox relay, no vault, no hook broker and no verifier |
 | Binaries | `ward` (for `ward replay`, `ward doctor`) | `wardd`, `ward-agent` on one side; `ward-node`, `ward-node-adapter` on the other |
 | Format | The event log: one catalogue, one frame format, one `HEAD` (§4.1) | The origin: `node` appears only in attempt logs, never in a session log, and no session origin appears in an attempt log |
-| State | Nothing | `~/.local/state/ward` (or `$WARD_STATE_DIR`) for sessions; `--state-dir` and `--task-root` (mode 0700) for the node |
-| Snapshot store | The format | The stores. A session's entry snapshot is not visible to the node and an imported snapshot is not visible to a session |
+| State | Nothing | `~/.local/state/ward` (or `$WARD_STATE_DIR`) for sessions; `--state-dir` and `--task-root` (mode 0700) for the node. In local node mode those are `<state>/node/state` and `<state>/node/tasks`, inside the node home `ward node migrate` made, which no session command writes (ADR-0040 §1) |
+| Snapshot store | The format | The stores. A session's entry snapshot is not visible to the node unless `ward node migrate` imported it (a copy, verified by digest), and an imported snapshot is not visible to a session |
 | Sockets | Nothing | `sessions/<id>/control.sock` (0600, JSON lines, per session); the node's `--socket` (0600, or 0660 with `--client-group`; protocol 1.x framing). Neither speaks the other's protocol and neither falls back to the other (node-integration.md §4, node_readiness.rs) |
 | Unix identity | Nothing, by design | The login user for sessions; a system user for the node, with listed client uids where the adapter runs as a second user (#378) |
-| Policy files | Nothing is read by both | `.ward/`, `.tamperward/config.yml` and `.tamperward.yml` are read by the per-session tools only; the node reads its trust store, its state and its task root only |
+| Policy files | Nothing is read by both | `.ward/`, `.tamperward/config.yml` and `.tamperward.yml` are read by the per-session tools only, `.ward/policy.yaml` also by `ward run --via-node` to compile the envelope it signs; the node reads its trust store, its state and its task root only |
 
 ### 2.2 `ward doctor`
 
@@ -111,7 +115,9 @@ with a `hello` only, and prints one of `binary_absent`, `not_configured`,
 work, requests no capabilities, and an incompatible or absent node never changes what the
 per-session commands do. Set the variable to the node's socket to check a node from the
 host (node-integration-guide.md §3); leave it unset on a host with no node and the line
-reads `not_configured`.
+reads `not_configured`. A second line, `node mode`, names the installation's mode:
+`per-session`, or `local-node` with the node and its home once `ward node migrate` has run
+(ADR-0040 §2); `ward node status` re-checks what that migration carried.
 
 ### 2.3 Installing both
 
@@ -140,7 +146,7 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
 | 1 | Task driving by an external control plane, as a uid of its own on the node's host, through the adapter | A control plane outside WardOS runs attempts end to end from its own identity without sharing the node's uid, reads receipts and verifies evidence logs, following the integration guide alone | The client-uid allowlist (#378, done) and node-integration-guide.md (#374, done); the control plane's side is outside WardOS. A control plane on another host reaches the node over mutual TLS (`--listen-tls`, ADR-0038, done); enrolment, attestation, revocation and key bootstrap remain [#262](https://github.com/hexrift/WardOS/issues/262) |
 | 2 | Producer tasks: workloads that fetch a dependency, call a provider or hand a result back | A manifest with `network.custom` is honoured through a node-owned egress proxy with the session proxy's rules; an attempt's output or workspace reaches the control plane in a bounded form the protocol carries; `network.proxy_allowlist` and `snapshots.read` or an output capability read `true` | Both halves by #332: the network half (`--network-allowlist`, node-integration.md §9; done) and the result half (`--output-return`, the manifest's `output` grant, `result` and the `output` capability section, node-integration.md §6.6; done). A workspace export as a snapshot (`snapshots.read`) has no issue yet (node-security-limitations.md §3.2) |
 | 3 | A hosted agent runtime: the conversation loop inside the sandbox, with approvals and credentials as node capabilities | A workload can ask the control plane a question and get an answer through a channel relayed by the node; a credential reaches a workload only brokered, scoped and revocable, with `credentials.proxy_injection` or `scoped_http_gateway` `true`; approvals are a node-mediated hold rather than a per-session daemon hold | The channel by [#404](https://github.com/hexrift/WardOS/issues/404) (`--action-channel`, the manifest's `actions` grant, `actions` and `answer`, node-integration.md §6.7, ADR-0031; done); [#267](https://github.com/hexrift/WardOS/issues/267) for credentials (first node slice done, ADR-0034); [#415](https://github.com/hexrift/WardOS/issues/415) for approvals as an enforced node capability (`--approval-hold`, the manifest's `hold`, node-integration.md §6.9, ADR-0035; done) |
-| 4 | Local sessions themselves: the desktop reads attempt evidence and drives node tasks, `ward up` is a thin client of a local node, per-session `wardd` is retired | `ward up`, `ward pause`, `ward resume`, `ward stop`, `ward verify`, `ward watch` and the desktop behave as they do today against a local node with no remote control plane; the single evidence writer of a session is the node; no command falls back to an in-process writer | [#258](https://github.com/hexrift/WardOS/issues/258)'s open slices ("Multi-session ownership and restart recovery", "Preserve current local CLI behaviour through the node boundary"); ADR-0029's migration map rows for the CLI, the per-session writer and the desktop; [#260](https://github.com/hexrift/WardOS/issues/260) for the scheduler several sessions need. The local-and-remote CLI issue (#272) was closed as superseded by #332 |
+| 4 | Local sessions themselves: the desktop reads attempt evidence and drives node tasks, `ward up` is a thin client of a local node, per-session `wardd` is retired | `ward up`, `ward pause`, `ward resume`, `ward stop`, `ward verify`, `ward watch` and the desktop behave as they do today against a local node with no remote control plane; the single evidence writer of a session is the node; no command falls back to an in-process writer | The migration and the first CLI path by [#278](https://github.com/hexrift/WardOS/issues/278) (`ward node migrate`, `ward run --via-node`, `ward node serve`; ADR-0040; first slice done); [#258](https://github.com/hexrift/WardOS/issues/258)'s open slices ("Multi-session ownership and restart recovery", "Preserve current local CLI behaviour through the node boundary"); ADR-0029's migration map rows for the CLI, the per-session writer and the desktop; [#260](https://github.com/hexrift/WardOS/issues/260) for the scheduler several sessions need. The local-and-remote CLI issue (#272) was closed as superseded by #332 |
 
 ### 3.1 Stage 0: the node beside per-session development
 
@@ -320,23 +326,34 @@ scheduled; where a row says "no issue yet", none has been opened at this revisio
   session's state moves from `~/.local/state/ward/sessions/<id>/` to the node's task root
   under the node's uid, which is the one place in this path where existing on-disk state
   changes hands. #278's acceptance ("an existing local installation can upgrade into
-  local ward-node mode without losing project policy, pinned snapshots or evidence") is
-  met at this stage only with an explicit import of the session CAS and the sealed logs
-  into the node's stores, read-only for the logs, with the prior tree left in place until
-  the import verifies. That importer does not exist and has no issue yet. The session log
-  and the attempt log also have to be reconciled into one shape: today a session is many
-  launches and an attempt is one, and the single-writer rule of ADR-0015 moves from the
-  per-session daemon to the node (ADR-0030 §3: "ADR-0015 is unchanged for local sessions
-  ... until ownership migrates").
+  local ward-node mode without losing project policy, pinned snapshots or evidence") needs
+  an explicit, verified, reversible migration before any of that, and its first slice is
+  in place ([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md)): `ward node
+  migrate` refuses an unsealed or unverifying session log, imports every snapshot the
+  per-session runtime retains into the node's store verified by digest, leaves every
+  sealed log and every policy file where it is and records each by BLAKE3, creates the
+  local issuer key (0600) and the trust store naming it, and commits all of it with one
+  rename of a staging directory, so a failure leaves the prior state byte-identical and
+  `--rollback` restores it. The logs are recorded, not imported: an attempt log and a
+  session log are verified against their own origin sets (§4.1), and evidence is never
+  copied into a second place. `ward run --via-node` then runs one attempt on that node.
+  The session log and the attempt log still have to be reconciled into one shape: today a
+  session is many launches and an attempt is one, and the single-writer rule of ADR-0015
+  moves from the per-session daemon to the node (ADR-0030 §3: "ADR-0015 is unchanged for
+  local sessions ... until ownership migrates").
 - **Rollback.** Keep the per-session binaries of the previous release installed beside
   the node; a session started by the old `wardd` is still stopped and sealed by the old
   `ward`. A release that retires `wardd` needs a documented release boundary and a
   migration path first (ADR-0029's compatibility policy, compatibility.md §3), and must
   not partially import evidence: an import that fails leaves the prior state as it was
-  (#278).
-- **Issues.** [#258](https://github.com/hexrift/WardOS/issues/258)'s two open slices;
+  (#278). For the migration that exists, `ward node migrate --rollback` is that path back:
+  it refuses while the node serves, renames the node home aside in one step, and removes it
+  unless attempts ran under it, whose evidence it keeps (ADR-0040 §2).
+- **Issues.** [#278](https://github.com/hexrift/WardOS/issues/278) for the migration and
+  the first CLI path (first slice done, ADR-0040; what remains is ADR-0040's last section);
+  [#258](https://github.com/hexrift/WardOS/issues/258)'s two open slices;
   [#260](https://github.com/hexrift/WardOS/issues/260); the desktop and `ward up` work
-  has no issue of its own yet beyond #258's slice, and the evidence importer has none.
+  has no issue of its own yet beyond #258's slice.
 
 ## 4. Compatibility statement
 
@@ -391,15 +408,21 @@ control plane, the upgrade order and the major-version rule are
 Node mode reads none of a project's files. `.ward/policy.yaml`, `.tamperward/config.yml`
 and `.tamperward.yml` keep their meaning and their readers (`ward up`, `ward verify`,
 `ward ready`, TamperWard), and `ward init` is unchanged. The envelope's capability
-manifest borrows `ward-policy`'s spelling for `network` so that a future importer of a
-project policy produces the same words, but no such importer exists and the manifest has
-no field for the rest of a policy yet (§1.1). The session CAS, the vault and every
+manifest borrows `ward-policy`'s spelling for `network`, and `ward run --via-node` compiles a
+project's effective policy into it (ADR-0040 §4): `offline`, `!custom` and the
+`registries` and `development` presets (as the very host lists the session proxy matches)
+compile; anything the node cannot enforce as a session would (an `ask` or `allow`
+credential, step-through observation, a mount narrower than the node gives, loopback-only
+or unrestricted egress) is refused by name, never dropped. The node itself still reads no
+policy file. The session CAS, the vault and every
 `sessions/<id>/` directory are untouched by a node on the same host.
 
 ### 4.4 What a per-session user must not do
 
 - **Do not point a node at a per-session state directory**, or at any directory with
-  content in it. `--state-dir` and `--task-root` are the node's own, created mode 0700
+  content in it. The node home `ward node migrate` makes (`<state>/node/`) is not one: it
+  is a new directory of the node's own, and the node it configures reads nothing outside
+  it. `--state-dir` and `--task-root` are the node's own, created mode 0700
   and refused if group- or world-accessible; the node pins its id there and writes its
   records, revocations and snapshot store into it. `~/.local/state/ward` is the session
   tree, mode and layout both wrong for a node, and sharing it would put session logs
@@ -448,25 +471,31 @@ no field for the rest of a policy yet (§1.1). The session CAS, the vault and ev
 
 #278 asks that an existing local installation can upgrade into local node mode without
 losing policy, pinned snapshots or evidence, that a failed migration leaves a recoverable
-prior state, and that fleet features can be enabled incrementally. At this revision:
+prior state, and that fleet features can be enabled incrementally. At this revision
+([ADR-0040](decisions/ADR-0040-local-node-mode-migration.md)):
 
-- **Policy, snapshots and evidence are not lost** because nothing migrates them: the two
-  modes keep separate state and the per-session tree is never read or written by a node
-  (§2.1, §4.3). This satisfies the letter for stages 0 to 3 and defers the substance to
-  stage 4, where session ownership changes hands and an importer with a verified,
-  reversible outcome is required (§3.5). That importer has no issue yet.
-- **A recoverable prior state** is the rollback column of each stage: remove the node
-  service (stage 0 and 1), roll back a node release and let the handshake fail closed
-  (stages 2 and 3), keep the previous release's per-session binaries beside the node
-  (stage 4).
-- **Incremental enablement** is what the protocol's additive minors and the capability
-  document give: a control plane learns from `capabilities` what a node offers and must
-  never assume more (node-integration.md §5), and a node refuses a grant it cannot enforce
-  rather than approximate it (§7.5). There are no feature flags beyond that; the node's
-  own flags (`--task-root`, `--client-uid`, `--client-group`) enable execution and shared
-  access and nothing else.
+- **Policy, snapshots and evidence are not lost.** `ward node migrate` imports every
+  snapshot the per-session runtime retains into the node's store, verified by digest, and
+  leaves every sealed session log and every policy file in place, recorded by BLAKE3 (the
+  logs with their chain heads), so `ward replay --verify` keeps verifying them and `ward
+  node status` shows them unchanged. Nothing of the session tree is written.
+- **A recoverable prior state.** The migration is staged beside the session tree and
+  committed by one rename; a failure before it leaves the prior state byte-identical, and
+  `ward node migrate --rollback` returns to per-session mode, removing the node home or,
+  when attempts ran under it, keeping it aside with their evidence. For the node itself,
+  the rollback column of each stage still holds.
+- **Upgrade into local node mode** means, in this first slice, that the node serves the
+  installation's own home (`ward node serve`) and `ward run --via-node` runs a session's
+  command on it as one attempt signed by the local issuer and sealed by the node. `ward up`
+  and the interactive commands stay per-session until #258 (§3.5).
+- **Incremental enablement** is the same node's flags: `ward node serve -- …` passes
+  mutual TLS, a control plane's issuer beside the local one in the node home's trust store,
+  credentials, the action channel and holds, adapters, cgroups, a bound on concurrent
+  attempts and containers, each discovered by a control plane through `capabilities`
+  (node-integration.md §5) and refused at `admit` when absent (§7.5), none needing the
+  installation to migrate again (ADR-0040 §5).
 - **Upgrade tests across releases** do not exist: CI tests one commit against itself
   (node-release-readiness.md §3), and the protocol tests cover skew between a node and a
   peer at the same commit (compatibility.md §7). A test that reads a log sealed by a
-  previous release, or drives a node from a previous release's client, is still to be
-  written and has no issue yet.
+  previous release, migrates an installation a previous release wrote, or drives a node
+  from a previous release's client, is still to be written and has no issue yet.
