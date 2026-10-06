@@ -76,9 +76,10 @@ single source of truth is `version` under `[workspace.package]` in the root
 **The node train has a version of its own** (issue #275). `crates/ward-node` and
 `crates/ward-node-client` carry a literal `version` that `ward-node --version` prints
 and that names the node tarball, `ward-node-<node version>-<arch>-linux.tar.gz`. It
-moves exactly when the node's inputs move: the crates in the node's dependency
-closure (without their tests), the locked third-party packages of that closure, the
-toolchain and the release profile. A release that changes none of them ships the same
+moves exactly when the node's inputs move: the crates in the dependency closure of the
+node and of the `ward-agent` shim the node tarball also ships (without their tests),
+the locked third-party packages of that closure, the toolchain and the release profile.
+A release that changes none of them ships the same
 node version again; one that changes any of them must raise it.
 `scripts/release/node-version.sh` enforces both directions against the previous
 release tag, in `prepare-version.sh` and in the release workflow before anything is

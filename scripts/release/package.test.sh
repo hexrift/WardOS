@@ -68,22 +68,28 @@ want="$(printf '%s\n' \
 $(diff <(printf '%s\n' "$want") <(listing "$c/dist/$runtime.tar.gz") || true)"
 echo "ok   the runtime tarball carries the five binaries, install.sh, README.md, LICENSE and docs/"
 
-# The node tarball: the node, the adapter, LICENSE and docs/ -- no installer (the
-# node is an operator install, node-integration-guide.md §1) and no runtime binary.
+# The node tarball: the node, the adapter, the ward-agent shim a node names with
+# --agent-shim (issue #427, ADR-0037), LICENSE and docs/ -- no installer (the node is
+# an operator install, node-integration-guide.md §1) and no other runtime binary.
 want="$(printf '%s\n' \
-  "$node" "$node/ward-node" "$node/ward-node-adapter" "$node/LICENSE" \
+  "$node" "$node/ward-node" "$node/ward-node-adapter" "$node/ward-agent" "$node/LICENSE" \
   "$node/docs" "$node/docs/node-integration-guide.md" "$node/docs/decisions" \
   "$node/docs/decisions/ADR-0001.md" | sort)"
 [[ "$(listing "$c/dist/$node.tar.gz")" == "$want" ]] ||
   fail "node tarball layout differs:
 $(diff <(printf '%s\n' "$want") <(listing "$c/dist/$node.tar.gz") || true)"
-echo "ok   the node tarball carries ward-node, ward-node-adapter, LICENSE and docs/"
+echo "ok   the node tarball carries ward-node, ward-node-adapter, ward-agent, LICENSE and docs/"
 
 # The packaged binaries are the built ones, executable, under their own names.
 mkdir -p "$c/unpack" && tar -C "$c/unpack" -xzf "$c/dist/$node.tar.gz"
 [[ "$("$c/unpack/$node/ward-node-adapter")" == "ward-node-adapter" ]] ||
   fail "node tarball: ward-node-adapter is not the built binary"
 cmp -s "$c/bin/ward-node" "$c/unpack/$node/ward-node" || fail "node tarball: ward-node differs from the built binary"
+# The shim is the same build the runtime tarball carries, executable as shipped: the
+# node refuses a shim its owner may not execute.
+cmp -s "$c/bin/ward-agent" "$c/unpack/$node/ward-agent" || fail "node tarball: ward-agent differs from the built binary"
+[[ -f "$c/unpack/$node/ward-agent" && ! -L "$c/unpack/$node/ward-agent" && -x "$c/unpack/$node/ward-agent" ]] ||
+  fail "node tarball: ward-agent is not an executable regular file"
 echo "ok   the node tarball's binaries are the built ones"
 
 # The two trains carry their own versions (issue #275): the node tarball is named by
@@ -108,6 +114,13 @@ c="$(fresh_case no-adapter)"
 rm "$c/bin/ward-node-adapter"
 expect_status 1 "a build without ward-node-adapter is refused" \
   bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
+
+# The shim is part of the node train (issue #427): a build without it ships neither.
+c="$(fresh_case no-shim)"
+rm "$c/bin/ward-agent"
+expect_status 1 "a build without ward-agent is refused" \
+  bash "$sut" "$version" "$node_version" "$arch" "$c/bin" "$c/dist" "$c/src"
+[[ -z "$(ls -A "$c/dist")" ]] || fail "no-shim: something was written to dist despite the refusal"
 
 c="$(fresh_case no-ward)"
 rm "$c/bin/ward"

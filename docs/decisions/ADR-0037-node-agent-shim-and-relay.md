@@ -99,9 +99,10 @@ remains).
 
 ## Alternatives
 
-* **The shim beside the node binary, as `wardd` finds it.** The node tarball does not carry
-  one, and a file that happens to sit next to the binary would become code run in every
-  adapter's sandbox without the operator naming it. Rejected for an explicit, verified flag.
+* **The shim beside the node binary, as `wardd` finds it.** A file that happens to sit next
+  to the binary would become code run in every adapter's sandbox without the operator
+  naming it, and that holds now that the node tarball carries the shim (#427) as much as
+  when it did not. Rejected for an explicit, verified flag.
 * **A relay in the node process.** A listener on the host is unreachable from a namespace
   that holds only loopback; the node would have to enter each attempt's namespace. Rejected.
 * **A relay of the node's own inside the sandbox.** It would duplicate the shim's, and the
@@ -177,7 +178,9 @@ and `ward-agent-adapter`), so the next release must raise the node version (CONT
 
 ## What remains
 
-* Ship the shim in the node tarball (it would join the node train's inputs, #275).
+* Ship the shim in the node tarball (it would join the node train's inputs, #275). Done by
+  #427: the node tarball carries `ward-agent`, `node-version.sh` counts it among the
+  node's inputs, and node-integration-guide.md §1 installs it.
 * Say in the capability document that hosted adapters run under a shim with a relay.
 * A real-runtime conformance run in CI (ADR-0033 §8).
 * A `node-js.sh` case of the shipped node with a shim.

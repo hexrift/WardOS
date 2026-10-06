@@ -21,10 +21,15 @@
 #                wardos-theme-render (the five the image's release stage expects,
 #                image/Containerfile; tarballs before v0.2 carried only the first
 #                three), install.sh, README.md, LICENSE and a copy of docs/.
-#   ward-node-…  the node, under the node version: ward-node and ward-node-adapter,
-#                LICENSE and the same copy of docs/. No installer: the node is an operator install
-#                (docs/node-integration-guide.md §1), not part of install.sh; the
-#                image's release stage installs the two binaries from this tarball.
+#   ward-node-…  the node, under the node version: ward-node, ward-node-adapter and
+#                ward-agent, LICENSE and the same copy of docs/. ward-agent is the
+#                shim a node runs hosted adapters under (`ward-node --agent-shim`,
+#                ADR-0037, issue #427), the same build the runtime tarball carries,
+#                so an operator who installs only the node has it. No installer: the
+#                node is an operator install (docs/node-integration-guide.md §1), not
+#                part of install.sh; the image's release stage installs ward-node
+#                and ward-node-adapter from this tarball (its ward-agent comes from
+#                the runtime tarball, the same binary).
 #
 # The sidecar is sha256sum's own line for the tarball, written next to it, so
 # `sha256sum -c <name>.tar.gz.sha256` verifies it wherever both are downloaded.
@@ -55,7 +60,7 @@ semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[
 [[ -d "$source_root" ]] || die "no such source root: '$source_root'"
 
 runtime_binaries=(ward wardd ward-agent ward-shell wardos-theme-render)
-node_binaries=(ward-node ward-node-adapter)
+node_binaries=(ward-node ward-node-adapter ward-agent)
 runtime_files=(install.sh README.md LICENSE)
 node_files=(LICENSE)
 

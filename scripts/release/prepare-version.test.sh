@@ -89,9 +89,11 @@ after="$(sha256sum "$fixture/Cargo.toml" "$fixture/crates/ward-b/Cargo.toml")"
 
 # A workspace with the node crates: their own version is left alone by a release
 # that does not name one, moved by --node, and the requirement on ward-node follows
-# the node version, not the workspace's.
+# the node version, not the workspace's. It has the ward-agent crate too, whose shim
+# the node tarball ships (issue #427) and node-version.sh counts among its inputs.
 node_fixture="$tmp/node-repo"
-mkdir -p "$node_fixture/scripts/release" "$node_fixture/crates/ward-a" "$node_fixture/crates/ward-node" "$node_fixture/crates/ward-node-client"
+mkdir -p "$node_fixture/scripts/release" "$node_fixture/crates/ward-a" "$node_fixture/crates/ward-agent" \
+  "$node_fixture/crates/ward-node" "$node_fixture/crates/ward-node-client"
 cp "$repo_root/scripts/release/prepare-version.sh" "$repo_root/scripts/release/check-version.sh" \
   "$repo_root/scripts/release/node-version.sh" "$node_fixture/scripts/release/"
 
@@ -100,6 +102,7 @@ cat >"$node_fixture/Cargo.toml" <<'EOF2'
 resolver = "2"
 members = [
     "crates/ward-a",
+    "crates/ward-agent",
     "crates/ward-node",
     "crates/ward-node-client",
 ]
@@ -113,6 +116,15 @@ cat >"$node_fixture/crates/ward-a/Cargo.toml" <<'EOF2'
 name = "ward-a"
 version.workspace = true
 edition.workspace = true
+EOF2
+cat >"$node_fixture/crates/ward-agent/Cargo.toml" <<'EOF2'
+[package]
+name = "ward-agent"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ward-a = { path = "../ward-a", version = "0.18.0" }
 EOF2
 cat >"$node_fixture/crates/ward-node/Cargo.toml" <<'EOF2'
 [package]

@@ -102,12 +102,15 @@ The node protocol version and the WardOS release version are independent:
   ([node-release-readiness.md](node-release-readiness.md) §2), under the **node
   version**: the literal `version` of `crates/ward-node` and `crates/ward-node-client`,
   which `ward-node --version` prints, independent of the WardOS version
-  ([#275](https://github.com/hexrift/WardOS/issues/275)). It moves exactly when the
-  node's inputs move: `scripts/release/node-version.sh` refuses a release whose node
-  changed since the previous release without a higher node version, and one whose
-  node version changed although nothing the node is built from did, so one node
-  version names one node source across releases. The protocol version is a third
-  thing: a node version may rise without a protocol change (a fix), and a protocol
+  ([#275](https://github.com/hexrift/WardOS/issues/275)). The tarball also carries the
+  `ward-agent` shim a node names with `--agent-shim`, which keeps the release version
+  it shares with the runtime tarball but is a node input all the same
+  ([#427](https://github.com/hexrift/WardOS/issues/427)). The node version moves exactly
+  when the node's inputs move, the shim's included: `scripts/release/node-version.sh`
+  refuses a release whose node changed since the previous release without a higher
+  node version, and one whose node version changed although nothing the node is built
+  from did, so one node version names one node source across releases. The protocol
+  version is a third thing: a node version may rise without a protocol change (a fix), and a protocol
   minor arrives with a node version bump at the next release. Every release carries
   its protocol window in the release manifest
   ([release-manifest.md](release-manifest.md)), as `node_protocol_window`, read from
