@@ -28,9 +28,10 @@
 //! `runc run` is spawned through `setpriv --pdeathsig KILL` from the attempt's reaper
 //! thread and the container's first process is `setpriv --pdeathsig KILL` too, so the
 //! container dies with `runc` and `runc` with the node, as bubblewrap's
-//! `--die-with-parent` does. A stop or the budget kills `runc` and the container's init
-//! (`runc kill`), and the container is deleted (`runc delete --force`) and its bundle
-//! removed once it is reaped, whatever ended it.
+//! `--die-with-parent` does. A stop or the budget kills `runc` and every process of the
+//! container (`runc kill`, with `--all` as root so a frozen cgroup is thawed only once
+//! everything in it is killed), and the container is deleted (`runc delete --force`) and
+//! its bundle removed once it is reaped, whatever ended it.
 //!
 //! As root `runc` puts the container in cgroups of its own, and `pause` and `resume` are
 //! `runc pause` and `runc resume` (the cgroup freezer), confirmed by `runc state`, with
