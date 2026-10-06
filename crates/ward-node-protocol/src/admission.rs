@@ -20,9 +20,11 @@
 //! its `network` capability (`"offline"`, or `{"custom": [hosts]}` in its host-pattern
 //! grammar), an optional `output` grant ([`OutputGrant`]: the stdio and workspace
 //! files to return), an optional `resources` grant ([`ResourceGrant`]: the cgroup
-//! limits on the attempt's process tree) and an optional `actions` grant
-//! ([`ActionGrant`]: what the workload may ask through its action channel). Bytes outside
-//! the grammar fail envelope decoding, so a node never
+//! limits on the attempt's process tree), an optional `actions` grant
+//! ([`ActionGrant`]: what the workload may ask through its action channel) and an optional
+//! `isolation` floor ([`IsolationGrant`]: the weakest isolation level the attempt may run
+//! at, `sandbox` without one). Bytes outside the grammar fail envelope decoding, so a node
+//! never
 //! admits a manifest it cannot read. Which decoded grants a node honours is the node's
 //! decision, made at `admit`.
 
@@ -41,6 +43,7 @@ use crate::credentials::{
     CredentialError, CredentialGrantWire, CredentialGrants, grants_from_wire,
 };
 use crate::hold::{HoldError, HoldGrant, HoldGrantWire};
+use crate::isolation::{IsolationError, IsolationGrant, IsolationGrantWire, IsolationLevel};
 use crate::output::{OutputError, OutputGrant, OutputGrantWire};
 use crate::resources::{ResourceGrant, ResourceGrantWire};
 
@@ -99,6 +102,8 @@ pub enum TaskAdmissionError {
     /// The `hold` is outside its grammar (nothing held, too much, a repeat, a host or
     /// service the manifest does not grant, or no `actions` grant naming `approval`).
     MalformedHold(HoldError),
+    /// The `isolation` floor names `sandbox`, which is spelled by leaving it out.
+    MalformedIsolation(IsolationError),
     /// The workload names an adapter but its program (`argv[0]`) is not a launch program:
     /// a name on the sandbox `PATH` or an absolute path.
     AdapterProgram,
@@ -140,6 +145,7 @@ impl Display for TaskAdmissionError {
             Self::MalformedActionGrant(_) => "capability manifest actions grant is invalid",
             Self::MalformedCredentialGrant(_) => "capability manifest credentials grant is invalid",
             Self::MalformedHold(_) => "capability manifest hold is invalid",
+            Self::MalformedIsolation(_) => "capability manifest isolation floor is invalid",
             Self::AdapterProgram => {
                 "a workload naming an adapter runs a program on the sandbox PATH or at an absolute path"
             }
@@ -318,7 +324,8 @@ pub enum NetworkGrant {
 /// means the manifest asks for no limit), the optional field `actions`, an
 /// [`ActionGrant`] (absent means the attempt has no action channel), and the optional
 /// field `credentials`, [`CredentialGrants`] (absent means no credential is brokered;
-/// present, every host must be one `network.custom` covers). Unknown fields, a
+/// present, every host must be one `network.custom` covers), and the optional field
+/// `isolation`, an [`IsolationGrant`] (absent means the floor is `sandbox`). Unknown fields, a
 /// repeated field, anything that is not one JSON object and any value outside the grammar
 /// fail decoding.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -334,6 +341,8 @@ pub struct CapabilityManifest {
     credentials: Option<CredentialGrants>,
     #[serde(skip_serializing_if = "Option::is_none")]
     hold: Option<HoldGrant>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    isolation: Option<IsolationGrant>,
 }
 
 impl CapabilityManifest {
@@ -347,6 +356,7 @@ impl CapabilityManifest {
             actions: None,
             credentials: None,
             hold: None,
+            isolation: None,
         }
     }
 
@@ -403,6 +413,13 @@ impl CapabilityManifest {
         Ok(self)
     }
 
+    /// The same manifest also requiring at least the isolation of `isolation`.
+    #[must_use]
+    pub const fn with_isolation(mut self, isolation: IsolationGrant) -> Self {
+        self.isolation = Some(isolation);
+        self
+    }
+
     const fn allowlist(&self) -> Option<&HostAllowlist> {
         match &self.network {
             NetworkGrant::Offline => None,
@@ -441,6 +458,11 @@ impl CapabilityManifest {
             .map(ActionGrant::try_from)
             .transpose()
             .map_err(TaskAdmissionError::MalformedActionGrant)?;
+        let isolation = wire
+            .isolation
+            .map(IsolationGrant::try_from)
+            .transpose()
+            .map_err(TaskAdmissionError::MalformedIsolation)?;
         let manifest = Self {
             network,
             output,
@@ -448,6 +470,7 @@ impl CapabilityManifest {
             actions,
             credentials: None,
             hold: None,
+            isolation,
         };
         let manifest = match wire.credentials {
             None => manifest,
@@ -498,6 +521,22 @@ impl CapabilityManifest {
     pub const fn hold(&self) -> Option<&HoldGrant> {
         self.hold.as_ref()
     }
+
+    /// The isolation floor the manifest names, if any.
+    #[must_use]
+    pub const fn isolation(&self) -> Option<IsolationGrant> {
+        self.isolation
+    }
+
+    /// The weakest isolation level the attempt may run at: the floor the manifest names,
+    /// or `sandbox` without one.
+    #[must_use]
+    pub const fn minimum_isolation(&self) -> IsolationLevel {
+        match self.isolation {
+            Some(isolation) => isolation.minimum(),
+            None => IsolationLevel::Sandbox,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -514,6 +553,17 @@ struct CapabilityManifestWire {
     credentials: Option<Vec<CredentialGrantWire>>,
     #[serde(default, deserialize_with = "deserialize_present_hold")]
     hold: Option<HoldGrantWire>,
+    #[serde(default, deserialize_with = "deserialize_present_isolation")]
+    isolation: Option<IsolationGrantWire>,
+}
+
+fn deserialize_present_isolation<'de, D>(
+    deserializer: D,
+) -> Result<Option<IsolationGrantWire>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    IsolationGrantWire::deserialize(deserializer).map(Some)
 }
 
 fn deserialize_present_hold<'de, D>(deserializer: D) -> Result<Option<HoldGrantWire>, D::Error>
