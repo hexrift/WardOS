@@ -331,23 +331,7 @@ impl Session {
         let session = new_session_id()?;
         let session_str = session.to_string();
 
-        let project_policy = load_project_policy(&worktree)?;
-        // The host's provider-backed services (#267) enter as the system layer:
-        // only the host can introduce a service, the project can only narrow
-        // it. An unusable configuration introduces none (and every launch
-        // says why), so the session itself still starts.
-        let system_policy = crate::credentials::config::Registry::load(state)
-            .map(|r| r.policy())
-            .unwrap_or_default();
-        // `ward-policy` and `ward-events` keep independent id newtypes so each crate
-        // builds alone; bridge the same identity into the policy-crate types here.
-        let manifest = merge(
-            &system_policy,
-            &Policy::default(),
-            &project_policy,
-            ward_policy::SessionId(session_str.clone()),
-            ward_policy::ProjectId(project_id_str.clone()),
-        );
+        let manifest = effective_manifest(&worktree, state, &session_str)?;
 
         let store =
             SnapshotStore::open(state.join("cas")).map_err(|e| Error::Snapshot(e.to_string()))?;
@@ -2131,6 +2115,33 @@ fn lease_notifier(state: &Path, session: &str) -> crate::credentials::keeper::No
     })
 }
 
+/// The capability manifest a session of `session` over the canonical `worktree` gets:
+/// the host's system layer, the (empty) user layer and the project's
+/// `.ward/policy.yaml`, merged so that each layer only narrows.
+pub fn effective_manifest(
+    worktree: &Path,
+    state: &Path,
+    session: &str,
+) -> Result<CapabilityManifest> {
+    let project_policy = load_project_policy(worktree)?;
+    // The host's provider-backed services (#267) enter as the system layer:
+    // only the host can introduce a service, the project can only narrow
+    // it. An unusable configuration introduces none (and every launch
+    // says why), so the session itself still starts.
+    let system_policy = crate::credentials::config::Registry::load(state)
+        .map(|r| r.policy())
+        .unwrap_or_default();
+    // `ward-policy` and `ward-events` keep independent id newtypes so each crate
+    // builds alone; bridge the same identity into the policy-crate types here.
+    Ok(merge(
+        &system_policy,
+        &Policy::default(),
+        &project_policy,
+        ward_policy::SessionId(session.to_owned()),
+        ward_policy::ProjectId(project_id_for(worktree).to_string()),
+    ))
+}
+
 fn load_project_policy(worktree: &Path) -> Result<Policy> {
     let path = worktree.join(".ward").join("policy.yaml");
     match std::fs::read_to_string(&path) {
@@ -2456,6 +2467,30 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let policy = load_project_policy(dir.path()).unwrap();
         assert_eq!(policy, Policy::default());
+    }
+
+    #[test]
+    fn the_effective_manifest_is_the_project_policy_merged_under_the_defaults() {
+        let state = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let worktree = dir.path().canonicalize().unwrap();
+        let default = effective_manifest(&worktree, state.path(), "sess_a").unwrap();
+        assert_eq!(default.network, NetworkCapability::Development);
+        assert_eq!(default.session.0, "sess_a");
+        assert_eq!(default.project.0, project_id_for(&worktree).to_string());
+
+        std::fs::create_dir_all(worktree.join(".ward")).unwrap();
+        std::fs::write(worktree.join(".ward/policy.yaml"), "network: offline\n").unwrap();
+        let narrowed = effective_manifest(&worktree, state.path(), "sess_a").unwrap();
+        assert_eq!(narrowed.network, NetworkCapability::Offline);
+        assert_ne!(narrowed.policy_hash, default.policy_hash);
+
+        std::fs::write(
+            worktree.join(".ward/policy.yaml"),
+            "network: [not, a, mode]\n",
+        )
+        .unwrap();
+        assert!(effective_manifest(&worktree, state.path(), "sess_a").is_err());
     }
 
     #[test]
