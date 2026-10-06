@@ -4,9 +4,12 @@
 //! `ward-node` application protocol, this client's certificate and key, and the node's
 //! certificate checked against the operator's server CA for the expected server name and,
 //! when a pin is given, for the expected key. A certificate outside its validity window by
-//! more than [`CLOCK_SKEW`] is refused, as the node refuses a client's. The framing,
-//! bounds and fail-closed reading of EOF are exactly the Unix transport's.
+//! more than [`CLOCK_SKEW`] is refused, as the node refuses a client's. A node whose key
+//! is on the client's [`RevokedNodeKeys`] is refused even when it chains and is pinned.
+//! The framing, bounds and fail-closed reading of EOF are exactly the Unix transport's.
 
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::{BufReader, Read};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -91,9 +94,82 @@ pub enum TlsSetupError {
     /// The server pin is not `sha256:` and 64 lowercase hex digits.
     #[error("server pin {0:?} is not sha256: followed by 64 lowercase hex digits")]
     Pin(String),
+    /// A line of the node-key revocation list is neither a pin, blank nor a comment.
+    #[error(
+        "{path}, line {line}: malformed revoked key {value:?} (expected sha256: followed by 64 lowercase hex digits)"
+    )]
+    Revocation {
+        /// The revocation list.
+        path: PathBuf,
+        /// The line, counted from 1.
+        line: usize,
+        /// What the line holds, comment and surrounding blanks removed.
+        value: String,
+    },
     /// rustls refused the assembled configuration.
     #[error("TLS configuration: {0}")]
     Tls(String),
+}
+
+/// The node keys a client refuses even when their certificate chains to the server CA and
+/// is pinned (`ward-node-adapter --tls-server-revoked`): a node whose key leaked and was
+/// revoked. The list is spelled as the node's `--tls-client-revoked`: one pin per line,
+/// as [`TlsSettings::server_pin`] spells it, with blank lines and everything from a `#` to
+/// the end of its line ignored. A key listed twice is revoked once.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RevokedNodeKeys(BTreeSet<[u8; 32]>);
+
+impl RevokedNodeKeys {
+    /// Parse a revocation list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsSetupError::Revocation`], naming `path` and the line, for anything
+    /// but a pin, a blank or a comment on a line.
+    pub fn parse(path: &Path, text: &str) -> Result<Self, TlsSetupError> {
+        let mut revoked = BTreeSet::new();
+        for (index, line) in text.lines().enumerate() {
+            let value = line.split_once('#').map_or(line, |(value, _)| value).trim();
+            if value.is_empty() {
+                continue;
+            }
+            let pin = parse_pin(value).map_err(|_| TlsSetupError::Revocation {
+                path: path.to_owned(),
+                line: index + 1,
+                value: value.to_owned(),
+            })?;
+            revoked.insert(pin);
+        }
+        Ok(Self(revoked))
+    }
+
+    /// Read and parse the revocation list at `path`, under the rule of the certificates:
+    /// a regular file, not a symlink, writable by no one else, at most
+    /// [`MAX_TLS_FILE_BYTES`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsSetupError`] for an unsafe, unreadable, non-UTF-8 or malformed list.
+    pub fn load(path: &Path) -> Result<Self, TlsSetupError> {
+        let bytes = read(path, false)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| TlsSetupError::File {
+            path: path.to_owned(),
+            reason: "not UTF-8 text".to_owned(),
+        })?;
+        Self::parse(path, text)
+    }
+
+    /// How many keys are revoked.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether no key is revoked.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
 }
 
 /// The newline-delimited JSON transport over TCP with mutual TLS.
@@ -112,6 +188,19 @@ impl TlsTransport {
     ///
     /// Returns [`TlsSetupError`] for an unsafe or malformed file, server name or pin.
     pub fn new(settings: &TlsSettings, timeouts: Timeouts) -> Result<Self, TlsSetupError> {
+        Self::with_revoked(settings, &RevokedNodeKeys::default(), timeouts)
+    }
+
+    /// As [`Self::new`], refusing a node whose key is in `revoked`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TlsSetupError`] for an unsafe or malformed file, server name or pin.
+    pub fn with_revoked(
+        settings: &TlsSettings,
+        revoked: &RevokedNodeKeys,
+        timeouts: Timeouts,
+    ) -> Result<Self, TlsSetupError> {
         let server_name = ServerName::try_from(settings.server_name.clone())
             .map_err(|_| TlsSetupError::ServerName(settings.server_name.clone()))?;
         let pin = settings.server_pin.as_deref().map(parse_pin).transpose()?;
@@ -138,7 +227,11 @@ impl TlsTransport {
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|error| TlsSetupError::Tls(error.to_string()))?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ServerVerifier { inner, pin }))
+            .with_custom_certificate_verifier(Arc::new(ServerVerifier {
+                inner,
+                pin,
+                revoked: revoked.clone(),
+            }))
             .with_client_auth_cert(chain, key)
             .map_err(|error| TlsSetupError::Tls(error.to_string()))?;
         config.alpn_protocols = vec![ALPN.to_vec()];
@@ -267,6 +360,13 @@ fn parse_pin(value: &str) -> Result<[u8; 32], TlsSetupError> {
     Ok(pin)
 }
 
+fn spelled(pin: &[u8; 32]) -> String {
+    pin.iter().fold(String::from("sha256:"), |mut out, byte| {
+        let _ = write!(out, "{byte:02x}");
+        out
+    })
+}
+
 fn spki_sha256(cert: &CertificateDer<'_>) -> Option<[u8; 32]> {
     let cert = webpki::EndEntityCert::try_from(cert).ok()?;
     let mut digest = [0_u8; 32];
@@ -346,12 +446,17 @@ fn shifted(now: UnixTime, skew: Duration, later: bool) -> UnixTime {
 #[error("the node's key is not the pinned one")]
 struct NotPinned;
 
+#[derive(Debug, Error)]
+#[error("the node's key {} is revoked", spelled(.0))]
+struct Revoked([u8; 32]);
+
 /// The server CA's chain for the expected name, with [`CLOCK_SKEW`] on either side of the
-/// validity window, then the pin.
+/// validity window, then the revocation list, then the pin.
 #[derive(Debug)]
 struct ServerVerifier {
     inner: Arc<WebPkiServerVerifier>,
     pin: Option<[u8; 32]>,
+    revoked: RevokedNodeKeys,
 }
 
 impl ServerCertVerifier for ServerVerifier {
@@ -376,8 +481,14 @@ impl ServerCertVerifier for ServerVerifier {
             )) => verify(shifted(now, CLOCK_SKEW, false)),
             verified => verified,
         }?;
+        let key = spki_sha256(end_entity);
+        if let Some(key) = key.filter(|key| self.revoked.0.contains(key)) {
+            return Err(rustls::Error::InvalidCertificate(CertificateError::Other(
+                OtherError(Arc::new(Revoked(key))),
+            )));
+        }
         if let Some(pin) = self.pin
-            && spki_sha256(end_entity) != Some(pin)
+            && key != Some(pin)
         {
             return Err(rustls::Error::InvalidCertificate(CertificateError::Other(
                 OtherError(Arc::new(NotPinned)),
@@ -436,6 +547,140 @@ mod tests {
                 "{value:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_revocation_list_is_one_pin_per_line_with_blank_lines_and_comments() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let two = format!("sha256:{}", "2".repeat(64));
+        let path = Path::new("revoked.list");
+        let revoked = RevokedNodeKeys::parse(
+            path,
+            &format!("# lost keys\r\n\n  {one}  # node-4\n\t{two}\n{one}\n"),
+        )
+        .unwrap();
+        assert_eq!(revoked.len(), 2, "a key listed twice is revoked once");
+        assert!(revoked.0.contains(&parse_pin(&one).unwrap()));
+        assert!(revoked.0.contains(&parse_pin(&two).unwrap()));
+        assert!(RevokedNodeKeys::parse(path, "").unwrap().is_empty());
+        assert!(RevokedNodeKeys::parse(path, "#\n \n").unwrap().is_empty());
+        assert!(RevokedNodeKeys::default().is_empty());
+    }
+
+    #[test]
+    fn a_malformed_revocation_line_is_named_by_its_number() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let path = Path::new("revoked.list");
+        for (text, at, holds) in [
+            (format!("{one}\nsha256:00\n"), 2, "sha256:00".to_owned()),
+            (format!("# a\n\n{one} {one}"), 3, format!("{one} {one}")),
+            (one.to_uppercase(), 1, one.to_uppercase()),
+            ("md5:00 # old".to_owned(), 1, "md5:00".to_owned()),
+        ] {
+            let error = RevokedNodeKeys::parse(path, &text).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    TlsSetupError::Revocation { path: p, line, value }
+                        if p == path && *line == at && *value == holds
+                ),
+                "{text:?}: {error:?}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .starts_with(&format!("revoked.list, line {at}: malformed")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_revocation_list_reads_exactly_as_the_nodes_own() {
+        let one = format!("sha256:{}", "1".repeat(64));
+        let two = format!("sha256:{}", "ab".repeat(32));
+        let path = Path::new("revoked.list");
+        for text in [
+            String::new(),
+            "\n\n# only comments\n   \t\n".to_owned(),
+            format!("{one}\n"),
+            format!("{one}\r\n{two}\r\n"),
+            format!("  {one}  # trailing\n#{two}\n{one}"),
+            format!("{one}#{two}"),
+            format!("{one}\nsha256:00\n"),
+            format!("{one} {two}"),
+            one.to_uppercase(),
+            format!("SHA256:{}", &one[7..]),
+            format!("sha256: {}", &one[8..]),
+            format!("sha256:{}g", &one[8..]),
+            format!("sha256:{one}"),
+            "md5:00 # old".to_owned(),
+            "\u{a0}\n".to_owned(),
+        ] {
+            let ours = RevokedNodeKeys::parse(path, &text);
+            let nodes = ward_node::tls::RevokedKeys::parse(path, &text);
+            match (&ours, &nodes) {
+                (Ok(ours), Ok(nodes)) => {
+                    assert_eq!(ours.len(), nodes.len(), "{text:?}");
+                    for pin in &ours.0 {
+                        assert!(
+                            nodes.revokes(ward_node::tls::SpkiPin::parse(&spelled(pin)).unwrap()),
+                            "{text:?}"
+                        );
+                    }
+                }
+                (Err(ours), Err(nodes)) => {
+                    assert_eq!(ours.to_string(), nodes.to_string(), "{text:?}");
+                }
+                _ => panic!("{text:?}: the client read {ours:?}, the node {nodes:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_revocation_list_is_a_bounded_regular_file_no_one_else_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let pin = format!("sha256:{}", "1".repeat(64));
+        let file = |name: &str, contents: &[u8], mode: u32| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, contents).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            path
+        };
+        let list = file("revoked", format!("{pin}\n").as_bytes(), 0o644);
+        assert_eq!(RevokedNodeKeys::load(&list).unwrap().len(), 1);
+        let writable = file("writable", pin.as_bytes(), 0o664);
+        assert!(matches!(
+            RevokedNodeKeys::load(&writable),
+            Err(TlsSetupError::File { .. })
+        ));
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&list, &link).unwrap();
+        assert!(matches!(
+            RevokedNodeKeys::load(&link),
+            Err(TlsSetupError::File { .. })
+        ));
+        let binary = file("binary", &[0xff, 0xfe, b'\n'], 0o644);
+        let error = RevokedNodeKeys::load(&binary).unwrap_err();
+        assert!(error.to_string().contains("not UTF-8"), "{error}");
+        let large = file(
+            "large",
+            &vec![b'#'; usize::try_from(MAX_TLS_FILE_BYTES).unwrap() + 1],
+            0o644,
+        );
+        assert!(matches!(
+            RevokedNodeKeys::load(&large),
+            Err(TlsSetupError::File { .. })
+        ));
+        assert!(matches!(
+            RevokedNodeKeys::load(&dir.path().join("missing")),
+            Err(TlsSetupError::File { .. })
+        ));
+        let malformed = file("malformed", b"sha256:00\n", 0o644);
+        assert!(matches!(
+            RevokedNodeKeys::load(&malformed),
+            Err(TlsSetupError::Revocation { line: 1, .. })
+        ));
     }
 
     #[test]

@@ -3,7 +3,8 @@
 //!
 //! * [`UnixTransport`] speaks the Unix-socket JSON-lines framing of §3, one connection per
 //!   request, with the line bounds and the fail-closed reading of EOF; [`TlsTransport`]
-//!   speaks the same over TCP with mutual TLS to a node serving `--listen-tls` (ADR-0038).
+//!   speaks the same over TCP with mutual TLS to a node serving `--listen-tls` (ADR-0038),
+//!   refusing a node whose key is on the client's [`RevokedNodeKeys`].
 //! * [`Client`] negotiates protocol 1.3 or later (§4), reads capabilities (§5) and sends
 //!   the typed lifecycle verbs (§6), the read-only `result` request (§6.6) and the action
 //!   channel's `actions` listing and `answer` (§6.7), checking every answer against its
@@ -39,5 +40,5 @@ pub use driver::{
 };
 pub use envelope::{EnvelopeError, EnvelopeInput, WorkloadInput, offline_manifest};
 pub use issuer::{IssuerKey, IssuerKeyError, SEED_LEN, SignedEnvelope};
-pub use tls::{TlsSettings, TlsSetupError, TlsTransport};
+pub use tls::{RevokedNodeKeys, TlsSettings, TlsSetupError, TlsTransport};
 pub use transport::{Exchange, MAX_LINE_BYTES, Timeouts, Transport, TransportError, UnixTransport};
