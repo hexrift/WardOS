@@ -43,7 +43,7 @@ use ward_events::{ClaimKind, EndReason, EventRecord, LogReader, Origin, WardEven
 static SERIAL: Mutex<()> = Mutex::new(());
 
 const BLOCKED: &str = "blocked.example";
-const ANTHROPIC_CANARY: &str = "sk-ant-canary-279-never-in-the-sandbox";
+const ANTHROPIC_CANARY: &str = "anthropic-canary-279-never-in-the-sandbox";
 const OPENAI_CANARY: &str = "sk-openai-canary-279-never-in-the-sandbox";
 const HOST_SECRET: &str = "host-secret-279";
 
