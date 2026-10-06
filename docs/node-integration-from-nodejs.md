@@ -303,6 +303,36 @@ Rules of the conversation:
   (malformed command, unreachable node for `capabilities`/`inspect`/`revoke`, a `run`
   refused before anything was sent); 2 for bad flags.
 
+**A node on another host.** A node started with `--listen-tls` (node-integration.md §2.1,
+§3, ADR-0038) is reached over mutual TLS by the same adapter: `--connect-tls <host:port>`
+with this client's certificate and key, the CA of the node's certificate, the name it must
+carry and, optionally, the node's pinned key, in place of `--socket`. The conversation is
+unchanged. The reference client takes them as `new Adapter({ tls: { address, cert, key,
+serverCa, serverName, serverPin } })` (exclusive with `socket`, every setting checked
+before the adapter is spawned) and on its command line as `--connect-tls <host:port>
+--tls-cert <pem> --tls-key <pem> --tls-server-ca <pem> --tls-server-name <name>
+[--tls-server-pin sha256:<hex>]`:
+
+```js
+const adapter = new Adapter({
+  tls: {
+    address: "node-7.exec.internal:7443",
+    cert: "/etc/institution/ward/client.pem",
+    key: "/etc/institution/ward/client-key.pem",      // mode 0600 or 0400
+    serverCa: "/etc/institution/ward/node-ca.pem",
+    serverName: "node-7.exec.internal",
+  },
+});
+```
+
+The client's certificate says who may speak; the issuer signature (§5) still decides what
+is admitted, so the issuer key stays on the control plane as before. A refused handshake (a
+node certified by another CA or for another name, a node that refuses this client) is the
+adapter's `error` event, with the TLS reason, before anything is sent; a session that
+fails later in a `run` ends it `unknown` with the reason in `transport_error`, like any lost
+answer (§9). A remote client cannot read the
+evidence log; pass `task_root` only to have the report name the path the operator verifies.
+
 One complete run, as the reference client logged it with `--trace` against a real node
 (`>>` sent, `<<` received; the `envelope_json` string shortened, paths shortened):
 
@@ -898,7 +928,12 @@ none of the node's keys in either sandbox, one `agent_adapter` binding in each s
 `claude_code_hooks_are_claims` (every hook line answered `allow` and recorded as a claim,
 none in Codex's log, the adapter's directory gone with the attempt) and
 `agent_adapter_refused_where_not_hosted` (the client's refusal of `process` before signing,
-and the plain node's own `unsupported_grant` for the signed Codex run),
+and the plain node's own `unsupported_grant` for the signed Codex run);
+and, against a node started with `--listen-tls` and certificates the script makes with
+`openssl`, `mutual_tls_transport` (the capability document over `--connect-tls` equal to
+the socket's, a run completing to a verifying sealed log, the node's key pinned the
+operator's way accepted and another refused by name, a client certified by another CA
+refused and reported in the node's log),
 verifying every evidence log with `ward-node audit --task-root` (and `ward replay --verify`
 when a `ward` binary is at hand). The shipped `ward-node` never connects to a loopback
 address and speaks only TLS upstream, so the credentials and hold nodes, alone, are
@@ -955,8 +990,11 @@ plane deciding what to put through the node today:
   a base URL has none. Hook answers are `allow` everywhere and a `PermissionRequest` is not
   bridged onto the action channel: hold the hosts and credentials that matter (§7.4 above)
   (#279, #424).
-- **Remote transport.** The adapter runs on the node's host (#262); a control plane
-  elsewhere brings its own channel to that host and ships pre-signed bytes over it.
+- **Enrolment and revocation of transport identities.** A node started with
+  `--listen-tls` is reached from anywhere over mutual TLS (§6 above), but its certificate,
+  its client CA and any pins are files its operator provisions and rotates by restarting
+  the node; there is no enrolment, attestation or certificate revocation, and the node
+  reports handshakes on stderr, not in a durable record (#262, ADR-0038).
 
 ## 12. Checklist for #490
 
@@ -987,6 +1025,14 @@ Operator side:
       (`anthropic`, `openai`) configured in `--credentials` with its upstream, header,
       the API path in `paths` and `write` among its `permissions` (a model API is a
       `POST`).
+- [ ] Where the institution's workers reach the node from another host: the node started
+      with `--listen-tls <ip:port>`, `--tls-cert`/`--tls-key` from the operator's PKI for the
+      name the institution dials, `--tls-client-ca` naming the CA of the institution's
+      client certificates and, where that CA certifies more than the institution,
+      `--tls-client-pin` for the institution's keys (node-integration.md §2.1, ADR-0038);
+      the port reachable only from the control plane's network; a restart planned for every
+      certificate or CA rotation; the node's stderr (refused and served handshakes) kept in
+      the journal.
 - [ ] Where a real Claude Code or Codex runs there: the node started with
       `--agent-shim <file>` naming the release's `ward-agent` (from the runtime tarball or
       the image, owned by root or the node user, writable by no one else) and
@@ -1007,6 +1053,10 @@ behind an adapter:
 - [ ] The adapter spawned like TamperWard (§6): pre-signed `run`, `task_root`, a timeout
       above budget + grace + 90 s; one command at a time; `done` parsed into the outcome
       (§7); `unknown` mapped to failure.
+- [ ] For a node on another host: the adapter given `tls` settings in place of `socket`
+      (§6), the client key in a 0600 file of the worker's user, the expected server name
+      from configuration, never derived from what the node says; a TLS refusal treated as
+      an unreachable node, never retried with weaker settings.
 - [ ] Nodes started with `--output-return`, and each action's verdict file and stream
       budget declared in its manifest's `output` grant within the ceilings (§7.1 above); every
       returned file's digest verified before use; a granted output that is missing treated

@@ -23,7 +23,12 @@
 # ADR-0036) start a seventh node with --agent-adapter claude-code and --agent-adapter codex
 # and prove that both run under one signed manifest with the same authority, Claude Code's
 # hook lines recorded as claims, and an adapter the node does not host refused by the
-# client and by the plain node. A fake upstream on loopback over plain HTTP is
+# client and by the plain node. The mutual-TLS case (node-integration.md §3, ADR-0038)
+# starts an eighth node with --listen-tls and certificates made here with openssl, and
+# proves that the client, through the adapter's --connect-tls, reads the same capability
+# document as over the socket and runs an attempt to a verifying sealed log, that the
+# node's key pinned the operator's way is accepted and another refused, and that a client
+# from another CA is refused and reported. A fake upstream on loopback over plain HTTP is
 # something the shipped ward-node refuses by design (its proxy never connects to loopback
 # and speaks only TLS upstream), so the credentials and hold nodes alone are ward-node
 # built with the `test-loopback` feature, exactly as ward-node's own
@@ -1514,6 +1519,99 @@ if [[ -z "$problems" ]]; then
   pass agent_adapter_refused_where_not_hosted "run --agent-adapter process on a node that hosts only claude-code and codex is refused by the client before anything is signed or recorded, and the node started without --agent-adapter refuses the signed Codex run unsupported_grant at admit"
 else
   fail agent_adapter_refused_where_not_hosted "$problems"
+fi
+
+# ---- case 26: the same client over mutual TLS (node-integration.md §3, ADR-0038) ----------
+
+# A throwaway PKI made here with openssl: one CA for the node, one for the client, one for an
+# outsider. Nothing of it outlives $work.
+tls="$work/tls"
+mkdir -m 700 "$tls"
+tls_ca() {
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj "/CN=$1" \
+    -keyout "$tls/$1-key.pem" -out "$tls/$1.pem" \
+    -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" 2>/dev/null
+  chmod 600 "$tls/$1-key.pem"
+}
+# tls_leaf <ca> <name> <serverAuth|clientAuth>: a certificate for <name> from <ca>.
+tls_leaf() {
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj "/CN=$2" \
+    -keyout "$tls/$2-key.pem" -out "$tls/$2.csr" 2>/dev/null
+  openssl x509 -req -in "$tls/$2.csr" -CA "$tls/$1.pem" -CAkey "$tls/$1-key.pem" -CAcreateserial -days 1 \
+    -out "$tls/$2.pem" -extfile <(printf 'subjectAltName=DNS:%s\nextendedKeyUsage=%s\nkeyUsage=critical,digitalSignature\n' "$2" "$3") 2>/dev/null
+  chmod 600 "$tls/$2-key.pem"
+}
+problems=""
+if command -v openssl >/dev/null 2>&1; then
+  tls_ca node-ca
+  tls_ca client-ca
+  tls_ca outsider-ca
+  tls_leaf node-ca node.acceptance.test serverAuth
+  tls_leaf client-ca control-plane.acceptance.test clientAuth
+  tls_leaf outsider-ca outsider.acceptance.test clientAuth
+  tls_snapshot="$("$WARD_NODE_BIN" snapshot import --state-dir "$work/tls-state" "$work/project")"
+  tls_pid="$(start_node "$work/tls.sock" "$work/tls-state" "$work/tls-tasks" \
+    --listen-tls 127.0.0.1:0 --tls-cert "$tls/node.acceptance.test.pem" \
+    --tls-key "$tls/node.acceptance.test-key.pem" --tls-client-ca "$tls/client-ca.pem")"
+  background+=("$tls_pid")
+  tls_address=""
+  for _ in $(seq 1 100); do
+    tls_address="$(sed -n 's/^ward-node: serving the node protocol over mutual TLS on //p' "$work/node.log" | tail -n 1)"
+    [[ -n "$tls_address" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$tls_address" ]] || die "the TLS node never reported its listener"
+  # The node's pin as an operator computes it: SHA-256 of the certificate's DER SubjectPublicKeyInfo.
+  node_pin="sha256:$(openssl x509 -in "$tls/node.acceptance.test.pem" -pubkey -noout | openssl pkey -pubin -outform der | sha256sum | cut -d' ' -f1)"
+  tls_common=(--connect-tls "$tls_address" --tls-cert "$tls/control-plane.acceptance.test.pem"
+    --tls-key "$tls/control-plane.acceptance.test-key.pem" --tls-server-ca "$tls/node-ca.pem"
+    --tls-server-name node.acceptance.test --adapter "$WARD_NODE_ADAPTER_BIN")
+
+  node "$client" capabilities "${tls_common[@]}" --tls-server-pin "$node_pin" >"$work/tls-capabilities.json" 2>>"$work/client.log" \
+    || problems+="capabilities over TLS with the operator's pin failed; "
+  node "$client" capabilities --socket "$work/tls.sock" --adapter "$WARD_NODE_ADAPTER_BIN" >"$work/tls-socket-capabilities.json" 2>>"$work/client.log"
+  cmp -s "$work/tls-capabilities.json" "$work/tls-socket-capabilities.json" \
+    || problems+="the capability document over TLS differs from the socket's; "
+
+  status=0
+  node "$client" run "${tls_common[@]}" --key "$work/cp/issuer.pem" --principal acceptance-issuer --node "$node_id" \
+    --state-dir "$work/cp" --snapshot "$tls_snapshot" --task-root "$work/tls-tasks" --timeout-ms 90000 \
+    --task acc-task-26 --attempt acc-attempt-26a --budget-ms 60000 -- sh -c 'cat src/input.txt > copy.txt' \
+    >"$work/run26.json" 2>>"$work/client.log" || status=$?
+  [[ "$status" == "0" ]] || problems+="run over TLS exit status $status; "
+  check 26 "$work/run26.json" 'o.outcome' '"completed"' "outcome over TLS"
+  check 26 "$work/run26.json" 'o.operations.map(x => x.verb).join()' '"create,admit,start,seal"' "operations over TLS"
+  tls_task="$(field "$work/run26.json" 'o.binding.task' | tr -d '"')"
+  tls_attempt="$(field "$work/run26.json" 'o.binding.attempt' | tr -d '"')"
+  tls_log="$(field "$work/run26.json" 'o.evidenceLog' | tr -d '"')"
+  [[ "$(cat "$work/tls-tasks/$tls_task/$tls_attempt/copy.txt" 2>/dev/null)" == "from the snapshot" ]] \
+    || problems+="the workload run over TLS did not read its snapshot; "
+  verify_log_at "$work/tls-state" "$work/tls-tasks" "$tls_task" "$tls_log" \
+    || problems+="the evidence log of the run over TLS does not verify sealed; "
+
+  status=0
+  node "$client" capabilities "${tls_common[@]}" --tls-server-pin "sha256:$(printf '0%.0s' $(seq 1 64))" \
+    >/dev/null 2>"$work/tls-wrong-pin.err" || status=$?
+  [[ "$status" != "0" ]] || problems+="a node whose key is not the pinned one was trusted; "
+  grep -q 'pinned' "$work/tls-wrong-pin.err" || problems+="the pin refusal is not named: $(cat "$work/tls-wrong-pin.err"); "
+
+  status=0
+  node "$client" capabilities --connect-tls "$tls_address" --tls-cert "$tls/outsider.acceptance.test.pem" \
+    --tls-key "$tls/outsider.acceptance.test-key.pem" --tls-server-ca "$tls/node-ca.pem" \
+    --tls-server-name node.acceptance.test --adapter "$WARD_NODE_ADAPTER_BIN" >/dev/null 2>>"$work/client.log" || status=$?
+  [[ "$status" != "0" ]] || problems+="a client from another CA was served; "
+  for _ in $(seq 1 100); do
+    grep -q 'refused a TLS connection from 127.0.0.1' "$work/node.log" && break
+    sleep 0.1
+  done
+  grep -q 'refused a TLS connection from 127.0.0.1' "$work/node.log" || problems+="the node did not report the refused client; "
+else
+  problems+="openssl is needed to make the TLS case's certificates; "
+fi
+if [[ -z "$problems" ]]; then
+  pass mutual_tls_transport "a node started with --listen-tls serves the client over TLS 1.3 with client certificates: the capability document is the socket's byte for byte, a run completes and seals a verifying log, the operator's openssl-computed pin of the node's key is accepted and any other refused by name, and a client certified by another CA is refused and reported in the node's log"
+else
+  fail mutual_tls_transport "$problems"
 fi
 
 echo
