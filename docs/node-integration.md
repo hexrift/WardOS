@@ -123,7 +123,8 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
   [--trusted-issuers <file>] [--task-root <dir>] [--network-allowlist [--credentials <file>]] \
   [--output-return] [--action-channel [--approval-hold]] [--cgroup-root <dir>] \
   [--max-running <n> [--memory-floor <bytes>] [--disk-floor <bytes>]] \
-  [--agent-adapter <id>…] [--agent-shim <file>] [--client-uid <uid>]… [--client-group <group>] \
+  [--agent-adapter <id>…] [--agent-shim <file>] [--container-runtime <file> [--place-stronger]] \
+  [--client-uid <uid>]… [--client-group <group>] \
   [--listen-tls <ip:port> --tls-cert <file> --tls-key <file> --tls-client-ca <file> [--tls-client-pin <pin>]… [--tls-client-revoked <file>]]
 ```
 
@@ -144,6 +145,8 @@ ward-node --socket <path> --state-dir <dir> --node-id <node_…> \
 | `--memory-floor`, `--disk-floor` | no | Refuse a `start` `capacity_exhausted` while the host's available memory (`MemAvailable`) or the space available on the task root's filesystem is below this many bytes. A floor the node cannot measure refuses the `start` `resource_unavailable`. Need `--max-running`. |
 | `--agent-adapter` | no | Host this agent adapter (`claude-code`, `codex` or `process`; repeatable) on workloads that name it (§6.10, §7.3): the node launches the workload's argv through `ward-agent-adapter`'s contract, adding the adapter's environment and settings files and, for one with hooks, a hook socket whose lines are recorded as agent-origin claims, under exactly the authority the manifest grants; the capability document carries `adapters` (§5). An unknown id stops the node. Needs `--task-root`. Without it every workload naming an adapter is refused `unsupported_grant`. |
 | `--agent-shim` | no | The operator's `ward-agent` shim (the node tarball's, the runtime tarball's or the image's `ward-agent`: `/usr/local/bin/ward-agent` as node-integration-guide.md §1 installs it, `/usr/bin/ward-agent` on the image), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, that names `--relay` in its `--help` and once runs `/bin/true` hardened over the task root (so a kernel without Landlock stops the node). Every attempt of a hosted adapter, and every attempt with an egress proxy, then runs under it, bound read-only at `/run/ward/ward-agent`: Landlock, seccomp and no capabilities inside the sandbox, a hosted adapter's command hooks reaching its hook socket, and, behind an egress proxy, the shim's relay on `127.0.0.1:3128` forwarding to the attempt's proxy with `HTTP_PROXY`/`HTTPS_PROXY` naming it (§6.8) and a hosted adapter's provider base URL on it for a provider the manifest grants a credential for (§6.10). An offline attempt naming no adapter runs without it. Nothing in the capability document changes. Needs `--agent-adapter` or `--network-allowlist`. Without it no shim is bound and no relay runs. |
+| `--container-runtime` | no | The operator's OCI runtime, `runc` (`/usr/bin/runc` on Debian and Ubuntu; node-integration-guide.md §3.2), verified at start: an absolute path to a regular file, not a symlink, executable, owned by root or the node's user and writable by no one else, whose `--version` begins `runc version`, with `/usr/bin/setpriv` (util-linux) present, and that once runs a container built as an attempt's would be over a scratch directory of the task root; any refusal stops the node, naming it. The node then also has a Capsule backend at isolation level `container` ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) §2): an attempt placed there runs in an OCI container of its own, built from exactly the launch the bubblewrap sandbox would run (the same workspace at `/work`, read-only system directories, private `/tmp`, `/home`, `/run`, environment, proxy socket, hook and action sockets and shim), with no capability, `no_new_privs`, the baseline seccomp profile and a user namespace mapping only the node's user to root inside; its bundle lives in `<task-root>/<task>/<attempt>.capsule/` until the container is reaped. As root `runc` gives each container cgroups of its own and `pause`/`resume` use their freezer; run as another user (rootless) the container has no cgroup and `pause` is refused `unsupported_operation` for its attempts (§8.2). The capability document reports `isolation.backends.container` `true` (§5). A manifest with `resources` limits is never placed on it. Needs `--task-root`. Without it a manifest whose floor is `container` is refused `unsupported_grant`. |
+| `--place-stronger` | no | The operator's policy for placement (ADR-0039 §5): run an attempt on the weakest backend whose level is above its manifest's floor, when the node has one, instead of at exactly its floor; with `--container-runtime`, an attempt whose manifest names no floor runs in a container. The capability document reports `isolation.stronger_placement` `true` (§5) and the task record names the backend that ran the attempt (§6.4). Needs `--container-runtime`. Without it every attempt runs at exactly its floor. |
 | `--client-uid` | no | A uid (decimal) or user name the node serves on its socket besides its own uid; repeatable, resolved once at start (an unknown name or a uid listed twice refuses to start). The node reads every connection's peer credentials before it reads a byte and closes a connection from any other uid without a response (§3). Root is not exempt. Being served grants no authority: `admit` still needs a trusted signature (§8.1). |
 | `--client-group` | no | A gid or group name to share the socket with: the socket is created mode 0660 owned by it, and its parent directory must be owned by it with mode 0750 or stricter. Needs at least one `--client-uid`; a member of the group that is not a listed uid can connect but is closed unread. Without it the socket is 0600 and only the node's uid (or root) can connect, whatever `--client-uid` says. The state directory and task root stay 0700 either way: a listed client can speak to the node, not read its state. |
 | `--listen-tls` | no | Also serve the protocol on this TCP address (`<ip>:<port>`; port `0` picks a free one) over TLS 1.3 with a mandatory client certificate ([ADR-0038](decisions/ADR-0038-node-mutual-tls-transport.md), §3). At start the node writes `ward-node: serving the node protocol over mutual TLS on <ip>:<port>` to stderr. The socket is served as before. A certificate the node accepts takes the place of `--client-uid` for this listener, never of an issuer signature. With it, `SIGHUP` reloads the TLS files without a restart (below). Needs `--tls-cert`, `--tls-key` and `--tls-client-ca`; an address already in use stops the node. |
@@ -457,7 +460,8 @@ well, `network.proxy_allowlist` reads `true`):
 | `lifecycle.stop` | Always present. At 1.3 it equals `start`: the node never offers a way to begin execution without its own way to end it. |
 | `lifecycle.pause`, `lifecycle.revoke` | Always present. At 1.3 each is `true` exactly when `lifecycle.start` is: an executing node serves `pause` and `revoke`. The document has no flag for `resume` or `seal`; an executing node serves `resume` with `pause` and `seal` with `start`, and a node that advertises `start` `false` refuses all four `unsupported_operation`. |
 | `isolation.namespaces.sandbox`, `isolation.namespaces.user_namespace` | `true` exactly when `lifecycle.start` is: every workload runs in a bubblewrap namespace sandbox inside its own user namespace. `namespaces.sandbox` is also the node's offer of a Capsule backend at isolation level `sandbox` ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) §3): the level of every attempt whose manifest names no `isolation` floor (§7.5). |
-| `isolation.backends.container`, `isolation.backends.microvm`, `isolation.backends.vm` | The node's offer of a Capsule backend at that isolation level (ADR-0039 §1, §3): `true` exactly when it has one, and then a manifest whose `isolation.minimum` names the level is honoured on it (§7.5). At this revision every node has only the `sandbox` backend, so all three are `false` and every `isolation` floor is refused `unsupported_grant`. The section's shape is unchanged, so a strict decoder of any 1.3 revision reads it; which mechanism serves a level is the node's, not the document's. |
+| `isolation.backends.container`, `isolation.backends.microvm`, `isolation.backends.vm` | The node's offer of a Capsule backend at that isolation level (ADR-0039 §1, §3): `true` exactly when it has one, and then a manifest whose `isolation.minimum` names the level is honoured on it (§7.5). `container` is `true` on a node started with `--container-runtime` (§2.1); at this revision no node has a `microvm` or `vm` backend, so those two are `false` and such a floor is refused `unsupported_grant`. The section's shape is unchanged, so a strict decoder of any 1.3 revision reads it; which mechanism serves a level is the node's, not the document's. |
+| `isolation.stronger_placement` | Present, and `true`, as the last field of `isolation` (`…,"vm":false},"stronger_placement":true}`), exactly when the node was started with `--place-stronger` (§2.1): an attempt then runs on the weakest offered level above its manifest's floor when there is one, and at its floor otherwise, never below it (ADR-0039 §5). Absent means `false`: every attempt runs at exactly its floor. New in this revision of 1.3: a strict decoder of an earlier revision refuses a document that carries it, so start a node with `--place-stronger` only once every control plane that reads it is at this revision; a node without the flag emits exactly the earlier document. |
 | `network.offline` | `true` exactly when `lifecycle.start` is: every workload runs with no network but loopback. |
 | `network.proxy_allowlist` | `true` exactly when `lifecycle.start` is and the node was started with `--network-allowlist` (§2.1): a manifest asking for a host allowlist (`network.custom`, §7.5) is then honoured through a per-attempt egress proxy (§9). Otherwise `false`, and such a manifest is refused `unsupported_grant` at `admit`. |
 | `snapshots.content_addressed` | `true` exactly when `lifecycle.start` is: workspaces are materialised from the node's content-addressed store (§2.4). |
@@ -725,6 +729,7 @@ counters, as in `NodeAttemptResourceUsage`, §6.5), and keeps it across a restar
 without a measurement carries no `usage` field and reads exactly as before. From the
 launch intent of a `start` on, the record also names the Capsule backend the attempt was
 placed on and its isolation level (`"capsule":{"backend":"bubblewrap","isolation":"sandbox"}`,
+or `"capsule":{"backend":"runc","isolation":"container"}` for an attempt run in a container,
 ADR-0039 §6), and keeps it across a restart; a record of an attempt never started carries
 no `capsule` field. `start`
 records that it is about to spawn before it spawns, and the spawned process once the
@@ -742,10 +747,12 @@ it serves its socket, and a control plane observes:
   was in flight, or a `stop` or `revoke` still waiting for its reap — read `exited` with
   outcome `unknown`, whatever the workload did. Any process of the attempt that survived
   the node is killed: bubblewrap's `--die-with-parent` normally takes the sandbox down
-  with the node, and the node also kills the process tree still rooted at the recorded
-  host process (matched by pid, start time and boot, so an unrelated process is never
-  signalled; a paused tree is killed as it is). The attempt is never started again;
-  retry it as a new attempt (§10).
+  with the node, as `setpriv --pdeathsig` takes a `runc` container and `runc` itself down
+  with it, and the node also kills the process tree still rooted at the recorded host
+  process (matched by pid, start time and boot, so an unrelated process is never
+  signalled; a paused tree is killed as it is) and deletes a container its predecessor
+  left beside the workspace (`runc kill`, `runc delete --force`, the bundle removed). The
+  attempt is never started again; retry it as a new attempt (§10).
 - **`exited`, `stopped`, `revoked` and `sealed` tasks** keep their state and receipt
   outcome.
 - **Replays** of every `operation_id` the attempt applied are answered exactly as before
@@ -1560,7 +1567,7 @@ grammar, and anything that is not one object fail envelope decoding (`authority_
 | `hold.hosts` | Patterns of the manifest's own `network.custom`, each exactly as written there (a name a `*.` pattern covers is not one), no repeats. |
 | `hold.services` | Services of the manifest's own `credentials`, no repeats. Together with `hosts`, at most 8 entries. |
 | `isolation` | Optional (new in this revision of 1.3, like `output`). `{"minimum": L}`, `minimum` the only field: the weakest isolation level the attempt may run at ([ADR-0039](decisions/ADR-0039-capsule-backends-and-isolation-levels.md) §1). Absent, the floor is `sandbox`, the level of every attempt before this revision. |
-| `isolation.minimum` | One of `container`, `microvm` and `vm`, in the order of what they guarantee (`sandbox` < `container` < `microvm` < `vm`). `sandbox` is spelled by leaving `isolation` out and fails decoding, so a floor has one spelling. The node places the attempt only on a backend at exactly that level (a stronger one only by its operator's explicit policy, which no node offers at this revision), never on a weaker one. |
+| `isolation.minimum` | One of `container`, `microvm` and `vm`, in the order of what they guarantee (`sandbox` < `container` < `microvm` < `vm`). `sandbox` is spelled by leaving `isolation` out and fails decoding, so a floor has one spelling. The node places the attempt on a backend at exactly that level, or, only by its operator's explicit policy (`--place-stronger`, advertised as `isolation.stronger_placement`), on the weakest one above it; never on a weaker one. A manifest with `resources` limits is placed only on a backend that enforces them (the bubblewrap one). |
 | `output.files` | 0–64 paths, no repeats, each 1–255 bytes of `a-z A-Z 0-9 . _ - /`, relative to the workspace root, with no empty, `.` or `..` component, no leading or trailing `/` and no `//`. Exact paths only: no globs, no directories. A path outside the grammar (`../x`, `/etc/passwd`, a space) fails envelope decoding. |
 
 The node honours a decoded grant only if its capability document (§5) says it can
@@ -1575,9 +1582,10 @@ which a node started with `--action-channel` reports, and only within its ceilin
 `credentials` only when `credentials.proxy_injection` is `true`, which a node started with
 `--credentials` reports, and only for a service its operator configured, for that service's
 host and within its ceiling, and `hold` only when `actions.hold` is `true`, which a node
-started with `--approval-hold` reports, and `isolation` only when the node offers a
-backend at exactly that level, which its `isolation` section says (§5), and at this
-revision no node does; the
+started with `--approval-hold` reports, and `isolation` only when the node can place it:
+it offers a backend at exactly that level or, with `isolation.stronger_placement`, one
+above it, which its `isolation` section says (§5) and which for `container` a node started
+with `--container-runtime` does; the
 workload then runs behind the attempt's own egress proxy allowing exactly the listed
 patterns (§9), its output is kept and returned as §6.6 says, its process tree is held to
 the limits as §9 says, its channel is served as §6.7 says, its credentials are leased
@@ -1648,8 +1656,10 @@ Decodes; honoured on a node started with `--network-allowlist`, `--action-channe
 ```
 
 Decodes; honoured only on a node whose capability document reports
-`isolation.backends.microvm` `true`, refused `unsupported_grant` on any other, which at
-this revision is every node: it never runs the attempt in a weaker boundary.
+`isolation.backends.microvm` `true` (or `vm` with `isolation.stronger_placement`), refused
+`unsupported_grant` on any other, which at this revision is every node: it never runs the
+attempt in a weaker boundary. `{"network":"offline","isolation":{"minimum":"container"}}`
+is honoured on a node started with `--container-runtime` and runs in an OCI container.
 
 ```json
 {"network":"development"}
@@ -1694,7 +1704,7 @@ changes (no version is consumed, nothing is materialised).
 | 13 | The lineage promotes from its root: root shape, non-empty grants, every delegation rule of §7.3, each lease valid now | `lease_expired` for an expired lease, otherwise `authority_denied` |
 | 14 | Lease `task` / `id` / `subject` equal binding task / binding lease / `agent` | `authority_denied` / `lease_mismatch` / `authority_denied` |
 | 15 | No revocation (§2.5) covers the lease or an ancestor | `lease_revoked` |
-| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9), an `isolation` floor only when the node reports a backend at that level in `isolation` (§5, ADR-0039); and a `workload.adapter` only when the node lists it in `adapters.hosted` and can build its launch from the argv (§6.10) | `unsupported_grant` |
+| 16 | Every grant in the decoded capability manifest is one this node honours (§7.5): `{"network":"offline"}` always, `{"network":{"custom":[…]}}` only when the node reports `network.proxy_allowlist` (§5), an `output` grant only when the node reports `output` and the grant is within the node's ceilings (§6.6), a `resources` grant only when the node reports every limit it names in `resources` and the grant is within the node's ceilings (§7.5), an `actions` grant only when the node reports `actions` and within its ceilings (§6.7), a `credentials` grant only when the node reports `credentials.proxy_injection`, for services its operator configured, their hosts and within their ceilings (§6.8), a `hold` only when the node reports `actions.hold` (§6.9), an `isolation` floor only when the node reports a backend at that level in `isolation`, or one above it with `isolation.stronger_placement`, and `resources` limits only when the backend it places the attempt on enforces them (§5, ADR-0039); and a `workload.adapter` only when the node lists it in `adapters.hosted` and can build its launch from the argv (§6.10) | `unsupported_grant` |
 | 17 | The version is written durably | `resource_unavailable` (write failed) |
 
 On success the task is `ready` and holds the envelope for `start`.
@@ -1726,15 +1736,21 @@ exited first; any other state → `invalid_state`. The answer is written after t
 whatever it took (§3).
 
 `pause`: checks 1–2; replay; not `running`, or a kill of it is pending →
-`invalid_state`; 128 pauses already taken by the attempt → `resource_unavailable`; then
-the node sends `SIGSTOP` to every process of the workload's tree (rooted at the sandbox's
-outer `bwrap`, children first) and waits up to 1 second until each is stopped, ended or
+`invalid_state`; the attempt runs on a backend that does not serve `pause` (a container of
+a rootless `--container-runtime`, ADR-0039 §2) → `unsupported_operation`, with the task
+still `running`; 128 pauses already taken by the attempt → `resource_unavailable`; then,
+for an attempt in a `runc` container run as root, `runc pause` freezes the container's
+cgroup and `runc state` must report it `paused` (the attempt's egress proxy is paused
+first and continued if the freeze fails), and for a bubblewrap attempt the node sends
+`SIGSTOP` to every process of the workload's tree (rooted at the sandbox's outer `bwrap`,
+children first) and waits up to 1 second until each is stopped, ended or
 held in vfork wait on a stopped child, freezing anything forked meanwhile. Confirmed → `paused`. Not confirmed in time, or the workload ended → the node
 sends `SIGCONT` to everything it stopped and answers `resource_unavailable`, with the task
-still `running`. The freeze is by signal only; no cgroup freezer is used.
+still `running`. A bubblewrap attempt is frozen by signal only; no cgroup freezer is used.
 
 `resume`: checks 1–2; replay; not `paused`, or a kill of it is pending → `invalid_state`;
-then `SIGCONT` to the tree, parents first, and up to 1 second for no process of it to be
+then `runc resume` for a container, confirmed by `runc state` reporting it `running`, or
+`SIGCONT` to the tree, parents first, and up to 1 second for no process of it to be
 left stopped. Confirmed (or the workload already gone) → `running`; otherwise
 `resource_unavailable` with the task still `paused`.
 
