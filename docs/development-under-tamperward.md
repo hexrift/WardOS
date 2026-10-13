@@ -98,6 +98,30 @@ Intent-ambiguous signals (assertion weakening, guard removal, snapshot rewrite) 
 `warn`. The ignore list starts empty; adding an ignore requires the same scrutiny as adding
 a suppression.
 
+### Cargo cache and verifier progress
+
+The pristine verification job needs TamperWard 2.43.0 or newer. Its explicit
+`--cargo-target-root` points outside the checkout; the cache action restores and saves
+both `visible` and `pristine` subdirectories there. The two materialised source trees
+remain fresh and separate, and both run the complete command from the trusted base.
+Only dependency crates are retained by the cache action; workspace crates are excluded
+and failed runs do not save caches. No timeout or policy budget is reduced.
+
+TamperWard reports each stage immediately and every 30 seconds on stderr. It reports
+elapsed time and captured byte counts; candidate output stays buffered and bounded so
+it cannot inject live workflow commands. JSON stdout remains a single verdict document.
+
+This fixes cache placement, not all cold-build costs: new dependency/toolchain keys and
+uncached workspace crates still compile. Separate output directories prevent ordinary
+cross-stage reuse; checkpointed-local verification runs candidate code with the caller's
+UID and provides no filesystem isolation against deliberate cache poisoning. Persistent
+build outputs are not attested. Operators needing fresh outputs can remove the cache
+option and unset `CARGO_TARGET_DIR`, retaining both complete runs.
+
+The integration check exercises the actual workflow command with a stub CLI and checks
+that its target root matches both cache-action paths, while retaining ancestor checking,
+the original suite command and the 3600-second per-stage budget.
+
 The verify command is `scripts/verify/tamperward.sh` and is deliberately boring: fmt,
 clippy with `-D warnings`, the full test suite, then the static security check and the
 TamperWard integration check. All of its inputs are declared so pristine verification
@@ -226,12 +250,12 @@ closes it.)
 * **How, today — the compact head-bound token (canonical).** Generate one with:
 
   ```
-  npx --yes tamperward@2.42.0 signoff-label --rule verify --head <full-head-sha>
+  npx --yes tamperward@2.43.0 signoff-label --rule verify --head <full-head-sha>
   ```
 
   (or `--rule check` for a diff-time-gate sign-off, and `--file <path>` when the rule
   is file-scoped), and apply the resulting `tw1:<digest>` label to the pull request.
-  This is the mechanism `.github/workflows/tamperward.yml`'s pinned `tamperward@2.42.0`
+  This is the mechanism `.github/workflows/tamperward.yml`'s pinned `tamperward@2.43.0`
   actually verifies against: a short, opaque, versioned token that hashes the rule, the
   optional file, and the **complete** head object id — never a truncated display SHA —
   so it fits GitHub's 50-character label-name cap without relying on a prefix at all. It
@@ -250,7 +274,7 @@ closes it.)
   the longest that fits alongside the `tamperward:allow:verify@` prefix under GitHub's
   50-character label cap) as a fallback, on the mistaken premise that `tamperward`'s
   `oobToken` matcher accepted any prefix of the head SHA that was at least 7 hex
-  characters. That premise is wrong for the pinned CLI: under `tamperward@2.42.0`,
+  characters. That premise is wrong for the pinned CLI: under `tamperward@2.43.0`,
   once a full head SHA is supplied — which this repository's workflow always does,
   via `TAMPERWARD_OOB_HEAD` — `oobToken` requires a legacy label's SHA to equal
   that **full** 40-character object id; a prefix is rejected outright, not treated
