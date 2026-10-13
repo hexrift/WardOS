@@ -1305,18 +1305,14 @@ fn children_facts(proc: &Path, parent: u32) -> Vec<ProcFacts> {
 
 /// Let a frozen tree run again.
 pub fn thaw(frozen: &Frozen) {
-    match &frozen.cgroup {
-        Some(dir) => {
-            let _ = fs::write(dir.join("cgroup.freeze"), "0");
-        }
-        // Parents first: a parent that continues and finds a child still
-        // stopped simply waits; the reverse could let a child's exit reach a
-        // parent that cannot handle it yet.
-        None => {
-            for pid in frozen.pids.iter().rev() {
-                let _ = kill(Pid::from_raw(as_pid(*pid)), Signal::SIGCONT);
-            }
-        }
+    if let Some(dir) = &frozen.cgroup {
+        let _ = fs::write(dir.join("cgroup.freeze"), "0");
+    }
+    // A cgroup freeze can also contain SIGSTOP holds: stabilize uses signals
+    // for a member it cannot migrate. Release those too, parents first, so a
+    // resumed cgroup never leaves its fallback members stopped.
+    for pid in frozen.pids.iter().rev() {
+        let _ = kill(Pid::from_raw(as_pid(*pid)), Signal::SIGCONT);
     }
 }
 
@@ -2450,6 +2446,44 @@ mod tests {
 
     /// The signal path on a real process tree: a shell and its sleeping child
     /// are stopped children first, continue on thaw, and die on kill.
+    #[test]
+    fn thawing_a_cgroup_releases_members_stopped_by_the_signal_fallback() {
+        struct Reap(std::process::Child);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Reap(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        let proc = Path::new("/proc");
+        kill(Pid::from_raw(as_pid(pid)), Signal::SIGSTOP).unwrap();
+        assert!(crate::daemon::wait_until(Duration::from_secs(2), || {
+            stopped_or_gone(proc, pid)
+        }));
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cgroup.freeze"), "1").unwrap();
+        thaw(&Frozen {
+            method: PauseMethod::CgroupFreezer,
+            pids: vec![pid],
+            cgroup: Some(dir.path().into()),
+        });
+        assert_eq!(
+            fs::read_to_string(dir.path().join("cgroup.freeze")).unwrap(),
+            "0"
+        );
+        assert!(
+            crate::daemon::wait_until(Duration::from_secs(2), || !stopped_or_gone(proc, pid)),
+            "thaw must also release SIGSTOP used when cgroup migration could not hold a member"
+        );
+    }
+
     #[test]
     fn sigstop_freezes_a_real_tree_and_thaw_lets_it_finish() {
         use std::process::{Command, Stdio};
