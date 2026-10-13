@@ -238,7 +238,13 @@ somehow escapes both the tracked tree and the sandbox's PID namespace remains ou
 this membership proof; real `bwrap --unshare-pid` sandboxes are specifically structured
 so descendants stay in that namespace.
 
+Resume clears the cgroup freezer and sends `SIGCONT` to the tracked members in
+parent-first order. Both releases are necessary: a failed late migration can leave
+signal-stopped members in a cgroup-backed hold. Releasing only the cgroup would
+leave those members stopped even after the daemon recorded the session as running.
+
 ## What does not change
+
 No more colour, no shields, no closer resemblance to Omarchy, no custom kernel, no
 departure from the terminal-first workflow, no replacement of the Rust shell model,
 no blurring of WardOS isolation and TamperWard semantic enforcement.

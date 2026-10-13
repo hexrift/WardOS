@@ -17,7 +17,7 @@ use ward_daemon::acks::{self, Registration};
 use ward_daemon::control::{Progress, RemoteSink, Request, Response};
 use ward_daemon::pause::{self, Lifecycle, Owner};
 use ward_daemon::{Session, client, daemon};
-use ward_events::{AgentState, EndReason, EventRecord, LogReader, Origin, WardEvent};
+use ward_events::{AgentState, EndReason, EventRecord, LogReader, Origin, PauseMethod, WardEvent};
 
 fn scratch_project() -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -398,7 +398,24 @@ fn progress_is_reported_per_component_as_it_happens() {
         "{progress:?}"
     );
     assert!(progress.iter().all(|(p, _)| p.confirmed), "{progress:?}");
-    assert_eq!(progress[0].0.detail, "0 frozen (sigstop), settled");
+    // This host may delegate a real cgroup freezer. The progress must agree with
+    // the recorded pause method while retaining the same count/settled contract.
+    let method = match &answer {
+        Response::Paused { record, .. } => match record.event {
+            WardEvent::SessionPaused {
+                method: PauseMethod::Sigstop,
+                ..
+            } => "sigstop",
+            WardEvent::SessionPaused {
+                method: PauseMethod::CgroupFreezer,
+                ..
+            } => "cgroup freezer",
+            ref event => panic!("pause returned the wrong event: {event:?}"),
+        },
+        other => panic!("expected a pause: {other:?}"),
+    };
+    let process_detail = format!("0 frozen ({method}), settled");
+    assert_eq!(progress[0].0.detail, process_detail);
     assert_eq!(progress[1].0.detail, "acknowledged");
     assert!(
         progress[0].1 < delay / 2,
@@ -412,7 +429,7 @@ fn progress_is_reported_per_component_as_it_happens() {
     );
     assert_eq!(
         progress[0].0.text(),
-        "processes · 0 frozen (sigstop), settled"
+        format!("processes · {process_detail}")
     );
     // The plain connection is unaffected by another connection's progress.
     assert!(matches!(
