@@ -34,7 +34,8 @@ rust-version = "1.94"
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# Keep the serde_yaml API name while using the YAML Organization's maintained fork.
+serde_yaml = { package = "yaml_serde", version = "0.10.7" }
 serde_json = "1"
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 blake3 = "1"
