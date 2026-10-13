@@ -250,12 +250,12 @@ closes it.)
 * **How, today — the compact head-bound token (canonical).** Generate one with:
 
   ```
-  npx --yes tamperward@2.42.0 signoff-label --rule verify --head <full-head-sha>
+  npx --yes tamperward@2.43.0 signoff-label --rule verify --head <full-head-sha>
   ```
 
   (or `--rule check` for a diff-time-gate sign-off, and `--file <path>` when the rule
   is file-scoped), and apply the resulting `tw1:<digest>` label to the pull request.
-  This is the mechanism `.github/workflows/tamperward.yml`'s pinned `tamperward@2.42.0`
+  This is the mechanism `.github/workflows/tamperward.yml`'s pinned `tamperward@2.43.0`
   actually verifies against: a short, opaque, versioned token that hashes the rule, the
   optional file, and the **complete** head object id — never a truncated display SHA —
   so it fits GitHub's 50-character label-name cap without relying on a prefix at all. It
@@ -274,7 +274,7 @@ closes it.)
   the longest that fits alongside the `tamperward:allow:verify@` prefix under GitHub's
   50-character label cap) as a fallback, on the mistaken premise that `tamperward`'s
   `oobToken` matcher accepted any prefix of the head SHA that was at least 7 hex
-  characters. That premise is wrong for the pinned CLI: under `tamperward@2.42.0`,
+  characters. That premise is wrong for the pinned CLI: under `tamperward@2.43.0`,
   once a full head SHA is supplied — which this repository's workflow always does,
   via `TAMPERWARD_OOB_HEAD` — `oobToken` requires a legacy label's SHA to equal
   that **full** 40-character object id; a prefix is rejected outright, not treated
