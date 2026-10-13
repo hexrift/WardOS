@@ -76,7 +76,7 @@ jobs:
           # same PR. A `tw1:` token is bound to this head by construction; a legacy
           # tamperward:allow:<rule>@<head-sha> label is bound by its @<head-sha>.
           TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: npx --yes tamperward@2.33.0 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
+        run: npx --yes tamperward@2.42.0 check --diff "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"
 
   # Pristine re-execution (`tamperward verify`): .tamperward.yml's `verify.command`
   # is run in TWO materialised copies of the tree — as-is (visible) and with the
@@ -147,4 +147,4 @@ jobs:
         env:
           TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
           TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: npx --yes tamperward@2.33.0 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
+        run: npx --yes tamperward@2.42.0 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
