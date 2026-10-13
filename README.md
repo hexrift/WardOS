@@ -4,324 +4,126 @@
 
 <h1 align="center">WardOS</h1>
 
-<p align="center"><strong>A secure Linux workstation for software engineers working with autonomous coding agents.</strong></p>
+<p align="center"><strong>A secure Linux workstation and execution runtime for coding agents.</strong></p>
 
-WardOS is a purpose-built Linux distribution for agentic software development. It gives
-coding agents (Claude Code, Codex, Gemini CLI, Aider, and whatever comes next) everything
-they need to work effectively, while keeping the host, policy, credentials, verifier, and
-trusted state **outside the agent's authority**.
+WardOS lets coding agents work inside an isolated project environment while keeping
+the host, policy, credentials, verifier and trusted state outside their authority.
+It combines a Linux desktop, a portable session runtime and a node service for
+bounded local or remotely driven execution.
 
-WardOS is also being evolved into a local + distributed execution platform without
-discarding that workstation/runtime path. The target split is **WardOS distribution +
-portable Ward runtime + `ward-node`**, driven where needed by an **external control plane
-(not part of WardOS)**
-([ADR-0029](docs/decisions/ADR-0029-product-split-fleet-trust-boundaries.md)). Local mode
-remains first-class and needs no remote service; an external control plane distributes
-bounded, expiring authority while enforcement, resource limits, credential isolation and
-evidence remain node-local. The node's protocol for such a control plane is in
-[docs/node-integration.md](docs/node-integration.md). WardOS's side of that contract is
-tracked under [#332](https://github.com/hexrift/WardOS/issues/332) and is not claimed as
-delivered until its acceptance tests land.
+| Component | Use it for |
+| --- | --- |
+| **WardOS distribution** | A Fedora bootc workstation with a Hyprland desktop, security status bar, Claude Code, Codex and TamperWard. |
+| **Ward runtime** (`ward`, `wardd`, `ward-agent`) | Sandboxed agent sessions and independent verification on an existing Linux host. |
+| **`ward-node`** | Signed, expiring task authority, isolated attempts, resource limits, receipts and evidence for a local issuer or external control plane. |
 
-![The WardOS desktop from the first login to the lock screen, captured from the shipped Hyprland: the trust bar with no session over the Ward Dark wallpaper, the four steps of the first login (a theme, a key kept on the host, a project, an agent), ward init and ward up on ward-demo in the terminal with the trust bar going live, the closing step, ward watch beside the session with the welcome toast, the command centre, a theme switch to Tokyo Night, the lock screen](assets/wardos-desktop.gif)
+Local sessions need no remote service. An external control plane is built separately;
+WardOS enforces authority and records evidence on the execution host.
+See the [product and trust boundaries](docs/decisions/ADR-0029-product-split-fleet-trust-boundaries.md).
 
-<p align="center"><sub>Captured from the shipped Hyprland, Waybar, mako, fuzzel, foot and hyprlock on a virtual output in CI, every pixel the compositor's (<a href="docs/desktop.md#the-readme-animation">how</a>). Not shown: an agent at work, an approval and <code>ward verify</code>, since CI has no model key and no user namespaces.</sub></p>
+![WardOS desktop: onboarding, live security status, command centre, themes and lock screen](assets/wardos-desktop.gif)
 
-```bash
-ward init            # policy, verifier config and TamperWard wiring; the verify command is proposed, accepted by you
-ward ready           # is this project verifiable yet? policy, verifier config (accepted?), runtime, key
-ward claude          # Claude Code in the sandbox; keys stay on the host
-ward verify          # the protected tests, in a disposable verifier, from the entry snapshot
-```
+<sub>Captured from the shipped desktop in CI. This animation shows the interface;
+agent execution, approvals and verification are covered by the runtime tests.
+[Capture details](docs/desktop.md#the-readme-animation).</sub>
 
 ## Get started
 
-On a Linux you already have, install the release binaries: the tarball for your
-architecture and its checksum from the
-[latest release](https://github.com/hexrift/WardOS/releases/latest)
-(`wardos-<version>-<arch>-linux.tar.gz` and `.sha256`; `<arch>` is `uname -m`, x86_64
-or aarch64), checked before anything is unpacked:
+**On an existing Linux host:** download the runtime tarball for `x86_64` or
+`aarch64` from the [latest release](https://github.com/hexrift/WardOS/releases/latest).
+Follow the [installation guide](docs/install.md) to verify the download and install
+`ward`, `wardd` and `ward-agent`. The runtime requires `bubblewrap` and
+unprivileged user namespaces; `ward doctor` reports missing prerequisites.
+
+The optional [installer](install.sh) installs the latest runtime release into
+`~/.local/bin` and checks its signed manifest when verification is available.
+It reports checksum-only installs explicitly; `--require-provenance` refuses them.
+See [release verification](docs/release-manifest.md) for prerequisites and manual checks.
+
+**For the full workstation:** follow the [image guide](image/README.md).
+Use a qcow2 image for a VM or a raw image for a USB trial. The installer ISO erases
+the target disk. The image includes the desktop and agents; the standalone runtime
+requires the agent CLI to be installed separately.
+
+In your project on Linux:
 
 ```bash
-sha256sum -c wardos-0.2.0-x86_64-linux.tar.gz.sha256      # the checksum from the same release
-tar -xzf wardos-0.2.0-x86_64-linux.tar.gz
-cp wardos-0.2.0-x86_64-linux/{ward,wardd,ward-agent} ~/.local/bin/
+ward doctor
+ward vault set ANTHROPIC_API_KEY   # enter the key; it stays on the host
+ward init                         # review and accept the proposed verification command
+ward ready                        # check policy, tools, credentials and verification setup
+ward prepare                      # prepare dependencies for the offline verifier
+ward ready --baseline             # run the tests before the agent changes anything
+ward claude                       # launch Claude Code inside the sandbox
+ward verify                       # verify with protected inputs from the entry snapshot
+ward ready --answers              # inspect reach, credentials, changes and verification
+ward stop                         # end the session and seal its evidence log
 ```
 
-On a machine of its own, boot the image ([`image/README.md`](image/README.md)): the
-agents, TamperWard and the desktop are in it, and the first login walks you through a
-theme, a key, a project and an agent. To *try* it without giving up a machine, boot a
-`--type raw` image from a USB stick or a `--type qcow2` image in a VM; the `--type iso`
-is an installer that erases the target disk
-([which image to use](image/README.md#three-kinds-of-image-which-one-and-the-one-that-erases-a-disk)). The convenient development installer,
-`curl -fsSL https://raw.githubusercontent.com/hexrift/WardOS/main/install.sh | bash`,
-does the three steps above for you, verifies the release against its signed manifest
-when it has one (`--require-provenance` to insist), and runs `ward doctor`; it is a
-shell script fetched from `main`, so read it first ([`docs/install.md`](docs/install.md)).
+For Codex, use `OPENAI_API_KEY`, `ward init --agent codex` and `ward codex`.
+The [onboarding guide](docs/onboarding.md) explains setup and denied actions.
+Use `ward watch` from another terminal to follow activity, and `ward pause` /
+`ward resume` to intervene.
 
-Then, in any project, six commands and about five minutes
-([`docs/onboarding.md`](docs/onboarding.md)):
+## How it works
 
-```bash
-ward doctor                        # what this host can give a session, with a fix per gap
-ward vault set ANTHROPIC_API_KEY   # the model key, typed without echo, kept on the host
-ward init                          # policy, verifier config, TamperWard wiring; never overwrites yours; --accept-verify accepts the proposed verify command
-ward ready                         # is this project verifiable yet? policy, runtime, key, protected paths, dependencies prepared, last baseline
-ward prepare                       # the lockfile's dependency set, installed once, online, sealed for the offline verifier
-ward ready --baseline              # the project's own tests once, offline, before any agent work; red is "baseline failing", not setup required
-ward claude                        # Claude Code in the sandbox; the proxy injects the key
-ward verify                        # the protected tests, from the entry snapshot, offline
-ward ready --answers               # what the agent could reach, which credentials, what it changed, whether it is verified, each with its source
-```
+- **Bounded execution.** Project policy becomes a capability manifest. Agents run in
+  a sandbox with network access mediated by a host-side policy proxy.
+- **Host-held credentials.** Supported model and GitHub credentials are injected
+  through the proxy rather than exposed as long-lived secrets inside the sandbox.
+- **Independent verification.** `ward verify` captures a candidate and runs offline,
+  restoring protected tests and verification configuration from the entry snapshot.
+  Editing those inputs in the worktree cannot redefine the verifier's checks.
+- **Recorded evidence.** Content-addressed snapshots and a hash-chained event log
+  support inspection and replay. The desktop shows verification freshness, approvals
+  and temporary grants; agent reports remain labelled as claims.
 
-## See it running
-
-![A WardOS session on the demo project: ward init, the security panel, a sandboxed command with two private-network probes denied, a failing protected test, a shortcut that edits the test and is undone by the verifier, the real fix VERIFIED](assets/ward-session.gif)
-
-The prototype runs today on any Linux host with `bubblewrap`. It merges the project's
-policy into a capability manifest, freezes a content-addressed entry snapshot, runs
-commands inside an isolated sandbox with live kernel-origin file events, routes every
-network request through a per-session policy proxy, and records everything to an
-append-only, hash-chained event log that persists across commands.
-
-![A WardOS session: security panel with the daemon line, live observer with network decisions, the four self-test groups at 15/15](assets/ward-session.png)
-
-Claude Code runs inside that sandbox unmodified. The model-API key stays on the host:
-the agent gets a placeholder and a base URL on the session proxy, which injects the real
-key on the way out (`CRED`). Its hooks report to `wardd` (`NOTE`, `TOOL`), and every
-request to `api.anthropic.com` is a `NET` row. Below, a deliberately invalid host key:
-the API's `401` is the proof that the request left through the gateway and nothing else.
-
-![Claude Code headless inside a WardOS session: credential granted by proxy injection, network rows for every API call, the SessionStart hook recorded as a claim](assets/ward-claude.png)
-
-The verifier guards the judge, not the implementation. `ward verify` snapshots the
-worktree as a candidate, takes every protected test and the verify config from the
-*entry* snapshot, and runs the suite offline in a disposable sandbox. Below, the demo's
-bug fails; the shortcut of gutting the protected security test changes nothing, because
-the verifier restores the pristine copy; the real one-line fix passes.
-
-![ward verify on the demo: the bug fails, a weakened protected test is restored from the entry snapshot and still fails, the real fix is VERIFIED](assets/ward-verify.png)
-
-Each session's log has one writer. `ward up` starts a per-session `wardd` that owns the
-hash chain behind a control socket; every `ward` command writes through it, TamperWard
-appends its decisions as `origin=tamperward` evidence, and `ward watch` follows the log
-live from another terminal, as a full-screen observer (trust bar, activity stream,
-counters) or as plain rows on a pipe. Without a daemon, every command still works in-process.
-
-File and network observations reach that log *while a command is still running*, not in
-one batch when it exits: the file watch, the session proxy's decision recorder and the
-agent hook broker each hand what they see to a bounded per-source queue, and the single
-writer drains them every 250 ms — or every 256 observations, whichever comes first —
-then flushes once more before the command's terminal record. The bound never gates
-enforcement (the proxy keeps deciding in real time however far behind the log is) and
-never hides a gap: an observation a full queue had to refuse is counted and appended as
-an explicit `GAP` row (`ObservationsDropped`) beside the batch it belongs to.
-
-![A daemon-backed session: ward up spawns wardd, a producer and a TamperWard evidence record write through the control socket, and ward watch streams every row live until the session ends](assets/ward-watch.png)
-
-```bash
-# the binaries: the release tarball (Get started), install.sh, or cargo build --release
-ward doctor                         # what this host can give a session, with a fix per gap
-ward ready    examples/ward-demo    # is this project verifiable yet? policy, runtime, key, protected paths, dependencies, last baseline
-ward ready    examples/ward-demo --baseline   # run the verify command once over the entry state and record it (red = baseline failing)
-ward prepare  examples/ward-demo    # a Node/Python lockfile's dependency set, installed once online, sealed for the verifier (Cargo needs none)
-ward up       examples/ward-demo    # start a session: policy → manifest, entry snapshot, log
-ward run --dir examples/ward-demo -- cargo test   # run inside the sandbox; live observer
-ward claude   examples/ward-demo    # launch Claude Code; ANTHROPIC_API_KEY stays on the host
-ward claude   examples/ward-demo --grant github   # …and git/API calls to GitHub through the proxy
-ward status   examples/ward-demo    # the security panel for the active session
-ward verify   examples/ward-demo    # trusted verifier: protected tests from the entry snapshot
-ward ready    examples/ward-demo --answers   # the four E-14 answers from the session's records: reach, credentials, changes, verified
-ward selftest examples/ward-demo    # prove the isolation (38 hostile probes; none reaches its target)
-ward pause    examples/ward-demo    # freeze the agents as one operation: processes, network, credentials, approvals (--reason, --status); each component is reported as it confirms, the last line is the lifecycle state
-ward resume   examples/ward-demo    # let them continue (the same per-component lines, in release order)
-ward stop     examples/ward-demo    # end every sandboxed process (confirmed gone), then seal the log; the workspace stays
-ward stop     examples/ward-demo --restore-entry   # …holding the session frozen for the stop first, then writing the entry snapshot back over the worktree (.ward/restore-<ts>/ keeps what it replaced)
-ward replay   <events.log>          # replay any sealed session (--verify, --json, --stats for E-13 approval load)
-ward session describe examples/ward-demo   # the session's immutable facts for TamperWard (--json)
-ward session pending   examples/ward-demo  # held approvals: destination · requested by agent · Ward will allow (--json)
-ward session approvals examples/ward-demo  # every approval asked, pending or decided (state, id, tool, destination; --json)
-ward session grants    examples/ward-demo  # the temporary authority the agent holds: allow-session answers, --grant credentials (--json)
-ward snapshot create  examples/ward-demo   # capture the worktree into the CAS (--role candidate|final)
-ward snapshot diff    <a> <b>              # manifest-level diff from the CAS, not the worktree (--json)
-ward snapshot cat     <id> <path>          # pristine bytes of a path in a snapshot
-ward snapshot usage                        # storage usage by category, plus leftover scratch and its owner (--json)
-ward watch            examples/ward-demo   # full-screen observer on a terminal (--tui; q quits), one row per line on a pipe or with --plain (--from <seq>, --all)
-ward evidence append  examples/ward-demo --json '{"TamperDetected":{"subject":"VerifyConfig","detail":".tamperward/config.yml"}}'
-                                           # append a TamperWard-origin record through the daemon (--json - reads stdin)
-```
-
-In the session above the sandbox's only way out is a Unix socket to the session proxy:
-an allowlisted registry is reached over real HTTPS (`NET`, `http 200`), while a private
-address and the cloud metadata endpoint are refused host-side (`DENY`, `403`). The host
-home, SSH keys, cloud credentials, Docker socket, and the namespace, cgroup and symlink
-escape routes are never reachable, so `ward selftest` shows every probe denied by
-construction, and CI reproduces the same result on every pull request.
-
-## Design principle
-
-> Give coding agents everything they need to work effectively, while keeping the host,
-> policy, credentials, verifier, and trusted state outside their authority.
-
-WardOS provides **isolation and trustworthy primitives**. TamperWard provides **policy,
-protected invariants, tamper detection, independent verification, and evidence**. The two
-are designed together but do not duplicate each other:
-
-```text
-WardOS policy      = capabilities and isolation   (what the agent CAN reach)
-TamperWard policy  = allowed behaviour and verification (what the agent MAY do, and whether
-                     the result is acceptable)
-```
+WardOS supplies isolation and runtime primitives. TamperWard supplies protected
+invariants, tamper detection and independent checks. The
+[security model](docs/security-model.md) and [threat model](docs/threat-model.md)
+define the guarantees, assumptions and limits.
 
 ## Status
 
-**Phase 7 — authority, freshness, intervention.** The phase is declared once, in
-[`docs/status.toml`](docs/status.toml), and CI fails any document that claims one of
-its own. The contract is [ADR-0019](docs/decisions/ADR-0019-authority-freshness-intervention.md):
-the architecture and the visual language stay, what changes is what a human can read
-from the desktop at a glance. In progress:
+**Phase 7 — authority, freshness, intervention**, as declared in
+[`docs/status.toml`](docs/status.toml). See the [roadmap](docs/roadmap.md) and
+[experiments](docs/experiments.md) for remaining work and measured results.
 
-* **Verification bound to a snapshot, with its freshness shown.** `VERIFY` has five
-  states (`—`, `◐`, `✓ 7c01…`, `~ STALE`, `✗`); green disappears the moment the
-  worktree differs from the verified candidate, decided by content, not heuristics.
-  Built: the shell digests the worktree before every bar frame and `ward-shell
-  verify-panel` (the segment's click) shows the candidate, the digest and what differs.
-* **Approvals that separate the agent's claim from Ward's authority.** The destination,
-  *requested by agent* (verbatim, labelled as the agent's words) and *Ward will allow*
-  (what the policy and credential rules actually grant) as three blocks.
-* **Pause as a host primitive.** `ward pause` and one key freeze the session, close the
-  proxy, suspend credential injection and hold approvals as one recorded operation;
-  the exits are resume, stop keeping the workspace, stop restoring the entry state.
-* **Temporary authority visible while it exists.** A session-scoped grant changes the
-  bar (`NET restricted · github+`, `GRANTS 1`) until the session ends.
-* **Approval load as a security metric.** E-13 (approvals per agent-hour, approve and
-  deny rates, decision time, and the rest) and E-14 (ten to twenty real tasks, bare
-  agent against WardOS, ending with four comprehension questions); no targets until
-  the data exists ([`docs/experiments.md`](docs/experiments.md)).
-* **The security proofs behind ADR-0019 are all delivered** ([`docs/security-model.md`](docs/security-model.md) §6):
-  ST-018 freeze before capture (the daemon freezes the sandbox for the length of a
-  candidate/final capture so no agent write interleaves with it, an integration test
-  reproduced by CI); ST-022 TLS interception, ST-026 raw TCP, SOCKS and UDP, ST-027
-  loopback and control surfaces, ST-028 DNS rebinding and pinning, as the
-  `egress and surfaces` group of `ward selftest` (thirteen rows, §6.1); and ST-029 a
-  hostile verifier corpus, nine hostile repositories run through the real verifier as
-  the `verifier corpus` group (§6.2).
-* **One install path and one status.** The release tarball with its checksum is the
-  primary install; the release manifest is signed keyless by the release workflow and
-  verifiable offline ([`docs/release-manifest.md`](docs/release-manifest.md)), and the
-  installer does not verify it yet ([`docs/roadmap.md`](docs/roadmap.md)).
+The current `main` includes the session runtime, offline verifier, desktop and
+`ward-node` execution contract with cross-system acceptance tests. Node capabilities
+include network allowlists, bounded output return, brokered credentials, approval
+holds, hosted agent adapters and mutual TLS, enabled by the operator and constrained
+by signed task authority.
 
-Delivered. The v0.2.0 release ships the five host binaries with the bootable disks
-attached; `ghcr.io/hexrift/wardos:latest` is rebuilt, linted and published on every
-merge, for x86_64 and aarch64, and an installed host follows it on a timer with
-rollback. What the image holds today:
+The first local migration path is also implemented: `ward node migrate`,
+`ward node serve` and `ward run --via-node`. The other session commands and desktop
+still use the per-session runtime. Follow the [migration guide](docs/migration-to-node.md)
+for compatibility and rollback, and the [node security limitations](docs/node-security-limitations.md)
+before integrating a control plane.
 
-* **The secure-session layer.** `ward up` / `run` / `claude` / `codex` / `stop` /
-  `verify` / `replay --verify` on a capability manifest, content-addressed entry
-  snapshots and a hash-chained log; a per-session `wardd` as the single log writer; a
-  per-session policy proxy that is the sandbox's only way out, injecting the model-API
-  and GitHub credentials on repo-scoped routes so no key ever enters the sandbox; Claude
-  Code hooks reporting to `wardd`, `ask` decisions held by the daemon until the desktop
-  answers; `ward pause` / `ward resume`, the host's own hold on a session as one
-  recorded operation (processes frozen, proxy closed, credentials suspended, approvals
-  held), with `ward stop --restore-entry` to leave as you came; `ward verify`, a
-  disposable offline verifier that takes the protected tests and its config from the
-  entry snapshot; 38 hostile probes in `ward selftest`, every one denied where the host
-  can run it (a probe the host cannot run, such as the IPv6 path on a kernel without
-  IPv6 or a cgroup limit the bubblewrap backend does not apply, says
-  `CANNOT-MEASURE-HERE` and never counts as a pass), reproduced by CI on every
-  pull request; a daemon-backed warm start of 32 ms.
-* **The agents.** Claude Code, OpenAI Codex and TamperWard at pinned versions with a
-  lockfile, installed at build time, read-only in the sandbox; `ward init` makes any
-  directory a project (policy, verifier config, TamperWard wiring, idempotent);
-  `ward vault` keeps keys on the host; `ward doctor` reports agents, keys, firewall and
-  kernel features with a fix for each gap.
-* **The desktop** ([ADR-0016](docs/decisions/ADR-0016-desktop-feature-set.md),
-  [`docs/desktop.md`](docs/desktop.md)): Hyprland 0.56 with the full key set, the trust
-  bar in Waybar (its `VERIFY ✓` turns `~ STALE` the moment the worktree differs from
-  the verified candidate), the command centre and every menu in fuzzel, approvals as
-  notifications that show the destination, the agent's claim labelled as its own and
-  what Ward will allow (ADR-0019), answered with `y`/`s`/`n`, `Super + Shift + P` to
-  pause the agents with the exits in a menu, every temporary grant on the bar while it
-  lasts, fourteen themes rendered into every component
-  with a wallpaper drawn from each theme's tokens, a lock screen, the `wardos-*` command
-  family for capture, power, web apps, terminal apps, installs and setup, and
-  `wardos-welcome` for the first login. CI parses the Hyprland tree with the compositor
-  the image ships, so a renamed option fails a pull request instead of a boot.
-* **Security posture.** LUKS by default on the installer ISO, a firewall that admits
-  nothing inbound, timed image updates, no compiler on the host (a Rust toolchain for
-  `ward verify` lives in the user's home, `wardos-install dev rust`), one browser,
-  every package name checked against Fedora 44 before the image is built, and nothing
-  in the image is fetched by `curl | sh` at build time.
-* **Agent-first onboarding** ([ADR-0017](docs/decisions/ADR-0017-agent-first-image.md)):
-  `wardos-welcome` walks the first login through theme, key, project and agent;
-  `ward init`, `ward vault` and `ward doctor` are the same path on any Linux; the
-  image boots to the desktop in QEMU on a Fedora laptop (E-09, first boot; the
-  Hyprland config errors it showed are fixed and now caught by CI).
-
-Still ahead, behind the list above: the onboarding walk on real hardware with the time
-from boot to `✓ VERIFIED`, the semantic TamperWard rules, the verifier image, the
-shell's own toolkit (E-10), and the Secure Boot chain.
-
-See [`docs/roadmap.md`](docs/roadmap.md) for the phase plan and
-[`docs/experiments.md`](docs/experiments.md) for the recorded results of the experiments
-that gate each phase.
+`main` may contain changes newer than the latest release. Runtime and node tarballs
+have separate versions, recorded together in the release manifest; the runtime
+installer does not install the node service. See
+[node installation](docs/node-integration-guide.md) and
+[release readiness](docs/node-release-readiness.md).
 
 ## Documentation
 
-| Document | Purpose |
+| Start here | Guide |
 | --- | --- |
-| [`docs/architecture.md`](docs/architecture.md) | Components, trust zones, session lifecycle, data flows |
-| [`docs/threat-model.md`](docs/threat-model.md) | Assets, adversaries, attack surfaces, mitigations, explicit non-goals |
-| [`docs/security-model.md`](docs/security-model.md) | Guarantees WardOS makes, guarantees it does not make, capability model, defaults |
-| [`docs/snapshots-and-git.md`](docs/snapshots-and-git.md) | Frozen entry state, candidate state, and why `.git` is not trusted |
-| [`docs/event-model.md`](docs/event-model.md) | The typed Ward event model, evidence chain, observer and replay |
-| [`docs/credential-broker.md`](docs/credential-broker.md) | How agents obtain scoped, short-lived credentials without seeing long-lived secrets |
-| [`docs/tamperward-integration.md`](docs/tamperward-integration.md) | The OS-level primitives WardOS exposes to TamperWard |
-| [`docs/onboarding.md`](docs/onboarding.md) | Five minutes to a verified agent: boot, welcome, key, project, `ward claude`, `ward verify`, what the bar shows, what to do when something is denied |
-| [`docs/install.md`](docs/install.md) | Install on an existing Linux host, requirements, first project and session |
-| [`docs/release-manifest.md`](docs/release-manifest.md) | The machine-readable release manifest format (ADR-0028) and its generator |
-| [`docs/compatibility.md`](docs/compatibility.md) | The `ward-node` protocol window, version skew and upgrade order for an external control plane |
-| [`docs/node-acceptance.md`](docs/node-acceptance.md) | The cross-system acceptance suite for the `ward-node` contract: each case, its pass criterion, how to run it, what it does not prove |
-| [`docs/node-integration-guide.md`](docs/node-integration-guide.md) | From an empty host to a verified `ward-node` attempt: install, issuer key and trust store, snapshot, one pre-signed run, receipt and evidence, failures, restarts |
-| [`docs/node-integration-from-nodejs.md`](docs/node-integration-from-nodejs.md) | The same for a Node.js or TypeScript control plane: key custody, id derivation, the version counter, signing with `node:crypto`, the `ward-node-adapter` JSON-lines conversation, outcomes and bounded result return, cancel, recovery, what is not available yet, and the checklist; the reference client is `examples/node-control-plane` |
-| [`docs/node-security-limitations.md`](docs/node-security-limitations.md) | What `ward-node` enforces and what it does not yet, each gap with its impact for a control plane, the mitigation today and the issue that closes it |
-| [`docs/node-release-readiness.md`](docs/node-release-readiness.md) | What CI proves about `ward-node` on every change, what a release publishes, what is not proven, and the checks before tagging |
-| [`docs/migration-to-node.md`](docs/migration-to-node.md) | Per-session `wardd` and `ward-node` side by side, how they coexist on one host, the staged path from one to the other with the issue for each stage, and the compatibility statement |
-| [`docs/agent-integration.md`](docs/agent-integration.md) | How `ward claude` / `ward codex` compose the sandbox, proxy, credentials and hooks |
-| [`docs/design-language.md`](docs/design-language.md) | Visual and interaction identity of the WardOS desktop |
-| [`docs/desktop.md`](docs/desktop.md) | The desktop: commands, keys, menu, themes, packages, parity with Omarchy |
-| [`docs/performance.md`](docs/performance.md) | Latency budgets, benchmark methodology, CI regression gates |
-| [`docs/experiments.md`](docs/experiments.md) | Highest-risk assumptions and the experiments that must settle them |
-| [`docs/roadmap.md`](docs/roadmap.md) | Phases, first-prototype scope, acceptance criteria, implementation sequence |
-| [`docs/repository-structure.md`](docs/repository-structure.md) | Proposed layout of this repository |
-| [`docs/decisions/`](docs/decisions/) | Architecture Decision Records for every major technology choice |
-
-## Engineering principles
-
-1. Architecture over micro-optimisation.
-2. Isolation over detection, where OS enforcement is appropriate.
-3. Independent verification over trusting agent reports.
-4. Fail closed for security decisions.
-5. No invisible privilege escalation.
-6. Performance must be measured.
-7. Security claims must be testable.
-8. The user should not need to understand the machinery.
-9. Use existing Linux primitives before inventing replacements.
-10. Do not optimise the benchmark by weakening the product.
-
-## Non-goals
-
-WardOS 0.1 is not a general-purpose desktop, a server OS, a Kubernetes distribution, a
-gaming distro, a custom kernel project, a universal-hardware project, a promise of perfect
-sandbox security, or an enterprise management platform. See
-[`docs/roadmap.md`](docs/roadmap.md#non-goals).
-
+| Installation and first session | [Install](docs/install.md) · [Onboarding](docs/onboarding.md) |
+| Desktop commands, keys and themes | [Desktop](docs/desktop.md) |
+| Components and trust boundaries | [Architecture](docs/architecture.md) · [Decision records](docs/decisions/) |
+| Security guarantees and evidence | [Security model](docs/security-model.md) · [Threat model](docs/threat-model.md) · [Event model](docs/event-model.md) |
+| Agent and TamperWard integration | [Agent integration](docs/agent-integration.md) · [TamperWard integration](docs/tamperward-integration.md) |
+| Node protocol and control-plane clients | [Contract](docs/node-integration.md) · [Integration guide](docs/node-integration-guide.md) · [Node.js / TypeScript](docs/node-integration-from-nodejs.md) |
+| Node compatibility and acceptance | [Compatibility](docs/compatibility.md) · [Acceptance tests](docs/node-acceptance.md) |
+| Plans and measurements | [Roadmap](docs/roadmap.md) · [Experiments](docs/experiments.md) · [Performance](docs/performance.md) |
 
 ## Contributing
 
-See [`CONTRIBUTING.md`](CONTRIBUTING.md) for how to build, verify and propose a change,
-and [`SECURITY.md`](SECURITY.md) for how to report a vulnerability.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for source builds, verification and pull requests,
+and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 ## License
 
