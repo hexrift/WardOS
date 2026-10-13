@@ -59,6 +59,11 @@ No token is needed. For a private fork, export `GITHUB_TOKEN` (or `GH_TOKEN`) wi
 read access first; the installer then fetches the release assets, and the verifier,
 through the GitHub API with it.
 
+For Node or Python projects, check the [offline dependency setup and release
+boundary](#node-and-python-dependencies-in-the-offline-verifier) before starting
+verification: v0.4.1 does not include `ward prepare`, even though this guide's
+current-source workflow uses it.
+
 **What `install.sh` verifies, and says.** Before it installs a downloaded release it
 walks ADR-0028 §5's states and prints each one it reaches, in the ADR's words, so the
 terminal or a log shows what was proven; the last line is `install: <state reached>`.
@@ -164,6 +169,51 @@ ward stop                  # end the sandboxed processes, then seal the log
 
 `examples/ward-demo` is a project with a protected test and a tempting shortcut, for
 seeing `ward verify` refuse one.
+
+### Node and Python dependencies in the offline verifier
+
+`ward run -- npm test` uses the live worktree, including its installed dependencies.
+`ward verify` instead materialises a snapshot in a disposable, offline sandbox;
+ignored `node_modules` directories are not part of that snapshot. Installing packages
+with `npm ci` in the worktree is therefore insufficient for trusted verification.
+
+Prepare the lockfile's dependency environment before starting the session:
+
+```bash
+cd your-project
+ward init --accept-verify           # review the proposed command and protected inputs first
+ward prepare                       # explicitly online; installs locked dependencies without scripts
+ward ready                         # check the verifier command, protected paths and dependencies
+ward up                            # freeze the accepted configuration and protected tests
+ward verify                        # mounts the prepared dependencies read-only; still offline
+ward stop
+```
+
+`ward prepare` supports npm, pnpm and Yarn lockfiles and Python requirements files.
+The environment is keyed by the input digests, runtime version, platform and registry;
+run it again when those inputs change. Preparation never gives the agent or the
+verifier host network access. See [`tamperward-integration.md`](tamperward-integration.md)
+§6 and [`onboarding.md`](onboarding.md) for the dependency and readiness checks.
+
+**Release boundary (13 October 2026):** the latest release, **v0.4.1**, has
+neither `ward prepare` nor `ward ready` (nor `init --accept-verify`). The dependency
+preparation implementation was merged after that tag in
+[PR #389](https://github.com/hexrift/WardOS/pull/389). On v0.4.1, a Node verifier can
+fail with `vitest: command not found` even though the same suite passes under
+`ward run`. Build current source as in §3, or install a later release that includes
+PR #389, before using the commands above. Check `ward prepare --help` to confirm the
+installed binary supports preparation. Keep the verifier offline; fetching packages
+from `verify.command` does not fix this boundary.
+The release and real-project acceptance are tracked in
+[issue #451](https://github.com/hexrift/WardOS/issues/451).
+
+For `tamperward-lite`, use `ward init --no-tamperward --accept-verify`: Lite provides
+`check`, not the full package's `tamperward init` command. Review that the protected
+test path is `test/` and that `vitest.config.ts` is protected before `ward up`.
+On the bubblewrap backend, Vitest may also need `server: { host: '127.0.0.1' }` in
+its Vite configuration: an isolated launch does not bind the host's resolver files,
+so resolving `localhost` can fail with `EAI_AGAIN`. This is separate from missing
+verifier dependencies; changing the bind address does not prepare them.
 
 ### 4.1 Optional: local node mode
 
