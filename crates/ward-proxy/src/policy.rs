@@ -212,6 +212,8 @@ mod tests {
             .with("github.com", [ip(PUBLIC), ip(PUBLIC6)])
             .with("pypi.org", [ip(PUBLIC)])
             .with("api.anthropic.com", [ip(PUBLIC)])
+            .with("platform.claude.com", [ip(PUBLIC)])
+            .with("claude.ai", [ip(PUBLIC)])
             .with("app.example.com", [ip(PUBLIC)])
             .with("localhost", [ip("127.0.0.1"), ip("::1")])
             .with("rebind.evil", [ip(PUBLIC), ip("10.0.0.5")])
@@ -295,6 +297,37 @@ mod tests {
             eval(cap, &name("app.example.com", 443)),
             Err(Denial::NotAllowlisted)
         );
+    }
+
+    #[test]
+    fn claude_startup_hosts_are_exact_and_development_only() {
+        for host in ["platform.claude.com", "claude.ai"] {
+            let target = name(host, 443);
+            assert!(eval(NetworkCapability::Development, &target).is_ok());
+            assert_eq!(
+                eval(NetworkCapability::Offline, &target),
+                Err(Denial::Offline)
+            );
+            for cap in [
+                NetworkCapability::LocalhostOnly,
+                NetworkCapability::Registries,
+                custom(&["api.anthropic.com"]),
+            ] {
+                assert_eq!(eval(cap, &target), Err(Denial::NotAllowlisted));
+            }
+        }
+        let policy = Policy::new(NetworkCapability::Development);
+        for host in [
+            "other.claude.com",
+            "sub.claude.ai",
+            "platform.claude.com.evil.example",
+            "mcp-proxy.anthropic.com",
+        ] {
+            assert_eq!(
+                policy.check_host(&name(host, 443)),
+                Err(Denial::NotAllowlisted)
+            );
+        }
     }
 
     #[test]

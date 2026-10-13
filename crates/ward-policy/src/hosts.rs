@@ -19,7 +19,7 @@ pub const REGISTRY_HOSTS: &[&str] = &[
     "proxy.golang.org",
 ];
 
-/// VCS hosts and model APIs added by `NetworkCapability::Development`
+/// VCS hosts, model APIs and agent startup hosts added by `NetworkCapability::Development`
 /// (on top of [`REGISTRY_HOSTS`]).
 pub const DEVELOPMENT_HOSTS: &[&str] = &[
     "github.com",
@@ -27,6 +27,8 @@ pub const DEVELOPMENT_HOSTS: &[&str] = &[
     "codeload.github.com",
     "objects.githubusercontent.com",
     "api.anthropic.com",
+    "platform.claude.com",
+    "claude.ai",
     "api.openai.com",
     "generativelanguage.googleapis.com",
 ];

@@ -48,8 +48,14 @@ Required for Claude Code to function (allowlisted in `Development` mode):
 | Host | Purpose | Notes |
 | --- | --- | --- |
 | `api.anthropic.com` | model API | required |
-| `claude.ai`, `platform.claude.com` | OAuth / token exchange | required for OAuth login; not needed with an API key or gateway |
+| `claude.ai`, `platform.claude.com` | startup / authentication | Claude Code may contact these during startup even with an API key or gateway |
 | `mcp-proxy.anthropic.com` | hosted MCP connectors | optional; `ENABLE_CLAUDEAI_MCP_SERVERS=false` |
+
+`api.anthropic.com`, `claude.ai` and `platform.claude.com` are exact entries in
+the shared `development` preset; the optional MCP host is not included. They do not widen an
+`offline`, `localhost_only`, `registries` or explicit `custom` policy. Model API
+credentials remain injected only through the API gateway; allowing a startup host
+does not grant it the host-held key.
 
 Disabled inside the sandbox by default (denied by the proxy, and switched off so the
 agent does not retry): telemetry/error reporting (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`),
