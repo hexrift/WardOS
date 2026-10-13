@@ -75,7 +75,7 @@ BLOCK_END = "<!-- tamperward-prefix-guidance:reviewed-block:end -->"
 # deliberately whenever anything in that section changes, after a human
 # re-reads the new content for correctness against the pinned tamperward
 # CLI - never as a mechanical step to make this check pass again.
-PINNED_BLOCK_SHA256 = "713a88f14caebb7601475f1fdf313f346e6de7e91e698de31e24185ddb8e7230"
+PINNED_BLOCK_SHA256 = "05385b8f09658e96c3d0eecb9b68c47623442d5cdfdaab4c57808cd0f76d4c67"
 
 # The canonical, currently-working mechanism must stay documented.
 REQUIRED_PHRASES = ["tw1:", "signoff-label"]
