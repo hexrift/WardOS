@@ -98,6 +98,30 @@ Intent-ambiguous signals (assertion weakening, guard removal, snapshot rewrite) 
 `warn`. The ignore list starts empty; adding an ignore requires the same scrutiny as adding
 a suppression.
 
+### Cargo cache and verifier progress
+
+The pristine verification job needs TamperWard 2.43.0 or newer. Its explicit
+`--cargo-target-root` points outside the checkout; the cache action restores and saves
+both `visible` and `pristine` subdirectories there. The two materialised source trees
+remain fresh and separate, and both run the complete command from the trusted base.
+Only dependency crates are retained by the cache action; workspace crates are excluded
+and failed runs do not save caches. No timeout or policy budget is reduced.
+
+TamperWard reports each stage immediately and every 30 seconds on stderr. It reports
+elapsed time and captured byte counts; candidate output stays buffered and bounded so
+it cannot inject live workflow commands. JSON stdout remains a single verdict document.
+
+This fixes cache placement, not all cold-build costs: new dependency/toolchain keys and
+uncached workspace crates still compile. Separate output directories prevent ordinary
+cross-stage reuse; checkpointed-local verification runs candidate code with the caller's
+UID and provides no filesystem isolation against deliberate cache poisoning. Persistent
+build outputs are not attested. Operators needing fresh outputs can remove the cache
+option and unset `CARGO_TARGET_DIR`, retaining both complete runs.
+
+The integration check exercises the actual workflow command with a stub CLI and checks
+that its target root matches both cache-action paths, while retaining ancestor checking,
+the original suite command and the 3600-second per-stage budget.
+
 The verify command is `scripts/verify/tamperward.sh` and is deliberately boring: fmt,
 clippy with `-D warnings`, the full test suite, then the static security check and the
 TamperWard integration check. All of its inputs are declared so pristine verification
