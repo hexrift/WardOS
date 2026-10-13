@@ -115,6 +115,12 @@ jobs:
           toolchain: 1.94.1
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          key: verifier-stages-v1
+          workspaces: |
+            . -> ../tamperward-target/visible
+            . -> ../tamperward-target/pristine
+          cache-workspace-crates: false
       - run: pip install pyyaml
       # scripts/verify/tamperward.sh runs the bubblewrap-guarded ward-daemon tests.
       # Install bwrap and allow unprivileged user namespaces so they RUN (matching
@@ -147,4 +153,7 @@ jobs:
         env:
           TAMPERWARD_OOB_SIGNOFF: ${{ steps.oob.outputs.rules }}
           TAMPERWARD_OOB_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: npx --yes tamperward@2.42.0 verify --require-ancestor --base "${{ github.event.pull_request.base.sha }}"
+        run: >-
+          npx --yes tamperward@2.43.0 verify --require-ancestor
+          --base "${{ github.event.pull_request.base.sha }}"
+          --cargo-target-root "$GITHUB_WORKSPACE/../tamperward-target"

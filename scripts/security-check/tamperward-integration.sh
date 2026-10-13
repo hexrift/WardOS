@@ -14,6 +14,7 @@ fi
 if command -v python3 >/dev/null 2>&1; then
   python3 - <<'PY'
 import sys
+import subprocess
 try:
     import yaml  # type: ignore
 except ImportError:
@@ -26,6 +27,7 @@ for key in ("version", "protected", "rules", "verify"):
         print(f"tamperward-integration: missing top-level key {key!r}", file=sys.stderr)
         sys.exit(1)
 print("tamperward-integration: PASS")
+subprocess.run([sys.executable, "scripts/security-check/tamperward-cache.test.py"], check=True)
 PY
 else
   echo "tamperward-integration: python3 not available; syntax check skipped"
