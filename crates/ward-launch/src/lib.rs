@@ -168,6 +168,10 @@ const SYSTEM_RO: &[&str] = &[
     "/etc/alternatives",
     "/etc/ssl",
     "/etc/ca-certificates",
+    // Fedora's CA bundle symlinks target the extracted public trust store. Do not
+    // bind /etc/pki itself: it also contains private keys.
+    "/etc/pki/tls/certs",
+    "/etc/pki/ca-trust/extracted",
 ];
 /// The directories of `/proc` every sandbox masks with an empty read-only tmpfs.
 pub const PROC_MASKED_DIRECTORIES: [&str; 3] = ["acpi", "asound", "scsi"];
@@ -322,7 +326,7 @@ pub struct Launch {
     budget: Option<Duration>,
     capture_bytes: Option<usize>,
     raw_head_bytes: Option<usize>,
-    keep_prefix: Option<String>,
+    keep_prefix: Option<Vec<String>>,
     clear_env: bool,
     host_network: bool,
     cgroup: Option<PathBuf>,
@@ -605,10 +609,13 @@ impl Launch {
 
     /// Keep full copies of captured lines that start with `prefix` (e.g. test-result
     /// summaries), taken from the whole stream even when the retained text is
-    /// truncated — so counts are never read from text that was dropped.
+    /// truncated — so counts are never read from text that was dropped. Repeated calls
+    /// retain each prefix; a line matching more than one is kept only once.
     #[must_use]
     pub fn keep_lines(mut self, prefix: impl Into<String>) -> Self {
-        self.keep_prefix = Some(prefix.into());
+        self.keep_prefix
+            .get_or_insert_with(Vec::new)
+            .push(prefix.into());
         self
     }
 
@@ -1078,7 +1085,7 @@ fn drain<R: std::io::Read + Send + 'static>(
     mut r: R,
     bound: Option<usize>,
     raw_head: Option<usize>,
-    keep_prefix: Option<String>,
+    keep_prefix: Option<Vec<String>>,
 ) -> std::thread::JoinHandle<StreamCapture> {
     std::thread::spawn(move || {
         if let Some(bound) = bound {
@@ -1112,7 +1119,7 @@ fn drain_bounded<R: std::io::Read>(
     r: &mut R,
     bound: usize,
     raw_head_bound: Option<usize>,
-    keep_prefix: Option<&str>,
+    keep_prefix: Option<&[String]>,
 ) -> StreamCapture {
     use std::fmt::Write as _;
     let tail_limit = (bound / 4).max(1);
@@ -1194,13 +1201,13 @@ fn drain_bounded<R: std::io::Read>(
 
 /// Push `line` (a full line, without its newline) to `out` when it starts with
 /// `prefix` and the per-stream keep budget is not yet spent.
-fn push_kept_line(line: &[u8], prefix: &str, out: &mut Vec<String>, kept_bytes: &mut usize) {
+fn push_kept_line(line: &[u8], prefixes: &[String], out: &mut Vec<String>, kept_bytes: &mut usize) {
     if *kept_bytes >= MAX_KEPT_LINE_BYTES {
         return;
     }
     let text = String::from_utf8_lossy(line);
     let text = text.strip_suffix('\r').unwrap_or(&text);
-    if text.starts_with(prefix) {
+    if prefixes.iter().any(|prefix| text.starts_with(prefix)) {
         *kept_bytes += text.len();
         out.push(text.to_string());
     }
@@ -1527,6 +1534,53 @@ mod tests {
                 .spawn_runtime(Command::new("/nonexistent/runtime"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fedora_trust_roots_are_read_only_without_exposing_private_keys() {
+        let launch = Launch::new("/tmp", vec!["true".into()]);
+        let args = launch.args(Path::new("/tmp")).join(" ");
+        let plan = launch.plan(Path::new("/tmp"));
+        for root in ["/etc/pki/tls/certs", "/etc/pki/ca-trust/extracted"] {
+            assert!(is_system_ro(Path::new(root)), "missing trust root: {root}");
+            if Path::new(root).exists() {
+                assert!(args.contains(&format!("--ro-bind {root} {root}")));
+                assert!(plan.mounts.contains(&SandboxMount::ReadOnly {
+                    host: root.into(),
+                    path: root.into(),
+                }));
+            }
+        }
+        for private in ["/etc/pki", "/etc/pki/tls/private", "/etc/pki/private"] {
+            assert!(!is_system_ro(Path::new(private)), "exposed keys: {private}");
+        }
+        assert!(args.contains("--unshare-net"));
+        assert!(!args.contains("/etc/resolv.conf"));
+    }
+
+    #[test]
+    fn fedora_ca_bundle_symlink_resolves_inside_an_isolated_launch() {
+        let bundle = Path::new("/etc/pki/tls/certs/ca-bundle.crt");
+        if !bundle.exists() || !ward_sandbox::ci::isolation_ready(available(), "bubblewrap") {
+            return;
+        }
+        let out = Launch::new(
+            "/tmp",
+            vec![
+                "sh".into(),
+                "-c".into(),
+                "cat /etc/pki/tls/certs/ca-bundle.crt && \
+                 test ! -w /etc/pki/tls/certs/ca-bundle.crt && \
+                 test ! -e /etc/pki/tls/private && \
+                 test ! -e /etc/pki/ca-trust/source"
+                    .into(),
+            ],
+        )
+        .clear_env()
+        .run()
+        .unwrap();
+        assert_eq!(out.code, Some(0), "{}", out.stderr);
+        assert_eq!(out.stdout.as_bytes(), std::fs::read(bundle).unwrap());
     }
 
     #[test]
@@ -1894,6 +1948,34 @@ mod tests {
     }
 
     #[test]
+    fn multiple_summary_prefixes_survive_truncation_without_duplicates() {
+        let mut input = vec![b'x'; 4000];
+        input.extend_from_slice(
+            b"\ntest result: ok. 2 passed; 0 failed\n      Tests  81 passed (81)\n",
+        );
+        input.extend(std::iter::repeat_n(b'y', 4000));
+        let cap = drain_bounded(
+            &mut std::io::Cursor::new(input),
+            1024,
+            None,
+            Some(&[
+                "test result:".to_owned(),
+                "      Tests ".to_owned(),
+                "      Tests".to_owned(),
+            ]),
+        );
+        assert!(cap.truncated);
+        assert!(!cap.text.contains("81 passed"));
+        assert_eq!(
+            cap.kept_lines,
+            vec![
+                "test result: ok. 2 passed; 0 failed",
+                "      Tests  81 passed (81)",
+            ]
+        );
+    }
+
+    #[test]
     fn bounded_capture_keeps_summary_line_dropped_from_the_middle() {
         // A `test result:` line buried in the middle is dropped from the retained
         // head/tail text, yet still captured in full for the summary parser.
@@ -1904,7 +1986,7 @@ mod tests {
             &mut std::io::Cursor::new(input),
             1024,
             None,
-            Some("test result:"),
+            Some(&["test result:".to_owned()]),
         );
         assert!(cap.truncated);
         assert!(

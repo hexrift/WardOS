@@ -425,6 +425,7 @@ fn verifier_launch(
         // `test result:` lines from the whole stream so counts survive truncation.
         .capture_bytes(MAX_OUTPUT_BYTES / 2)
         .keep_lines("test result:")
+        .keep_lines("      Tests ")
         .budget(budget);
     for name in crate::session::FORWARDED_ENV {
         if let Ok(value) = std::env::var(name) {
@@ -512,13 +513,25 @@ fn cap(mut output: String) -> String {
     output
 }
 
-/// Per-test counts from `cargo test` style result lines
-/// (`test result: ok. 3 passed; 1 failed; ...`); zero when the runner prints none.
+/// Per-test counts from Cargo result lines and Vitest's `Tests` summary.
+/// File counts and skipped tests are not tests run; zero when the runner prints none.
 #[must_use]
 pub fn parse_summary(output: &str) -> VerifySummary {
     let mut summary = VerifySummary::default();
-    for line in output.lines().filter(|l| l.starts_with("test result:")) {
-        for part in line.split(';') {
+    for line in output.lines() {
+        let parts: Vec<&str> = if line.starts_with("test result:") {
+            line.split(';').collect()
+        } else if let Some(tests) = line.trim_start().strip_prefix("Tests ") {
+            tests
+                .split('(')
+                .next()
+                .unwrap_or_default()
+                .split('|')
+                .collect()
+        } else {
+            continue;
+        };
+        for part in parts {
             let mut words = part.split_whitespace().rev();
             let (Some(kind), Some(n)) = (words.next(), words.next()) else {
                 continue;
@@ -795,6 +808,17 @@ mod tests {
         let s = parse_summary(out);
         assert_eq!((s.tests_run, s.tests_failed), (3, 1));
         assert_eq!(parse_summary("no runner output").tests_run, 0);
+    }
+
+    #[test]
+    fn summary_counts_vitest_tests_without_counting_files_or_skips() {
+        let passed = parse_summary(" Test Files  7 passed (7)\n      Tests  81 passed (81)\n");
+        assert_eq!((passed.tests_run, passed.tests_failed), (81, 0));
+        let failed = parse_summary(
+            " Test Files  1 failed | 6 passed (7)\n      Tests  1 failed | 79 passed | 1 skipped (81)\n",
+        );
+        assert_eq!((failed.tests_run, failed.tests_failed), (80, 1));
+        assert_eq!(parse_summary("      Tests  no tests found\n").tests_run, 0);
     }
 
     #[test]
