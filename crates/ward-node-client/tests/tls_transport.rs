@@ -340,7 +340,9 @@ fn a_superseded_pause_replays_stale_operation_over_tls() {
     let snapshot = imported(dir.path());
     let node = Node::spawn(dir.path(), &pki.node_args(dir.path()), true);
     let marker = marker("ward-node-client-tls-pause");
-    let script = format!("sleep 600 # {marker}");
+    // Keep the marked shell alive: some shells exec a sole final `sleep`,
+    // removing its marked command line before the process-tree readiness check.
+    let script = format!("sleep 600; : # {marker}");
     let signed = AttemptRequest::sign(
         &envelope(binding(), snapshot, &["sh", "-c", &script]),
         &issuer(),
