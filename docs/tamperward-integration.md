@@ -203,6 +203,14 @@ complete environment, or `dependencies: not mounted: <stale | incomplete | never
 prepared …>` (status `Fail`, the verifier still offline and fetching nothing) when it
 does not; `ward ready`'s `dependencies` row says the same before the agent starts.
 
+On Fedora, the launch mounts `/etc/pki/tls/certs` and
+`/etc/pki/ca-trust/extracted` read-only as public TLS trust data, including the
+targets of the CA bundle symlinks. It does not mount `/etc/pki` or its private-key
+directories. This lets the online preparation phase verify registry certificates;
+the verifier still has no network. Cargo and Vitest result summaries are retained
+across output truncation and counted in verification evidence; the command's exit
+status remains authoritative for the verdict.
+
 ## 7. Open questions for TamperWard (to settle before Phase 3)
 
 1. Does TamperWard want to supply the trusted test bundle as a snapshot ID (WardOS
